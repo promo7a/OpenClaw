@@ -1,0 +1,30 @@
+name: Deploy to Hugging Face
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Push to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git config --global user.email "you@example.com"
+          git config --global user.name "yourname"
+
+          git clone https://user:$HF_TOKEN@huggingface.co/spaces/USERNAME/SPACENAME hf
+
+          cp -r * hf/
+          cd hf
+
+          git add .
+          git commit -m "auto deploy"
+          git push
