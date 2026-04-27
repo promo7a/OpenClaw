@@ -20,7 +20,7 @@ jobs:
           git config --global user.email "you@example.com"
           git config --global user.name "yourname"
 
-          git clone https://user:$HF_TOKEN@huggingface.co/spaces/USERNAME/SPACENAME hf
+          git clone https://user:$HF_TOKEN@huggingface.co/spaces/movis10/OpenClaw hf
 
           cp -r * hf/
           cd hf
