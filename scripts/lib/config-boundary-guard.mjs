@@ -3,19 +3,22 @@ import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const sourceCache = new Map();
 
 const COMPAT_CONFIG_API_FILES = new Set([
   "src/config/config.ts",
   "src/config/io.ts",
   "src/config/mutate.ts",
   "src/memory-host-sdk/runtime-core.ts",
-  "src/plugin-sdk/browser-config-runtime.ts",
   "src/plugin-sdk/config-runtime.ts",
-  "src/plugin-sdk/memory-core.ts",
   "src/plugin-sdk/memory-core-host-runtime-core.ts",
   "src/plugins/compat/registry.ts",
+  "src/plugins/registry.runtime-config.test.ts",
+  "src/plugins/registry.ts",
   "src/plugins/contracts/config-boundary-guard.test.ts",
   "src/plugins/contracts/deprecated-internal-config-api.test.ts",
+  "src/plugins/registry.runtime-config.test.ts",
+  "src/plugins/registry.ts",
   "src/plugins/runtime/runtime-config.test.ts",
   "src/plugins/runtime/runtime-config.ts",
   "src/plugins/runtime/types-core.ts",
@@ -37,6 +40,20 @@ const BROAD_CONFIG_RUNTIME_COMPAT_FILES = new Set([
   "src/plugins/bundled-capability-runtime.test.ts",
   "src/plugins/contracts/config-boundary-guard.test.ts",
 ]);
+
+const SEMANTIC_CONFIG_MUTATION_HELPER_FILES = new Set([
+  "extensions/browser/src/browser/config-mutations.ts",
+  "src/auto-reply/reply/config-mutations.ts",
+  "src/gateway/server-methods/agents-config-mutations.ts",
+  "src/gateway/server-methods/config-write-flow.ts",
+  "src/gateway/server-methods/skills-config-mutations.ts",
+]);
+
+const SEMANTIC_CONFIG_MUTATION_SCOPE_PREFIXES = [
+  "extensions/browser/src/browser/",
+  "src/auto-reply/reply/",
+  "src/gateway/server-methods/",
+];
 
 function collectTypeScriptFiles(dir) {
   if (!existsSync(dir)) {
@@ -62,6 +79,16 @@ function collectTypeScriptFiles(dir) {
 
 function repoRelative(repoRoot, filePath) {
   return relative(repoRoot, filePath).split(sep).join("/");
+}
+
+function readTypeScriptSource(filePath) {
+  const cached = sourceCache.get(filePath);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const source = readFileSync(filePath, "utf8");
+  sourceCache.set(filePath, source);
+  return source;
 }
 
 function isProductionExtensionFile(relPath) {
@@ -104,6 +131,13 @@ function isCompatConfigApiFile(relPath) {
 
 function isAmbientRuntimeConfigCompatFile(relPath) {
   return AMBIENT_RUNTIME_LOAD_CONFIG_COMPAT_FILES.has(relPath);
+}
+
+function isSemanticConfigMutationFile(relPath) {
+  return (
+    SEMANTIC_CONFIG_MUTATION_SCOPE_PREFIXES.some((prefix) => relPath.startsWith(prefix)) &&
+    !SEMANTIC_CONFIG_MUTATION_HELPER_FILES.has(relPath)
+  );
 }
 
 function findLineNumbers(source, pattern) {
@@ -153,7 +187,7 @@ function pushDeprecatedRuntimeApiViolations(violations, files) {
   ];
 
   for (const { filePath, relPath } of files) {
-    const source = readFileSync(filePath, "utf8");
+    const source = readTypeScriptSource(filePath);
     for (const guard of guards) {
       for (const line of findMatchLineNumbers(source, guard.pattern)) {
         violations.push(`${relPath}:${line} ${guard.replacement}`);
@@ -171,7 +205,7 @@ function pushBroadConfigRuntimeBarrelViolations(violations, files) {
     /\b(?:typeof\s+)?import\(["']openclaw\/plugin-sdk\/config-runtime["']\)\.[A-Za-z_$][\w$]*/g;
 
   for (const { filePath, relPath } of files) {
-    const source = readFileSync(filePath, "utf8");
+    const source = readTypeScriptSource(filePath);
     for (const pattern of [staticImportPattern, dynamicImportPattern, typeQueryPattern]) {
       for (const line of findMatchLineNumbers(source, pattern)) {
         violations.push(
@@ -186,7 +220,7 @@ function pushBroadConfigRuntimeSpecifierViolations(violations, files) {
   const moduleSpecifierPattern = /["']openclaw\/plugin-sdk\/config-runtime["']/g;
 
   for (const { filePath, relPath } of files) {
-    const source = readFileSync(filePath, "utf8");
+    const source = readTypeScriptSource(filePath);
     for (const line of findMatchLineNumbers(source, moduleSpecifierPattern)) {
       violations.push(
         `${relPath}:${line} use narrow plugin-sdk config subpaths instead of openclaw/plugin-sdk/config-runtime`,
@@ -220,11 +254,11 @@ export function collectDeprecatedInternalConfigApiViolations({
   pushBroadConfigRuntimeBarrelViolations(violations, productionExtensionFiles);
 
   for (const { filePath, relPath } of productionExtensionFiles) {
-    const source = readFileSync(filePath, "utf8");
+    const source = readTypeScriptSource(filePath);
     const guards = [
       {
         pattern:
-          /\b(?:import|export)\s+(?:type\s+)?\{[^}]*\bloadConfig\b[^}]*\}\s+from\s+["']openclaw\/plugin-sdk\/(?:browser-config-runtime|config-runtime|memory-core-host-runtime-core)["']/,
+          /\b(?:import|export)\s+(?:type\s+)?\{[^}]*\bloadConfig\b[^}]*\}\s+from\s+["']openclaw\/plugin-sdk\/(?:config-runtime|memory-core-host-runtime-core)["']/,
         replacement:
           "use getRuntimeConfig(), runtime.config.current(), or pass the already loaded config",
       },
@@ -274,19 +308,19 @@ export function collectDeprecatedInternalConfigApiViolations({
   );
 
   for (const { filePath, relPath } of repoFiles.filter(
-    ({ relPath }) => !isCompatConfigApiFile(relPath),
+    ({ relPath: relPathItem }) => !isCompatConfigApiFile(relPathItem),
   )) {
-    const source = readFileSync(filePath, "utf8");
+    const source = readTypeScriptSource(filePath);
     const guards = [
       {
         pattern:
-          /\b(?:import|export)\s+(?:type\s+)?\{[\s\S]*?\b(?:loadConfig|writeConfigFile)\b[\s\S]*?\}\s+from\s+["']openclaw\/plugin-sdk\/(?:browser-config-runtime|config-runtime|memory-core-host-runtime-core|memory-core)["']/,
+          /\b(?:import|export)\s+(?:type\s+)?\{[\s\S]*?\b(?:loadConfig|writeConfigFile)\b[\s\S]*?\}\s+from\s+["']openclaw\/plugin-sdk\/(?:config-runtime|memory-core-host-runtime-core)["']/,
         replacement:
           "use getRuntimeConfig(), runtime.config.current(), or mutation helpers with afterWrite",
       },
       {
         pattern:
-          /ReturnType<typeof import\(["']openclaw\/plugin-sdk\/(?:browser-config-runtime|config-runtime|memory-core-host-runtime-core|memory-core)["']\)\.(?:loadConfig|writeConfigFile)>/,
+          /ReturnType<typeof import\(["']openclaw\/plugin-sdk\/(?:config-runtime|memory-core-host-runtime-core)["']\)\.(?:loadConfig|writeConfigFile)>/,
         replacement: "use OpenClawConfig or the explicit mutation helper type",
       },
     ];
@@ -298,12 +332,12 @@ export function collectDeprecatedInternalConfigApiViolations({
   }
 
   for (const { filePath, relPath } of repoFiles.filter(
-    ({ relPath }) =>
-      !isTestOrHarnessFile(relPath) &&
-      !isCompatConfigApiFile(relPath) &&
-      !relPath.startsWith("test/"),
+    ({ relPath: relPathCandidate }) =>
+      !isTestOrHarnessFile(relPathCandidate) &&
+      !isCompatConfigApiFile(relPathCandidate) &&
+      !relPathCandidate.startsWith("test/"),
   )) {
-    const source = readFileSync(filePath, "utf8");
+    const source = readTypeScriptSource(filePath);
     const importPattern =
       /\bimport\s+\{[\s\S]*?\bwriteConfigFile\b[\s\S]*?\}\s+from\s+["'][^"']*(?:config\/config|config\/io)\.js["']/;
     const dynamicImportPattern =
@@ -324,13 +358,29 @@ export function collectDeprecatedInternalConfigApiViolations({
   }
 
   for (const { filePath, relPath } of repoFiles.filter(
-    ({ relPath }) =>
-      !isTestOrHarnessFile(relPath) &&
-      !isCompatConfigApiFile(relPath) &&
-      !PROCESS_BOUNDARY_DIRECT_CONFIG_LOAD_FILES.has(relPath) &&
-      !relPath.startsWith("test/"),
+    ({ relPath: relPathEntry }) =>
+      !isTestOrHarnessFile(relPathEntry) &&
+      !isCompatConfigApiFile(relPathEntry) &&
+      isSemanticConfigMutationFile(relPathEntry),
   )) {
-    const source = readFileSync(filePath, "utf8");
+    const source = readTypeScriptSource(filePath);
+    const importPattern =
+      /\bimport\s+\{[\s\S]*?\b(?:mutateConfigFile|mutateConfigFileWithRetry|transformConfigFile|transformConfigFileWithRetry|replaceConfigFile)\b[\s\S]*?\}\s+from\s+["'][^"']*(?:config\/config|config\/mutate)\.js["']/;
+    for (const line of findMatchLineNumbers(source, importPattern)) {
+      violations.push(
+        `${relPath}:${line} use the local domain config mutation helper instead of direct config writes`,
+      );
+    }
+  }
+
+  for (const { filePath, relPath } of repoFiles.filter(
+    ({ relPath: relPathResult }) =>
+      !isTestOrHarnessFile(relPathResult) &&
+      !isCompatConfigApiFile(relPathResult) &&
+      !PROCESS_BOUNDARY_DIRECT_CONFIG_LOAD_FILES.has(relPathResult) &&
+      !relPathResult.startsWith("test/"),
+  )) {
+    const source = readTypeScriptSource(filePath);
     for (const line of findNonCommentLineNumbers(source, /(?<!\.)\bloadConfig\s*\(/)) {
       violations.push(
         `${relPath}:${line} use a passed cfg, context.getRuntimeConfig(), or getRuntimeConfig() at an explicit process boundary`,
@@ -344,9 +394,12 @@ export function collectDeprecatedInternalConfigApiViolations({
   }
 
   for (const { filePath, relPath } of collectTypeScriptFiles(gatewayServerMethodsRoot)
-    .map((filePath) => ({ filePath, relPath: repoRelative(repoRoot, filePath) }))
-    .filter(({ relPath }) => !isTestOrHarnessFile(relPath))) {
-    const source = readFileSync(filePath, "utf8");
+    .map((filePathValue) => ({
+      filePath: filePathValue,
+      relPath: repoRelative(repoRoot, filePathValue),
+    }))
+    .filter(({ relPath: relPathValue }) => !isTestOrHarnessFile(relPathValue))) {
+    const source = readTypeScriptSource(filePath);
     const importPattern =
       /\bimport\s+\{[\s\S]*?\bloadConfig\b[\s\S]*?\}\s+from\s+["'][^"']*(?:config\/config|config\/io)\.js["']/;
     for (const line of findMatchLineNumbers(source, importPattern)) {
@@ -363,14 +416,17 @@ export function collectDeprecatedInternalConfigApiViolations({
 
   for (const { filePath, relPath } of ambientRuntimeConfigRoots
     .flatMap(collectTypeScriptFiles)
-    .map((filePath) => ({ filePath, relPath: repoRelative(repoRoot, filePath) }))
+    .map((filePathLocal) => ({
+      filePath: filePathLocal,
+      relPath: repoRelative(repoRoot, filePathLocal),
+    }))
     .filter(
-      ({ relPath }) =>
-        !isTestOrHarnessFile(relPath) &&
-        !isCompatConfigApiFile(relPath) &&
-        !isAmbientRuntimeConfigCompatFile(relPath),
+      ({ relPath: relPathLocal }) =>
+        !isTestOrHarnessFile(relPathLocal) &&
+        !isCompatConfigApiFile(relPathLocal) &&
+        !isAmbientRuntimeConfigCompatFile(relPathLocal),
     )) {
-    const source = readFileSync(filePath, "utf8");
+    const source = readTypeScriptSource(filePath);
     const loadConfigLines = findNonCommentLineNumbers(source, /(?<!\.)\bloadConfig\s*\(/);
     if (loadConfigLines.length === 0) {
       continue;
@@ -446,7 +502,7 @@ export function collectRuntimeActionLoadConfigViolations({ repoRoot = DEFAULT_RE
     .map((filePath) => ({ filePath, relPath: repoRelative(repoRoot, filePath) }))
     .filter(({ relPath }) => isRuntimeActionLoadConfigCandidate(relPath))
     .flatMap(({ filePath, relPath }) => {
-      const lines = readFileSync(filePath, "utf8").split(/\r?\n/);
+      const lines = readTypeScriptSource(filePath).split(/\r?\n/);
       return lines.flatMap((line, index) =>
         RUNTIME_ACTION_FORBIDDEN_CONFIG_LOAD_PATTERNS.some((pattern) => pattern.test(line))
           ? [`${relPath}:${index + 1}: ${line.trim()}`]

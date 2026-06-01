@@ -20,7 +20,7 @@ Codex has two OpenClaw routes:
 
 | Route                      | Config/command                                         | Setup page                              |
 | -------------------------- | ------------------------------------------------------ | --------------------------------------- |
-| Native Codex app-server    | `/codex ...`, `agentRuntime.id: "codex"`               | [Codex harness](/plugins/codex-harness) |
+| Native Codex app-server    | `/codex ...`, `openai/gpt-*` agent refs                | [Codex harness](/plugins/codex-harness) |
 | Explicit Codex ACP adapter | `/acp spawn codex`, `runtime: "acp", agentId: "codex"` | This page                               |
 
 Prefer the native route unless you explicitly need ACP/acpx behavior.
@@ -41,7 +41,6 @@ Current acpx built-in harness aliases:
 - `kiro`
 - `openclaw`
 - `opencode`
-- `pi`
 - `qwen`
 
 When OpenClaw uses the acpx backend, prefer these values for `agentId` unless your acpx config defines custom agent aliases.
@@ -79,7 +78,7 @@ Core ACP baseline:
       "kiro",
       "openclaw",
       "opencode",
-      "pi",
+      "openclaw",
       "qwen",
     ],
     maxConcurrentSessions: 8,
@@ -109,7 +108,7 @@ Thread binding config is channel-adapter specific. Example for Discord:
     discord: {
       threadBindings: {
         enabled: true,
-        spawnAcpSessions: true,
+        spawnSessions: true,
       },
     },
   },
@@ -118,7 +117,7 @@ Thread binding config is channel-adapter specific. Example for Discord:
 
 If thread-bound ACP spawn does not work, verify the adapter feature flag first:
 
-- Discord: `channels.discord.threadBindings.spawnAcpSessions=true`
+- Discord: `channels.discord.threadBindings.spawnSessions=true`
 
 Current-conversation binds do not require child-thread creation. They require an active conversation context and a channel adapter that exposes ACP conversation bindings.
 
@@ -126,8 +125,15 @@ See [Configuration Reference](/gateway/configuration-reference).
 
 ## Plugin setup for acpx backend
 
-Fresh installs ship the bundled `acpx` runtime plugin enabled by default, so ACP
-usually works without a manual plugin install step.
+Packaged installs use the official `@openclaw/acpx` runtime plugin for ACP.
+Install and enable it before using ACP harness sessions:
+
+```bash
+openclaw plugins install @openclaw/acpx
+openclaw config set plugins.entries.acpx.enabled true
+```
+
+Source checkouts can also use the local workspace plugin after `pnpm install`.
 
 Start with:
 
@@ -136,10 +142,10 @@ Start with:
 ```
 
 If you disabled `acpx`, denied it via `plugins.allow` / `plugins.deny`, or want
-to switch to a local development checkout, use the explicit plugin path:
+to switch back to the packaged plugin, use the explicit package path:
 
 ```bash
-openclaw plugins install acpx
+openclaw plugins install @openclaw/acpx
 openclaw config set plugins.entries.acpx.enabled true
 ```
 
@@ -157,10 +163,12 @@ Then verify backend health:
 
 ### acpx command and version configuration
 
-By default, the bundled `acpx` plugin registers the embedded ACP backend without
-spawning an ACP agent during Gateway startup. Run `/acp doctor` for an explicit
-live probe. Set `OPENCLAW_ACPX_RUNTIME_STARTUP_PROBE=1` only when you need the
-Gateway to probe the configured agent at startup.
+By default, the `acpx` plugin registers the embedded ACP backend during Gateway
+startup and waits for the embedded runtime startup probe before the gateway
+`ready` signal. Set `OPENCLAW_ACPX_RUNTIME_STARTUP_PROBE=0` or
+`OPENCLAW_SKIP_ACPX_RUNTIME_PROBE=1` only for scripts or environments that
+intentionally keep the startup probe disabled. Run `/acp doctor` for an explicit
+on-demand probe.
 
 Override the command or version in plugin config:
 
@@ -184,78 +192,33 @@ Override the command or version in plugin config:
 - `expectedVersion: "any"` disables strict version matching.
 - Custom `command` paths disable plugin-local auto-install.
 
-See [Plugins](/tools/plugin).
+Override an individual ACP agent command with structured arguments when a path
+or flag value should remain one argv token:
 
-## Optional Coven backend
-
-OpenClaw can also register a bundled, opt-in `coven` ACP backend for operators
-who want ACP coding sessions supervised by a local [Coven](https://github.com/OpenCoven/coven)
-daemon instead of launched directly through ACPX.
-
-This is intentionally an extension, not a core runtime path:
-
-- the default ACPX backend stays unchanged for normal installs;
-- Coven has its own daemon, socket, session store, harness mapping, and project
-  boundary model;
-- the bridge can be enabled, disabled, configured, and reviewed independently
-  through the plugin system; and
-- OpenClaw remains responsible for ACP session routing, chat bindings, task
-  state, and fallback policy while Coven owns harness supervision.
-
-Minimal opt-in config:
-
-```json5
+```json
 {
-  acp: {
-    enabled: true,
-    backend: "coven",
-    defaultAgent: "codex",
-  },
-  plugins: {
-    entries: {
-      coven: {
-        enabled: true,
-        config: {
-          // Optional. Defaults to ~/.coven. Environment variables are not used for this trust anchor.
-          covenHome: "~/.coven",
-          // Optional. Defaults to <covenHome>/coven.sock; overrides must resolve to that path.
-          socketPath: "~/.coven/coven.sock",
-          // Optional. Defaults to false; enable only when direct ACP fallback is acceptable.
-          allowFallback: false,
-          // Optional. Used only when allowFallback is true.
-          fallbackBackend: "acpx",
-        },
-      },
-    },
-  },
+  "plugins": {
+    "entries": {
+      "acpx": {
+        "enabled": true,
+        "config": {
+          "agents": {
+            "claude": {
+              "command": "node",
+              "args": ["/path/to/custom adapter.mjs", "--verbose"]
+            }
+          }
+        }
+      }
+    }
+  }
 }
 ```
 
-When selected, OpenClaw checks Coven daemon health over the configured Unix
-socket before launching. A successful launch creates a Coven session and records
-the Coven session id in the ACP runtime handle. If the health check or launch
-fails, OpenClaw fails closed by default so `acp.backend="coven"` cannot silently
-downgrade to direct ACP execution. Set `allowFallback: true` only when direct
-ACP fallback is an explicit, acceptable operator choice.
+- `agents.<id>.command` is the executable or existing command string for that ACP agent.
+- `agents.<id>.args` is optional. Each array item is shell-quoted before OpenClaw passes it through the current acpx command-string registry.
 
-For path safety, `~` in `covenHome` and `socketPath` expands to the current
-user home directory, and configured Coven paths must be absolute after that
-expansion. OpenClaw rejects workspace-relative Coven daemon paths because the
-daemon socket is a local user trust anchor, not repository-controlled state.
-`socketPath` must resolve to `<covenHome>/coven.sock`; OpenClaw does not allow
-arbitrary Coven socket filenames because the daemon socket is the local trust
-anchor. Keep `covenHome` owned by the OpenClaw user and private (`0700`);
-OpenClaw rejects symlinked, shared-accessible, shared-writable, or non-socket
-Coven socket paths before connecting. The Coven backend currently requires Unix
-socket validation and fails closed on Windows rather than trusting a socket path
-whose owner and permissions cannot be validated by this plugin.
-
-The default harness mapping sends known ACP agent ids such as `codex`, `claude`,
-`gemini`, and `opencode` to explicitly authorized Coven harness ids. Unknown
-ACP agent ids are rejected instead of being forwarded as harness names. Override
-`plugins.entries.coven.config.harnesses` only when your local Coven install uses
-custom harness names, and keep `acp.allowedAgents` aligned with the intended
-chat-exposed harness set.
+See [Plugins](/tools/plugin).
 
 ### Automatic dependency install
 
@@ -312,26 +275,26 @@ What this does:
 - Exposes selected built-in OpenClaw tools. The initial server exposes `cron`.
 - Keeps core-tool exposure explicit and default-off.
 
-### Runtime timeout configuration
+### Runtime operation timeout configuration
 
-The bundled `acpx` plugin defaults embedded runtime turns to a 120-second
-timeout. This gives slower harnesses such as Gemini CLI enough time to complete
-ACP startup and initialization. Override it if your host needs a different
-runtime limit:
+The `acpx` plugin gives embedded runtime startup and control operations 120
+seconds by default. This gives slower harnesses such as Gemini CLI enough time
+to complete ACP startup and initialization. Override it if your host needs a
+different operation limit:
 
 ```bash
 openclaw config set plugins.entries.acpx.config.timeoutSeconds 180
 ```
 
-Restart the gateway after changing this value.
+Runtime turns use OpenClaw agent/run timeouts, including `/acp timeout` and
+`sessions_spawn.timeoutSeconds`. Restart the gateway after changing this value.
 
 ### Health probe agent configuration
 
-When `/acp doctor` or the opt-in startup probe checks the backend, the bundled
-`acpx` plugin probes one harness agent. If `acp.allowedAgents` is set, it
-defaults to the first allowed agent; otherwise it defaults to `codex`. If your
-deployment needs a different ACP agent for health checks, set the probe agent
-explicitly:
+When `/acp doctor` or the startup probe checks the backend, the bundled `acpx`
+plugin probes one harness agent. If `acp.allowedAgents` is set, it defaults to
+the first allowed agent; otherwise it defaults to `codex`. If your deployment
+needs a different ACP agent for health checks, set the probe agent explicitly:
 
 ```bash
 openclaw config set plugins.entries.acpx.config.probeAgent claude
@@ -344,6 +307,10 @@ Restart the gateway after changing this value.
 ACP sessions run non-interactively — there is no TTY to approve or deny file-write and shell-exec permission prompts. The acpx plugin provides two config keys that control how permissions are handled:
 
 These ACPX harness permissions are separate from OpenClaw exec approvals and separate from CLI-backend vendor bypass flags such as Claude CLI `--permission-mode bypassPermissions`. ACPX `approve-all` is the harness-level break-glass switch for ACP sessions.
+
+For the broader comparison between OpenClaw `tools.exec.mode`, Codex Guardian
+approvals, and ACPX harness permissions, see
+[Permission modes](/tools/permission-modes).
 
 ### `permissionMode`
 
