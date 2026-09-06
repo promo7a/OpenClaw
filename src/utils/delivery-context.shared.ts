@@ -1,3 +1,9 @@
+import type {
+  SessionDeliveryState,
+  SessionEntry,
+  SessionOrigin,
+} from "../config/sessions/types.js";
+// Shared delivery context helpers expose route normalization shared by modules.
 import {
   channelRouteCompactKey,
   channelRouteThreadId,
@@ -6,16 +12,23 @@ import {
   normalizeChannelRouteTarget,
   type ChannelRouteRef,
 } from "../plugin-sdk/channel-route.js";
-import { normalizeAccountId } from "./account-id.js";
-import type { DeliveryContext, DeliveryContextSessionSource } from "./delivery-context.types.js";
+import { normalizeOptionalAccountId } from "../routing/account-id.js";
+import type { DeliveryContext } from "./delivery-context.types.js";
 import {
   INTERNAL_MESSAGE_CHANNEL,
   isInternalNonDeliveryChannel,
 } from "./message-channel-constants.js";
-import { normalizeMessageChannel } from "./message-channel-core.js";
-import { isDeliverableMessageChannel } from "./message-channel-normalize.js";
-export type { DeliveryContext, DeliveryContextSessionSource } from "./delivery-context.types.js";
+import { isNormalizedMessageChannel, normalizeMessageChannel } from "./message-channel-core.js";
+export type { DeliveryContext } from "./delivery-context.types.js";
 
+/**
+ * Delivery-context normalization and projection helpers.
+ *
+ * Persisted sessions expose one closed delivery state. Compatibility
+ * projections are derived from that state at public boundaries.
+ */
+
+/** Normalizes a delivery context into canonical channel route fields, dropping invalid routes. */
 export function normalizeDeliveryContext(context?: DeliveryContext): DeliveryContext | undefined {
   if (!context) {
     return undefined;
@@ -35,7 +48,7 @@ export function normalizeDeliveryContext(context?: DeliveryContext): DeliveryCon
   const normalized: DeliveryContext = {
     channel: route.channel,
     to: channelRouteTarget(route),
-    accountId: normalizeAccountId(route.accountId),
+    accountId: normalizeOptionalAccountId(route.accountId),
   };
   const threadId = channelRouteThreadId(route);
   if (threadId != null) {
@@ -44,6 +57,14 @@ export function normalizeDeliveryContext(context?: DeliveryContext): DeliveryCon
   return normalized;
 }
 
+/** Checks raw channel/to presence only; does not normalize or validate deliverability. */
+export function hasDeliveryTargetFields(
+  context?: DeliveryContext,
+): context is DeliveryContext & { channel: string; to: string } {
+  return Boolean(context?.channel && context?.to);
+}
+
+/** Normalizes an unknown channel route payload from persisted session/plugin metadata. */
 export function normalizeDeliveryChannelRoute(route?: unknown): ChannelRouteRef | undefined {
   if (!route || typeof route !== "object" || Array.isArray(route)) {
     return undefined;
@@ -61,6 +82,7 @@ export function normalizeDeliveryChannelRoute(route?: unknown): ChannelRouteRef 
   });
 }
 
+/** Converts a normalized channel route reference into a delivery context. */
 export function deliveryContextFromChannelRoute(
   route?: ChannelRouteRef,
 ): DeliveryContext | undefined {
@@ -73,9 +95,8 @@ export function deliveryContextFromChannelRoute(
   });
 }
 
-export function channelRouteFromDeliveryContext(
-  context?: DeliveryContext,
-): ChannelRouteRef | undefined {
+/** Converts delivery context fields into the SDK channel route reference shape. */
+function channelRouteFromDeliveryContext(context?: DeliveryContext): ChannelRouteRef | undefined {
   return normalizeChannelRouteTarget(normalizeDeliveryContext(context));
 }
 
@@ -106,14 +127,22 @@ function isInternalRouteContext(context?: DeliveryContext): boolean {
 }
 
 function hasExternalDeliveryTarget(context?: DeliveryContext): boolean {
-  const channel = normalizeMessageChannel(context?.channel);
-  return Boolean(channel && isDeliverableMessageChannel(channel) && context?.to);
+  const channel = context?.channel;
+  return Boolean(
+    channel &&
+    isNormalizedMessageChannel(channel) &&
+    !isInternalNonDeliveryChannel(channel) &&
+    context?.to,
+  );
 }
 
 function mergeExternalDeliveryContextOverInternalRoute(
   deliveryContext?: DeliveryContext,
   internalContext?: DeliveryContext,
 ): DeliveryContext | undefined {
+  // Internal webchat/heartbeat routes are session plumbing. When a real channel
+  // target is also present, preserve internal account/thread hints but let the
+  // external channel/to pair own delivery.
   return normalizeDeliveryContext({
     channel: deliveryContext?.channel,
     to: deliveryContext?.to,
@@ -122,88 +151,130 @@ function mergeExternalDeliveryContextOverInternalRoute(
   });
 }
 
-export function normalizeSessionDeliveryFields(source?: DeliveryContextSessionSource): {
+type SessionDeliveryProjection = {
   route?: ChannelRouteRef;
   deliveryContext?: DeliveryContext;
+  origin?: SessionOrigin;
+  channel?: string;
   lastChannel?: string;
   lastTo?: string;
   lastAccountId?: string;
   lastThreadId?: string | number;
-} {
-  if (!source) {
-    return {
-      route: undefined,
-      deliveryContext: undefined,
-      lastChannel: undefined,
-      lastTo: undefined,
-      lastAccountId: undefined,
-      lastThreadId: undefined,
-    };
+};
+
+export function isCanonicalSessionDeliveryState(value: unknown): value is SessionDeliveryState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (candidate.kind === "none" || candidate.kind === "internal") {
+    return true;
+  }
+  return (
+    candidate.kind === "external" &&
+    Boolean(candidate.route && typeof candidate.route === "object") &&
+    Boolean(candidate.context && typeof candidate.context === "object") &&
+    Boolean(candidate.origin && typeof candidate.origin === "object")
+  );
+}
+
+/** Builds one canonical delivery state from current turn routing facts. */
+export function normalizeSessionDeliveryState(params?: {
+  route?: ChannelRouteRef;
+  context?: DeliveryContext;
+  origin?: SessionOrigin;
+}): SessionDeliveryState {
+  if (!params) {
+    return { kind: "none" };
   }
 
-  const normalizedRoute = normalizeDeliveryChannelRoute(source.route);
+  const normalizedRoute = normalizeDeliveryChannelRoute(params.route);
   const routeContext = deliveryContextFromChannelRoute(normalizedRoute);
-  const legacyContext = normalizeDeliveryContext({
-    channel: source.lastChannel ?? source.channel,
-    to: source.lastTo,
-    accountId: source.lastAccountId,
-    threadId: source.lastThreadId,
+  const originContext = normalizeDeliveryContext({
+    channel: params.origin?.provider,
+    to: params.origin?.to,
+    accountId: params.origin?.accountId,
+    threadId: params.origin?.threadId,
   });
-  const deliveryContext = normalizeDeliveryContext(source.deliveryContext);
-  const sessionContext =
-    isInternalRouteContext(legacyContext) && hasExternalDeliveryTarget(deliveryContext)
-      ? mergeExternalDeliveryContextOverInternalRoute(deliveryContext, legacyContext)
-      : mergeDeliveryContext(legacyContext, deliveryContext);
-  const routeInternalContext = mergeDeliveryContext(routeContext, legacyContext);
+  const context = normalizeDeliveryContext(params.context);
+  const fallbackContext = mergeDeliveryContext(context, originContext);
   const routeIsInternalFallback =
-    isInternalRouteContext(routeContext) && hasExternalDeliveryTarget(deliveryContext);
+    isInternalRouteContext(routeContext) && hasExternalDeliveryTarget(context);
   const merged = routeIsInternalFallback
-    ? mergeExternalDeliveryContextOverInternalRoute(deliveryContext, routeInternalContext)
-    : mergeDeliveryContext(routeContext, sessionContext);
+    ? mergeExternalDeliveryContextOverInternalRoute(
+        context,
+        mergeDeliveryContext(routeContext, originContext),
+      )
+    : mergeDeliveryContext(routeContext, fallbackContext);
 
   if (!merged) {
-    return {
-      route: undefined,
-      deliveryContext: undefined,
-      lastChannel: undefined,
-      lastTo: undefined,
-      lastAccountId: undefined,
-      lastThreadId: undefined,
-    };
+    return { kind: "none" };
   }
+  if (isInternalRouteContext(merged)) {
+    return { kind: "internal" };
+  }
+  const route = mergeRouteMetadataWithDeliveryContext(
+    routeIsInternalFallback ? undefined : normalizedRoute,
+    merged,
+  );
+  if (!route) {
+    return { kind: "none" };
+  }
+  const origin: SessionOrigin = { ...params.origin };
+  origin.provider ??= merged.channel;
+  origin.to ??= merged.to;
+  origin.accountId ??= merged.accountId;
+  origin.threadId ??= merged.threadId;
+  origin.chatType ??= route.target?.chatType;
+  return { kind: "external", route, context: merged, origin };
+}
 
+/** Projects compatibility fields without persisting duplicate delivery state. */
+export function projectSessionDeliveryFields(
+  delivery?: SessionDeliveryState,
+): SessionDeliveryProjection {
+  if (delivery?.kind !== "external") {
+    return {};
+  }
   return {
-    route: mergeRouteMetadataWithDeliveryContext(
-      routeIsInternalFallback ? undefined : normalizedRoute,
-      merged,
-    ),
-    deliveryContext: merged,
-    lastChannel: merged.channel,
-    lastTo: merged.to,
-    lastAccountId: merged.accountId,
-    lastThreadId: merged.threadId,
+    route: delivery.route,
+    deliveryContext: delivery.context,
+    origin: delivery.origin,
+    channel: delivery.context.channel ?? delivery.origin.provider,
+    lastChannel: delivery.context.channel,
+    lastTo: delivery.context.to,
+    lastAccountId: delivery.context.accountId,
+    lastThreadId: delivery.context.threadId,
   };
 }
 
+/** Reads only the canonical persisted delivery record. */
 export function deliveryContextFromSession(
-  entry?: DeliveryContextSessionSource,
+  entry?: Pick<SessionEntry, "delivery">,
 ): DeliveryContext | undefined {
-  if (!entry) {
-    return undefined;
-  }
-  const source: DeliveryContextSessionSource = {
-    route: entry.route,
-    channel: entry.channel ?? entry.origin?.provider,
-    lastChannel: entry.lastChannel,
-    lastTo: entry.lastTo,
-    lastAccountId: entry.lastAccountId ?? entry.origin?.accountId,
-    lastThreadId: entry.lastThreadId ?? entry.deliveryContext?.threadId ?? entry.origin?.threadId,
-    origin: entry.origin,
-    deliveryContext: entry.deliveryContext,
-  };
-  return normalizeSessionDeliveryFields(source).deliveryContext;
+  return entry?.delivery?.kind === "external" ? entry.delivery.context : undefined;
 }
 
+export function sessionDeliveryRoute(
+  entry?: Pick<SessionEntry, "delivery">,
+): ChannelRouteRef | undefined {
+  return entry?.delivery?.kind === "external" ? entry.delivery.route : undefined;
+}
+
+export function sessionDeliveryOrigin(
+  entry?: Pick<SessionEntry, "delivery">,
+): SessionOrigin | undefined {
+  return entry?.delivery?.kind === "external" ? entry.delivery.origin : undefined;
+}
+
+export function sessionDeliveryChannel(entry?: Pick<SessionEntry, "delivery">): string | undefined {
+  const delivery = entry?.delivery;
+  return delivery?.kind === "external"
+    ? (delivery.context.channel ?? delivery.origin.provider)
+    : undefined;
+}
+
+/** Merges delivery contexts without mixing target/account/thread fields across route owners. */
 export function mergeDeliveryContext(
   primary?: DeliveryContext,
   fallback?: DeliveryContext,
@@ -217,22 +288,28 @@ export function mergeDeliveryContext(
     normalizedPrimary?.channel &&
     normalizedFallback?.channel &&
     normalizedPrimary.channel !== normalizedFallback.channel;
+  const accountsConflict =
+    normalizedPrimary?.accountId &&
+    normalizedFallback?.accountId &&
+    normalizedPrimary.accountId !== normalizedFallback.accountId;
+  const routesConflict = channelsConflict || accountsConflict;
   return normalizeDeliveryContext({
-    channel: normalizedPrimary?.channel ?? normalizedFallback?.channel,
-    // Keep route fields paired to their channel; avoid crossing fields between
-    // unrelated channels during session context merges.
-    to: channelsConflict
-      ? normalizedPrimary?.to
-      : (normalizedPrimary?.to ?? normalizedFallback?.to),
-    accountId: channelsConflict
+    channel: accountsConflict
+      ? normalizedPrimary?.channel
+      : (normalizedPrimary?.channel ?? normalizedFallback?.channel),
+    // Keep route fields paired to their channel account; crossing either owner
+    // can address one account's target through another account's credentials.
+    to: routesConflict ? normalizedPrimary?.to : (normalizedPrimary?.to ?? normalizedFallback?.to),
+    accountId: routesConflict
       ? normalizedPrimary?.accountId
       : (normalizedPrimary?.accountId ?? normalizedFallback?.accountId),
-    threadId: channelsConflict
+    threadId: routesConflict
       ? normalizedPrimary?.threadId
       : (normalizedPrimary?.threadId ?? normalizedFallback?.threadId),
   });
 }
 
+/** Builds a compact stable key for a routable delivery context. */
 export function deliveryContextKey(context?: DeliveryContext): string | undefined {
   return channelRouteCompactKey(normalizeDeliveryContext(context));
 }

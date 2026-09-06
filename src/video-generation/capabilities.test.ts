@@ -1,7 +1,7 @@
+// Video generation capability tests cover model capability resolution.
 import { describe, expect, it } from "vitest";
 import {
   listSupportedVideoGenerationModes,
-  resolveVideoGenerationMode,
   resolveVideoGenerationModeCapabilities,
 } from "./capabilities.js";
 import type { VideoGenerationProvider } from "./types.js";
@@ -63,7 +63,6 @@ describe("video-generation capabilities", () => {
       supportsAudio: true,
     });
 
-    expect(resolveVideoGenerationMode({ inputImageCount: 1, inputVideoCount: 1 })).toBeNull();
     expect(
       resolveVideoGenerationModeCapabilities({
         provider,
@@ -90,7 +89,6 @@ describe("video-generation capabilities", () => {
       },
     });
 
-    expect(resolveVideoGenerationMode({ inputImageCount: 1, inputVideoCount: 1 })).toBeNull();
     expect(
       resolveVideoGenerationModeCapabilities({
         provider,

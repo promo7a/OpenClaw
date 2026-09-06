@@ -1,3 +1,4 @@
+// Implements `openclaw channels capabilities` account capability/probe reporting.
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
@@ -15,23 +16,24 @@ import type {
   ChannelCapabilitiesDisplayLine,
   ChannelPlugin,
 } from "../../channels/plugins/types.public.js";
+import { resolveCommandConfigWithSecrets } from "../../cli/command-config-resolution.js";
 import { formatCliCommand } from "../../cli/command-format.js";
+import { getChannelsCommandSecretTargetIds } from "../../cli/command-secret-targets.js";
 import { formatUnknownChannelMessage } from "../../cli/error-format.js";
+import { ExpectedCliError } from "../../cli/failure-output.js";
 import { parseTimeoutMsWithFallback } from "../../cli/parse-timeout.js";
-import { commitConfigWithPendingPluginInstalls } from "../../cli/plugins-install-record-commit.js";
-import { refreshPluginRegistryAfterConfigMutation } from "../../cli/plugins-registry-refresh.js";
-import {
-  readConfigFileSnapshot,
-  replaceConfigFile,
-  type OpenClawConfig,
-} from "../../config/config.js";
+import { getRuntimeConfig, type OpenClawConfig } from "../../config/config.js";
 import { danger } from "../../globals.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { defaultRuntime, type RuntimeEnv, writeRuntimeJson } from "../../runtime.js";
+import { ABSOLUTE_DEADLINE_EXPIRED, awaitWithinDeadline } from "../../utils/absolute-deadline.js";
 import { resolveInstallableChannelPlugin } from "../channel-setup/channel-plugin-resolution.js";
-import { formatChannelAccountLabel, requireValidConfig } from "./shared.js";
+import { requireValidConfigFileSnapshot } from "../config-validation.js";
+import { persistChannelPluginConfig } from "./plugin-config-persistence.js";
+import { formatChannelAccountLabel } from "./shared.js";
 
 export type ChannelsCapabilitiesOptions = {
+  agent?: string;
   channel?: string;
   account?: string;
   target?: string;
@@ -51,6 +53,51 @@ type ChannelCapabilitiesReport = {
   probe?: unknown;
   diagnostics?: ChannelCapabilitiesDiagnostics;
 };
+
+const CHANNEL_CAPABILITIES_TIMEOUT_MAX_MS = 30_000;
+
+// These CLI waits need a referenced deadline so stalled plugins still produce a report.
+async function runChannelCapabilitiesProbe(params: {
+  timeoutMs: number;
+  run: () => unknown;
+}): Promise<unknown> {
+  try {
+    const result = await awaitWithinDeadline(
+      async () => params.run(),
+      Date.now() + params.timeoutMs,
+    );
+    return result === ABSOLUTE_DEADLINE_EXPIRED
+      ? { ok: false, timedOut: true, error: `probe timed out after ${params.timeoutMs}ms` }
+      : result;
+  } catch (error) {
+    return { ok: false, error: formatErrorMessage(error) };
+  }
+}
+
+async function runChannelCapabilitiesDiagnostics(params: {
+  timeoutMs: number;
+  run: () =>
+    | Promise<ChannelCapabilitiesDiagnostics | undefined>
+    | ChannelCapabilitiesDiagnostics
+    | undefined;
+}): Promise<ChannelCapabilitiesDiagnostics | undefined> {
+  try {
+    const result = await awaitWithinDeadline(
+      async () => params.run(),
+      Date.now() + params.timeoutMs,
+    );
+    return result === ABSOLUTE_DEADLINE_EXPIRED
+      ? {
+          lines: [{ text: `Diagnostics: timed out after ${params.timeoutMs}ms`, tone: "error" }],
+          details: { timedOut: true },
+        }
+      : result;
+  } catch (error) {
+    return {
+      lines: [{ text: `Diagnostics: failed (${formatErrorMessage(error)})`, tone: "error" }],
+    };
+  }
+}
 
 function formatSupport(capabilities?: ChannelCapabilities) {
   if (!capabilities) {
@@ -156,25 +203,29 @@ async function resolveChannelReports(params: {
       : (resolvedAccount as { enabled?: boolean }).enabled !== false;
     let probe: unknown;
     if (configured && enabled && plugin.status?.probeAccount) {
-      try {
-        probe = await plugin.status.probeAccount({
-          account: resolvedAccount,
-          timeoutMs,
-          cfg,
-        });
-      } catch (err) {
-        probe = { ok: false, error: formatErrorMessage(err) };
-      }
-    }
-
-    const diagnostics =
-      configured && enabled
-        ? await plugin.status?.buildCapabilitiesDiagnostics?.({
+      probe = await runChannelCapabilitiesProbe({
+        timeoutMs,
+        run: () =>
+          plugin.status?.probeAccount?.({
             account: resolvedAccount,
             timeoutMs,
             cfg,
-            probe,
-            target: params.target,
+          }),
+      });
+    }
+
+    const diagnostics =
+      configured && enabled && plugin.status?.buildCapabilitiesDiagnostics
+        ? await runChannelCapabilitiesDiagnostics({
+            timeoutMs,
+            run: () =>
+              plugin.status?.buildCapabilitiesDiagnostics?.({
+                account: resolvedAccount,
+                timeoutMs,
+                cfg,
+                probe,
+                target: params.target,
+              }),
           })
         : undefined;
     const discoveredActions = resolveMessageActionDiscoveryForPlugin({
@@ -209,37 +260,38 @@ async function resolveChannelReports(params: {
   return reports;
 }
 
+async function resolveCapabilitiesRuntimeConfig(config: OpenClawConfig, runtime: RuntimeEnv) {
+  return (
+    await resolveCommandConfigWithSecrets({
+      config,
+      commandName: "channels",
+      targetIds: getChannelsCommandSecretTargetIds(),
+      runtime,
+    })
+  ).effectiveConfig;
+}
+
+/** Print or serialize configured channel capabilities, actions, and optional health probe details. */
 export async function channelsCapabilitiesCommand(
   opts: ChannelsCapabilitiesOptions,
   runtime: RuntimeEnv = defaultRuntime,
 ) {
-  const sourceSnapshotPromise = readConfigFileSnapshot().catch(() => null);
-  const loadedCfg = await requireValidConfig(runtime);
-  if (!loadedCfg) {
+  const configSnapshot = await requireValidConfigFileSnapshot(runtime);
+  if (!configSnapshot) {
     return;
   }
-  let cfg = loadedCfg;
-  const timeoutMs = parseTimeoutMsWithFallback(opts.timeout, 10_000);
+  let cfg = await resolveCapabilitiesRuntimeConfig(configSnapshot.config, runtime);
+  const timeoutMs = Math.min(
+    parseTimeoutMsWithFallback(opts.timeout, 10_000, { invalidType: "error" }),
+    CHANNEL_CAPABILITIES_TIMEOUT_MAX_MS,
+  );
   const rawChannel = normalizeLowercaseStringOrEmpty(opts.channel);
   const rawTarget = normalizeOptionalString(opts.target) ?? "";
 
-  if (opts.account && (!rawChannel || rawChannel === "all")) {
-    runtime.error(
-      danger(
-        `--account requires a specific --channel. Run ${formatCliCommand("openclaw channels list")} to choose one.`,
-      ),
-    );
-    runtime.exit(1);
-    return;
-  }
-  if (rawTarget && (!rawChannel || rawChannel === "all")) {
-    runtime.error(
-      danger(
-        `--target requires a specific --channel. Run ${formatCliCommand("openclaw channels list")} to choose one.`,
-      ),
-    );
-    runtime.exit(1);
-    return;
+  if ((!rawChannel || rawChannel === "all") && (opts.account || rawTarget)) {
+    const option = opts.account ? "--account" : "--target";
+    const message = `${option} requires a specific --channel. Run ${formatCliCommand("openclaw channels list")} to choose one.`;
+    throw new ExpectedCliError({ message, humanOutput: danger(message), machineOutput: message });
   }
 
   const plugins = listReadOnlyChannelPluginsForConfig(cfg, {
@@ -250,41 +302,22 @@ export async function channelsCapabilitiesCommand(
       ? plugins
       : await (async () => {
           const resolved = await resolveInstallableChannelPlugin({
-            cfg,
+            cfg: configSnapshot.sourceConfig,
             runtime,
+            agentId: opts.agent,
             rawChannel,
             allowInstall: true,
           });
           if (resolved.configChanged) {
-            cfg = resolved.cfg;
-            const shouldMovePluginInstalls = Boolean(
-              cfg.plugins?.installs && Object.keys(cfg.plugins.installs).length > 0,
-            );
-            if (shouldMovePluginInstalls) {
-              const committed = await commitConfigWithPendingPluginInstalls({
-                nextConfig: cfg,
-                baseHash: (await sourceSnapshotPromise)?.hash,
-              });
-              cfg = committed.config;
-              await refreshPluginRegistryAfterConfigMutation({
-                config: cfg,
-                reason: "source-changed",
-                installRecords: committed.installRecords,
-                logger: { warn: (message) => runtime.log(message) },
-              });
-            } else {
-              await replaceConfigFile({
-                nextConfig: cfg,
-                baseHash: (await sourceSnapshotPromise)?.hash,
-              });
-              if (resolved.pluginInstalled) {
-                await refreshPluginRegistryAfterConfigMutation({
-                  config: cfg,
-                  reason: "source-changed",
-                  logger: { warn: (message) => runtime.log(message) },
-                });
-              }
-            }
+            await persistChannelPluginConfig({
+              cfg: resolved.cfg,
+              pluginInstalled: resolved.pluginInstalled,
+              baseHash: configSnapshot.hash,
+              runtime,
+            });
+            // The writer refreshes the active runtime snapshot; probes must use that prepared
+            // view rather than the authored config that installation persisted.
+            cfg = await resolveCapabilitiesRuntimeConfig(getRuntimeConfig(), runtime);
           }
           return resolved.plugin ? [resolved.plugin] : null;
         })();
@@ -304,9 +337,8 @@ export async function channelsCapabilitiesCommand(
       );
       return;
     }
-    runtime.error(danger(formatUnknownChannelMessage({ channel: rawChannel })));
-    runtime.exit(1);
-    return;
+    const message = formatUnknownChannelMessage({ channel: rawChannel });
+    throw new ExpectedCliError({ message, humanOutput: danger(message), machineOutput: message });
   }
 
   const reports: ChannelCapabilitiesReport[] = [];
@@ -348,10 +380,12 @@ export async function channelsCapabilitiesCommand(
       const enabledLabel = report.enabled === false ? "disabled" : "enabled";
       lines.push(`Status: ${configuredLabel}, ${enabledLabel}`);
     }
-    const probeLines =
-      report.plugin.status?.formatCapabilitiesProbe?.({
-        probe: report.probe,
-      }) ?? formatGenericProbeLines(report.probe);
+    const formattedProbeLines = report.plugin.status?.formatCapabilitiesProbe?.({
+      probe: report.probe,
+    });
+    const probeLines = formattedProbeLines?.length
+      ? formattedProbeLines
+      : formatGenericProbeLines(report.probe);
     if (probeLines.length > 0) {
       lines.push(...probeLines.map(renderDisplayLine));
     } else if (report.configured && report.enabled) {

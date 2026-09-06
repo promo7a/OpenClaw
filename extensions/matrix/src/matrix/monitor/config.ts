@@ -1,8 +1,9 @@
+// Matrix helper module supports config behavior.
 import { isDangerousNameMatchingEnabled } from "openclaw/plugin-sdk/dangerous-name-runtime";
 import { resolveMatrixTargets } from "../../resolve-targets.js";
 import type { CoreConfig, MatrixRoomConfig } from "../../types.js";
 import { resolveMatrixAccountConfig } from "../account-config.js";
-import { isMatrixQualifiedUserId } from "../target-ids.js";
+import { isMatrixQualifiedUserId, isMatrixRoomId } from "../target-ids.js";
 import { normalizeMatrixUserId } from "./allowlist.js";
 import {
   addAllowlistUserEntriesFromConfigEntry,
@@ -115,7 +116,7 @@ function addUniqueMatrixAllowlistEntry(params: {
   if (!trimmed) {
     return;
   }
-  const key = trimmed.toLowerCase();
+  const key = normalizeMatrixUserId(trimmed);
   if (params.seen.has(key)) {
     return;
   }
@@ -177,6 +178,7 @@ function resolveStableMatrixMonitorUserAllowlist(params: {
   const canonicalized = canonicalizeAllowlistWithResolvedIds({
     existing: allowList,
     resolvedMap: resolution.resolvedMap,
+    entryKey: normalizeMatrixUserId,
   });
   logStableMatrixAllowlistUnresolved({
     label: params.label,
@@ -288,6 +290,7 @@ async function resolveMatrixMonitorUserAllowlist(params: {
   const canonicalized = canonicalizeAllowlistWithResolvedIds({
     existing: allowList,
     resolvedMap: resolution.resolvedMap,
+    entryKey: normalizeMatrixUserId,
   });
 
   summarizeMapping(params.label, resolution.mapping, resolution.unresolved, params.runtime);
@@ -375,6 +378,7 @@ export async function resolveMatrixMonitorLiveUserAllowlist(params: {
   const canonicalized = canonicalizeAllowlistWithResolvedIds({
     existing: pending,
     resolvedMap: resolution.resolvedMap,
+    entryKey: normalizeMatrixUserId,
   });
   const resolvedEntries = params.failClosedOnUnresolved
     ? filterFailClosedMatrixAllowlistEntries(canonicalized)
@@ -423,7 +427,7 @@ async function resolveMatrixMonitorRoomsConfig(params: {
       unresolved.push(entry);
       continue;
     }
-    if (cleaned.startsWith("!") && cleaned.includes(":")) {
+    if (isMatrixRoomId(cleaned)) {
       if (!nextRooms[cleaned]) {
         nextRooms[cleaned] = roomConfig;
       }
@@ -467,7 +471,7 @@ async function resolveMatrixMonitorRoomsConfig(params: {
   summarizeMapping("matrix rooms", mapping, unresolved, params.runtime);
   if (unresolved.length > 0) {
     params.runtime.log?.(
-      "matrix rooms must be room IDs or aliases (example: !room:server or #alias:server). Unresolved entries are ignored.",
+      "matrix rooms must be room IDs or aliases (example: !room:server, the suffixless !room form on room version 12+, or #alias:server). Unresolved entries are ignored.",
     );
   }
 
@@ -489,6 +493,7 @@ async function resolveMatrixMonitorRoomsConfig(params: {
       entries: nextRooms,
       resolvedMap: resolution.resolvedMap,
       strategy: "canonicalize",
+      entryKey: normalizeMatrixUserId,
     });
     return patched;
   }
@@ -511,6 +516,7 @@ async function resolveMatrixMonitorRoomsConfig(params: {
     entries: nextRooms,
     resolvedMap: resolution.resolvedMap,
     strategy: "canonicalize",
+    entryKey: normalizeMatrixUserId,
   });
   return patched;
 }

@@ -1,25 +1,24 @@
-import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
+// Doctor warnings for plugin allowlists that make configured tool policies ineffective.
 import { isRecord as hasRecord } from "@openclaw/normalization-core/record-coerce";
-import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import {
   sortUniqueStrings,
   uniqueStrings,
 } from "@openclaw/normalization-core/string-normalization";
 import { sanitizeServerName, TOOL_NAME_SEPARATOR } from "../../../agents/agent-bundle-mcp-names.js";
-import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../../../agents/defaults.js";
+import { listAgentEntriesWithSource } from "../../../agents/agent-scope-config.js";
 import { compileGlobPatterns, matchesAnyGlobPattern } from "../../../agents/glob-pattern.js";
-import { parseModelRef } from "../../../agents/model-selection-normalize.js";
+import { resolveProviderToolPolicy } from "../../../agents/provider-tool-policy.js";
 import {
   mergeAlsoAllowPolicy,
-  normalizeToolName,
+  normalizeToolPolicyName,
   resolveToolProfilePolicy,
 } from "../../../agents/tool-policy.js";
-import { resolveAgentModelPrimaryValue } from "../../../config/model-input.js";
 import type { AgentModelConfig } from "../../../config/types.agents-shared.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { normalizePluginId } from "../../../plugins/config-state.js";
 import { loadManifestMetadataSnapshot } from "../../../plugins/manifest-contract-eligibility.js";
 import type { PluginManifestRegistry } from "../../../plugins/manifest-registry.js";
+import { resolveDoctorPrimaryModelRef } from "./primary-model-ref.js";
 
 type ToolAllowlistSource = {
   label: string;
@@ -87,14 +86,10 @@ function collectToolPolicySources(policy: unknown, label: string, out: ToolAllow
 function collectToolAllowlistSources(cfg: OpenClawConfig): ToolAllowlistSource[] {
   const sources: ToolAllowlistSource[] = [];
   collectToolPolicySources(cfg.tools, "tools", sources);
-  const agentList = cfg.agents?.list;
-  if (Array.isArray(agentList)) {
-    agentList.forEach((agent, index) => {
-      if (!hasRecord(agent)) {
-        return;
-      }
-      collectToolPolicySources(agent.tools, `agents.list[${index}].tools`, sources);
-    });
+  for (const { entry: agent, source } of listAgentEntriesWithSource(cfg)) {
+    const label =
+      source.kind === "entries" ? `agents.entries.${source.key}` : `agents.list[${source.index}]`;
+    collectToolPolicySources(agent.tools, `${label}.tools`, sources);
   }
   return sources;
 }
@@ -127,7 +122,7 @@ function collectToolOwners(registry: PluginManifestRegistry): Map<string, string
   for (const plugin of registry.plugins) {
     const pluginId = normalizePluginId(plugin.id);
     for (const toolNameRaw of plugin.contracts?.tools ?? []) {
-      const toolName = normalizeToolName(toolNameRaw);
+      const toolName = normalizeToolPolicyName(toolNameRaw);
       if (!toolName) {
         continue;
       }
@@ -147,73 +142,14 @@ function collectConfiguredMcpServerNames(cfg: OpenClawConfig): string[] {
     return [];
   }
   return Object.entries(servers)
-    .filter(([, value]) => hasRecord(value))
+    .filter(([, value]) => hasRecord(value) && value.enabled !== false)
     .map(([name]) => name.trim())
     .filter(Boolean)
     .toSorted((left, right) => left.localeCompare(right));
 }
 
-function normalizeProviderKey(value: string): string {
-  const normalized = normalizeLowercaseStringOrEmpty(value);
-  const slashIndex = normalized.indexOf("/");
-  if (slashIndex <= 0) {
-    return normalizeProviderId(normalized);
-  }
-  const provider = normalizeProviderId(normalized.slice(0, slashIndex));
-  const modelId = normalized.slice(slashIndex + 1);
-  return modelId ? `${provider}/${modelId}` : provider;
-}
-
-function isCanonicalProviderKey(value: string): boolean {
-  return normalizeLowercaseStringOrEmpty(value) === normalizeProviderKey(value);
-}
-
 function asToolPolicyConfig(value: unknown): ToolPolicyConfig | undefined {
   return hasRecord(value) ? (value as ToolPolicyConfig) : undefined;
-}
-
-function resolveProviderToolPolicy(params: {
-  byProvider: unknown;
-  modelProvider: string;
-  modelId: string;
-}): ToolPolicyConfig | undefined {
-  if (!hasRecord(params.byProvider)) {
-    return undefined;
-  }
-  const provider = normalizeProviderId(params.modelProvider);
-  const modelId = normalizeLowercaseStringOrEmpty(params.modelId);
-  const providerModel = modelId ? `${provider}/${modelId}` : undefined;
-  const lookup = new Map<string, { canonical: boolean; policy: ToolPolicyConfig }>();
-  for (const [key, value] of Object.entries(params.byProvider)) {
-    const normalizedKey = normalizeProviderKey(key);
-    const policy = asToolPolicyConfig(value);
-    if (normalizedKey && policy) {
-      const canonical = isCanonicalProviderKey(key);
-      const existing = lookup.get(normalizedKey);
-      if (!existing || (canonical && !existing.canonical)) {
-        lookup.set(normalizedKey, { canonical, policy });
-      }
-    }
-  }
-  return (
-    (providerModel ? lookup.get(providerModel)?.policy : undefined) ?? lookup.get(provider)?.policy
-  );
-}
-
-function resolvePrimaryModelRef(
-  cfg: OpenClawConfig,
-  agentModel?: AgentModelConfig,
-): { provider: string; model: string } {
-  const raw =
-    resolveAgentModelPrimaryValue(agentModel) ??
-    resolveAgentModelPrimaryValue(cfg.agents?.defaults?.model) ??
-    DEFAULT_MODEL;
-  return (
-    parseModelRef(raw, DEFAULT_PROVIDER, { allowPluginNormalization: false }) ?? {
-      provider: DEFAULT_PROVIDER,
-      model: DEFAULT_MODEL,
-    }
-  );
 }
 
 function isSandboxModeActive(mode: unknown): boolean {
@@ -267,7 +203,7 @@ function buildEffectiveSandboxToolPolicy(params: {
   globalPolicy: unknown;
   nonSandboxToolPolicyBlocksMcp: boolean;
 }): ActiveSandboxToolPolicy {
-  const agentLabel = params.agentLabel ?? "agents.list[].tools.sandbox.tools";
+  const agentLabel = params.agentLabel ?? "agents.entries.*.tools.sandbox.tools";
   const allow = pickSandboxToolPolicyField({
     agentPolicy: params.agentPolicy,
     globalPolicy: params.globalPolicy,
@@ -342,35 +278,31 @@ function collectActiveSandboxToolPolicies(
     addGlobalPolicy();
   }
 
-  const agentList = cfg.agents?.list;
-  if (Array.isArray(agentList)) {
-    agentList.forEach((agent, index) => {
-      if (!hasRecord(agent)) {
-        return;
-      }
-      const agentSandbox = hasRecord(agent.sandbox) ? agent.sandbox : undefined;
-      const explicitMode = agentSandbox?.mode;
-      const agentSandboxActive =
-        explicitMode === undefined ? defaultSandboxActive : isSandboxModeActive(explicitMode);
-      if (!agentSandboxActive) {
-        return;
-      }
-      const agentTools = hasRecord(agent.tools) ? agent.tools : undefined;
-      const agentToolsSandbox = hasRecord(agentTools?.sandbox) ? agentTools.sandbox : undefined;
-      const agentPolicy = hasRecord(agentToolsSandbox?.tools) ? agentToolsSandbox.tools : undefined;
-      addPolicy(
-        buildEffectiveSandboxToolPolicy({
-          agentPolicy,
-          agentLabel: `agents.list[${index}].tools.sandbox.tools`,
-          globalPolicy,
-          nonSandboxToolPolicyBlocksMcp: nonSandboxToolPoliciesBlockMcp({
-            cfg,
-            serverNames,
-            agent,
-          }),
+  for (const { entry: agent, source } of listAgentEntriesWithSource(cfg)) {
+    const agentSandbox = hasRecord(agent.sandbox) ? agent.sandbox : undefined;
+    const explicitMode = agentSandbox?.mode;
+    const agentSandboxActive =
+      explicitMode === undefined ? defaultSandboxActive : isSandboxModeActive(explicitMode);
+    if (!agentSandboxActive) {
+      continue;
+    }
+    const agentTools = hasRecord(agent.tools) ? agent.tools : undefined;
+    const agentToolsSandbox = hasRecord(agentTools?.sandbox) ? agentTools.sandbox : undefined;
+    const agentPolicy = hasRecord(agentToolsSandbox?.tools) ? agentToolsSandbox.tools : undefined;
+    const label =
+      source.kind === "entries" ? `agents.entries.${source.key}` : `agents.list[${source.index}]`;
+    addPolicy(
+      buildEffectiveSandboxToolPolicy({
+        agentPolicy,
+        agentLabel: `${label}.tools.sandbox.tools`,
+        globalPolicy,
+        nonSandboxToolPolicyBlocksMcp: nonSandboxToolPoliciesBlockMcp({
+          cfg,
+          serverNames,
+          agent,
         }),
-      );
-    });
+      }),
+    );
   }
 
   return [...out.values()];
@@ -387,7 +319,7 @@ function buildMcpToolNamePrefixes(serverNames: readonly string[]): string[] {
   const usedNames = new Set<string>();
   return serverNames
     .map((serverName) =>
-      normalizeToolName(`${sanitizeServerName(serverName, usedNames)}${TOOL_NAME_SEPARATOR}`),
+      normalizeToolPolicyName(`${sanitizeServerName(serverName, usedNames)}${TOOL_NAME_SEPARATOR}`),
     )
     .filter(Boolean);
 }
@@ -397,7 +329,7 @@ function entriesMatchMcpTool(
   serverNames: readonly string[],
   mode: "any" | "every",
 ): boolean {
-  const normalizedEntries = entries.map(normalizeToolName).filter(Boolean);
+  const normalizedEntries = entries.map(normalizeToolPolicyName).filter(Boolean);
   if (
     normalizedEntries.some(
       (entry) => entry === "*" || entry === "bundle-mcp" || entry === "group:plugins",
@@ -406,8 +338,11 @@ function entriesMatchMcpTool(
     return true;
   }
   const serverPrefixes = buildMcpToolNamePrefixes(serverNames);
-  const patterns = compileGlobPatterns({ raw: normalizedEntries, normalize: normalizeToolName });
-  const probeNames = buildMcpProbeToolNames(serverNames).map(normalizeToolName);
+  const patterns = compileGlobPatterns({
+    raw: normalizedEntries,
+    normalize: normalizeToolPolicyName,
+  });
+  const probeNames = buildMcpProbeToolNames(serverNames).map(normalizeToolPolicyName);
   const prefixOrPatternMatches = (prefix: string, index: number) =>
     normalizedEntries.some((entry) => entry.length > prefix.length && entry.startsWith(prefix)) ||
     matchesAnyGlobPattern(probeNames[index] ?? "", patterns);
@@ -491,14 +426,17 @@ function nonSandboxToolPoliciesBlockMcp(params: {
 }): boolean {
   const globalTools = params.cfg.tools;
   const agentTools = asToolPolicyConfig(params.agent?.tools);
-  const modelRef = resolvePrimaryModelRef(params.cfg, params.agent?.model as AgentModelConfig);
+  const modelRef = resolveDoctorPrimaryModelRef(
+    params.cfg,
+    params.agent?.model as AgentModelConfig,
+  );
   const globalProviderPolicy = resolveProviderToolPolicy({
     byProvider: globalTools?.byProvider,
     modelProvider: modelRef.provider,
     modelId: modelRef.model,
   });
   const agentProviderPolicy = resolveProviderToolPolicy({
-    byProvider: agentTools?.byProvider,
+    byProvider: hasRecord(agentTools?.byProvider) ? agentTools.byProvider : undefined,
     modelProvider: modelRef.provider,
     modelId: modelRef.model,
   });
@@ -573,6 +511,7 @@ function addIssue(issues: Map<string, Set<string>>, key: string, sourceLabel: st
   issues.set(key, sources);
 }
 
+/** Collect warnings when plugin allowlists block tools referenced by active tool policies. */
 export function collectPluginToolAllowlistWarnings(params: {
   cfg: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
@@ -596,7 +535,7 @@ export function collectPluginToolAllowlistWarnings(params: {
   }
 
   const wildcardSources = sources
-    .filter((source) => source.entries.some((entry) => normalizeToolName(entry) === "*"))
+    .filter((source) => source.entries.some((entry) => normalizeToolPolicyName(entry) === "*"))
     .map((source) => source.label);
   if (wildcardSources.length > 0) {
     warnings.push(
@@ -606,7 +545,7 @@ export function collectPluginToolAllowlistWarnings(params: {
 
   const exactEntries = sources.flatMap((source) =>
     source.entries
-      .map((entry) => ({ source: source.label, entry: normalizeToolName(entry) }))
+      .map((entry) => ({ source: source.label, entry: normalizeToolPolicyName(entry) }))
       .filter(({ entry }) => entry && entry !== "*" && entry !== "group:plugins"),
   );
   if (exactEntries.length === 0) {

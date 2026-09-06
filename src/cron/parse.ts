@@ -1,21 +1,6 @@
-import { parseStrictPositiveInteger } from "../infra/parse-finite-number.js";
-
-const ISO_TZ_RE = /(Z|[+-]\d{2}:?\d{2})$/i;
-const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const ISO_DATE_TIME_RE = /^\d{4}-\d{2}-\d{2}T/;
-
-function normalizeUtcIso(raw: string) {
-  if (ISO_TZ_RE.test(raw)) {
-    return raw;
-  }
-  if (ISO_DATE_RE.test(raw)) {
-    return `${raw}T00:00:00Z`;
-  }
-  if (ISO_DATE_TIME_RE.test(raw)) {
-    return `${raw}Z`;
-  }
-  return raw;
-}
+/** Parses cron schedule timestamps from user-facing absolute time strings. */
+import { parseStrictPositiveInteger } from "@openclaw/normalization-core/number-coercion";
+import { hasValidIsoCalendarComponents, normalizeUtcIso } from "../shared/iso-time.js";
 
 /** Parses absolute cron timestamps from epoch milliseconds or ISO-like strings normalized to UTC. */
 export function parseAbsoluteTimeMs(input: string): number | null {
@@ -28,6 +13,9 @@ export function parseAbsoluteTimeMs(input: string): number | null {
     if (n !== undefined && Number.isFinite(new Date(n).getTime())) {
       return n;
     }
+    return null;
+  }
+  if (!hasValidIsoCalendarComponents(raw)) {
     return null;
   }
   const parsed = Date.parse(normalizeUtcIso(raw));

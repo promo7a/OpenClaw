@@ -1,3 +1,6 @@
+// Shared outbound target test fixtures provide deterministic channel plugins,
+// target parsing, and session-route behavior.
+import { parseTelegramTargetForTest } from "../../../test/helpers/infra/telegram-targets.js";
 import type {
   ChannelMessagingAdapter,
   ChannelOutboundAdapter,
@@ -7,6 +10,7 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { buildChannelOutboundSessionRoute } from "../../plugin-sdk/core.js";
 import { createTestRegistry } from "../../test-utils/channel-plugins.js";
 
+// Target fixtures keep normalization deterministic while exercising plugin-owned seams.
 function readTestDefaultTo(cfg: OpenClawConfig, channelId: string): string | undefined {
   const channels = cfg.channels as Record<string, { defaultTo?: unknown }> | undefined;
   const value = channels?.[channelId]?.defaultTo;
@@ -17,7 +21,8 @@ function stripTestPrefix(raw: string, channelId: string): string {
   return raw.replace(new RegExp(`^${channelId}:`, "i"), "").trim();
 }
 
-export function parseForumTargetForTest(raw: string): {
+/** Parses forum test targets with optional topic/thread suffixes. */
+function parseForumTargetForTest(raw: string): {
   roomId: string;
   threadId?: number;
   chatType: "direct" | "group" | "unknown";
@@ -53,31 +58,6 @@ function createGenericResolveTarget(
     }
     return { ok: true, to: normalized };
   };
-}
-
-export function parseTelegramTargetForTest(raw: string): {
-  chatId: string;
-  messageThreadId?: number;
-  chatType: "direct" | "group" | "unknown";
-} {
-  const trimmed = raw.trim();
-  const withoutPrefix = trimmed.replace(/^telegram:/i, "").trim();
-  const topicMatch = withoutPrefix.match(/^(.*):topic:(\d+)$/i);
-  const colonMatch = withoutPrefix.match(/^(-?\d+):(\d+)$/i);
-  const chatId = topicMatch?.[1]?.trim() || colonMatch?.[1] || withoutPrefix;
-  const messageThreadId = topicMatch?.[2]
-    ? Number.parseInt(topicMatch[2], 10)
-    : colonMatch?.[2]
-      ? Number.parseInt(colonMatch[2], 10)
-      : undefined;
-  const numericId = chatId.startsWith("-") ? chatId.slice(1) : chatId;
-  const chatType =
-    /^\d+$/.test(numericId) && !chatId.startsWith("-100")
-      ? "direct"
-      : chatId.startsWith("-")
-        ? "group"
-        : "unknown";
-  return { chatId, messageThreadId, chatType };
 }
 
 export const telegramMessagingForTest: ChannelMessagingAdapter = {
@@ -189,6 +169,9 @@ export function createGenericTargetTestPlugin(
     },
     messaging: {
       targetPrefixes: [String(id)],
+      // Owner-route tests need positive direct classification; syntax alone
+      // never admits an implicit owner destination.
+      inferTargetChatType: ({ to }) => (/^user:/i.test(to) ? "direct" : undefined),
     },
     resolveDefaultTo: ({ cfg }) => readTestDefaultTo(cfg, String(id)),
   });

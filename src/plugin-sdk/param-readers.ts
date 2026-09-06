@@ -1,3 +1,6 @@
+/**
+ * Public SDK subpath for typed tool parameter readers.
+ */
 export {
   readFiniteNumberParam,
   readNonNegativeIntegerParam,
@@ -5,5 +8,5 @@ export {
   readPositiveIntegerParam,
   readStringArrayParam,
   readStringOrNumberParam,
-  readStringParam,
+  readToolStringParam as readStringParam,
 } from "../agents/tools/common.js";

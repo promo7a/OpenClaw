@@ -4,14 +4,16 @@ import SwiftUI
 
 struct AgentProTab: View {
     @Environment(NodeAppModel.self) var appModel
-    @Environment(\.colorScheme) var colorScheme
     @Environment(\.scenePhase) var scenePhase
+    let directRoute: AgentRoute
+    let headerSidebarAction: OpenClawSidebarHeaderAction?
+    let headerTitle: String
+    let openSettings: (() -> Void)?
     @State var overview: AgentOverviewSnapshot?
     @State var overviewErrorText: String?
     @State var overviewLoading: Bool = false
-    @State var overviewRefreshNonce: Int = 0
+    @State var overviewRefreshGate = AgentOverviewRefreshGate()
     @State var agentRosterFilter: AgentRosterFilter = .all
-    @State var agentSearchPresented = false
     @State var agentSearchText = ""
     @State var skillFilter: String = ""
     @State var skillStatusFilter: SkillStatusFilter = .all
@@ -28,14 +30,20 @@ struct AgentProTab: View {
     @State var clawHubErrorText: String?
     @State var clawHubInstallSlug: String?
     @State var cronActionBusyIDs: Set<String> = []
+    @State var pendingCronRuns = AgentAutomationPendingRunRegistry()
     @State var cronActionStatusText: String?
+    @State var automationQuery = ""
+    @State var automationListFilter: AutomationListFilter = .all
+    @State var automationEditorSelection: AutomationEditorSelection?
 
     enum AgentRoute: Hashable {
+        case agents
         case skills
-        case nodes
+        case instances
         case cron
         case usage
         case dreaming
+        case files
     }
 
     enum SkillStatusFilter: String, CaseIterable, Identifiable {
@@ -51,11 +59,11 @@ struct AgentProTab: View {
 
         var title: String {
             switch self {
-            case .all: "All"
-            case .enabled: "Enabled"
-            case .off: "Off"
-            case .setup: "Setup"
-            case .blocked: "Blocked"
+            case .all: String(localized: "All")
+            case .enabled: String(localized: "Enabled")
+            case .off: String(localized: "Off")
+            case .setup: String(localized: "Setup")
+            case .blocked: String(localized: "Blocked")
             }
         }
     }
@@ -63,8 +71,7 @@ struct AgentProTab: View {
     enum AgentRosterFilter: String, CaseIterable, Identifiable {
         case all
         case online
-        case busy
-        case idle
+        case ready
 
         var id: Self {
             self
@@ -72,46 +79,66 @@ struct AgentProTab: View {
 
         var title: String {
             switch self {
-            case .all: "All"
-            case .online: "Online"
-            case .busy: "Busy"
-            case .idle: "Idle"
+            case .all: String(localized: "All")
+            case .online: String(localized: "Online")
+            case .ready: String(localized: "Ready")
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .all: "person.2"
+            case .online: "antenna.radiowaves.left.and.right"
+            case .ready: "checkmark.circle"
+            }
+        }
+    }
+
+    enum AutomationListFilter: String, CaseIterable, Identifiable {
+        case all
+        case active
+        case paused
+
+        var id: Self {
+            self
+        }
+
+        var title: String {
+            switch self {
+            case .all: String(localized: "All")
+            case .active: String(localized: "Active")
+            case .paused: String(localized: "Paused")
             }
         }
     }
 
     enum AgentLayout {
-        static let cardRadius: CGFloat = 12
-        static let filterHeight: CGFloat = 34
-        static let rowMinHeight: CGFloat = 104
-        static let metricTileHeight: CGFloat = 94
-        static let actionButtonSize: CGFloat = 34
+        static let cardRadius: CGFloat = OpenClawProMetric.cardRadius
     }
 
     enum AgentRosterState: Equatable {
         case online
-        case busy
-        case idle
-
-        var title: String {
-            switch self {
-            case .online: "Online"
-            case .busy: "Busy"
-            case .idle: "Idle"
-            }
-        }
+        case ready
 
         var color: Color {
             switch self {
             case .online: OpenClawBrand.ok
-            case .busy: OpenClawBrand.warn
-            case .idle: Color(red: 0 / 255.0, green: 122 / 255.0, blue: 255 / 255.0)
+            case .ready: OpenClawBrand.info
             }
         }
     }
 
     struct SkillEditorSelection: Identifiable {
         let id: String
+    }
+
+    struct AutomationEditorSelection: Identifiable {
+        let initialJob: CronJob
+        let sourceGatewayID: String
+
+        var id: String {
+            self.initialJob.id
+        }
     }
 
     struct SkillEditorMessage {
@@ -124,40 +151,52 @@ struct AgentProTab: View {
         }
     }
 
+    init(
+        directRoute: AgentRoute,
+        headerSidebarAction: OpenClawSidebarHeaderAction? = nil,
+        headerTitle: String = "Agents",
+        openSettings: (() -> Void)? = nil)
+    {
+        self.directRoute = directRoute
+        self.headerSidebarAction = headerSidebarAction
+        self.headerTitle = headerTitle
+        self.openSettings = openSettings
+    }
+
     var body: some View {
-        NavigationStack {
-            ZStack {
-                OpenClawProBackground()
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
-                        self.rosterHeader
-                        self.agentFilters
-                        self.agentsSection
-                        self.operationsSection
-                        self.dreamingSection
-                        self.cronSection
-                    }
-                    .padding(.vertical, 18)
+        self.directDestination(for: self.directRoute)
+            .task(id: self.overviewTaskID) {
+                await self.refreshOverview(force: false)
+            }
+            .sheet(item: self.$skillEditorSelection) { selection in
+                if let skill = self.skillByKey(selection.id) {
+                    self.skillEditorSheet(skill)
+                } else {
+                    self.missingSkillEditorSheet
                 }
-                .refreshable {
-                    await self.refreshOverview(force: true)
-                }
-                .safeAreaPadding(.bottom, OpenClawProMetric.bottomScrollInset)
             }
-            .navigationBarHidden(true)
-            .navigationDestination(for: AgentRoute.self) { route in
-                self.destination(for: route)
+            .sheet(item: self.$automationEditorSelection) { selection in
+                AgentAutomationDetailScreen(
+                    initialJob: selection.initialJob,
+                    sourceGatewayID: selection.sourceGatewayID,
+                    pendingRunRegistry: self.pendingCronRuns,
+                    onRunQueued: { runID, processInstanceID in
+                        self.reservePendingCronRun(
+                            jobID: selection.initialJob.id,
+                            runID: runID,
+                            processInstanceID: processInstanceID,
+                            sourceGatewayID: selection.sourceGatewayID)
+                    },
+                    onChanged: {
+                        Task { await self.refreshOverview(force: true) }
+                    })
             }
-        }
-        .task(id: self.overviewTaskID) {
-            await self.refreshOverview(force: false)
-        }
-        .sheet(item: self.$skillEditorSelection) { selection in
-            if let skill = self.skillByKey(selection.id) {
-                self.skillEditorSheet(skill)
-            } else {
-                self.missingSkillEditorSheet
-            }
-        }
+    }
+
+    private func directDestination(for route: AgentRoute) -> some View {
+        self.destination(for: route)
+            .toolbar(
+                route != .agents && self.directHeaderSidebarAction(for: route) != nil ? .hidden : .visible,
+                for: .navigationBar)
     }
 }

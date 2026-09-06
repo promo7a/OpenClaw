@@ -16,7 +16,7 @@ OpenClaw voice-call plugin for Twilio, Telnyx, and Plivo phone calls.
 
 ## Surface
 
-contracts: tools
+CLI commands: `openclaw voicecall`; contracts: `tools`; skills
 
 ## Related docs
 

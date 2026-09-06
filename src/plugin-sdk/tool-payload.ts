@@ -1,21 +1,24 @@
+// Tool payload helpers normalize provider tool-call schemas and compatibility payloads.
 import {
   parseStandalonePlainTextToolCallBlocks as parseStandaloneRepairToolCallBlocks,
   stripPlainTextToolCallBlocks as stripRepairToolCallBlocks,
+  type PlainTextToolCallBlock,
+  type PlainTextToolCallParseOptions,
+  type PlainTextToolCallProtectedRange,
 } from "../../packages/tool-call-repair/src/index.js";
 
-export type PlainTextToolCallBlock = {
-  arguments: Record<string, unknown>;
-  end: number;
-  name: string;
-  raw: string;
-  start: number;
+export type {
+  PlainTextToolCallBlock,
+  PlainTextToolCallParseOptions,
+  PlainTextToolCallProtectedRange,
+} from "../../packages/tool-call-repair/src/index.js";
+
+export type PlainTextToolCallStripOptions = {
+  /** Resolves literal source ranges that must not be interpreted as tool calls. */
+  resolveProtectedRanges?: (text: string) => readonly PlainTextToolCallProtectedRange[];
 };
 
-export type PlainTextToolCallParseOptions = {
-  allowedToolNames?: Iterable<string>;
-  maxPayloadBytes?: number;
-};
-
+/** Parses a message made only of standalone plain-text tool call blocks. */
 export function parseStandalonePlainTextToolCallBlocks(
   text: string,
   options?: PlainTextToolCallParseOptions,
@@ -23,8 +26,12 @@ export function parseStandalonePlainTextToolCallBlocks(
   return parseStandaloneRepairToolCallBlocks(text, options);
 }
 
-export function stripPlainTextToolCallBlocks(text: string): string {
-  return stripRepairToolCallBlocks(text);
+/** Removes full-line standalone plain-text tool call blocks from visible text. */
+export function stripPlainTextToolCallBlocks(
+  text: string,
+  options?: PlainTextToolCallStripOptions,
+): string {
+  return stripRepairToolCallBlocks(text, options);
 }
 
 type ToolPayloadTextBlock = {
@@ -32,8 +39,11 @@ type ToolPayloadTextBlock = {
   text: string;
 };
 
+/** Minimal tool-result-like object shape accepted by payload extraction helpers. */
 export type ToolPayloadCarrier = {
+  /** Structured payload preferred over content text when present. */
   details?: unknown;
+  /** Provider/tool content blocks or fallback payload. */
   content?: unknown;
 };
 
@@ -54,6 +64,7 @@ export function extractToolPayload(result: ToolPayloadCarrier | null | undefined
   if (!result) {
     return undefined;
   }
+  // Structured details are authoritative; content text is only a compatibility fallback.
   if (result.details !== undefined) {
     return result.details;
   }

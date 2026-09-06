@@ -1,3 +1,4 @@
+// Exercises wired plugin hooks after tool-call completion.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 /**
  * Test: after_tool_call hook wiring (embedded-agent-subscribe.handlers.tools.ts)
@@ -21,6 +22,9 @@ vi.mock("../infra/agent-events.js", () => ({
   emitAgentCommandOutputEvent: vi.fn(),
   emitAgentItemEvent: vi.fn(),
   emitAgentEvent: vi.fn(),
+  getAgentEventLifecycleGeneration: () => "test-generation",
+  isAgentEventLifecycleGenerationCurrent: (generation: string) => generation === "test-generation",
+  registerAgentEventLifecycleRotationHandler: vi.fn(),
 }));
 
 function createToolHandlerCtx(params: {

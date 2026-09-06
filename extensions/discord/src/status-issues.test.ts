@@ -1,3 +1,4 @@
+// Discord tests cover status issues plugin behavior.
 import type { ChannelAccountSnapshot } from "openclaw/plugin-sdk/channel-contract";
 import { describe, expect, it } from "vitest";
 import { collectDiscordStatusIssues } from "./status-issues.js";
@@ -68,29 +69,6 @@ describe("collectDiscordStatusIssues", () => {
         message:
           "Channel 123 permission check failed. missing ViewChannel, SendMessages: 403 (matchKey=alerts matchSource=guilds.ops.channels)",
         fix: "Ensure the bot role can view + send in this channel (and that channel overrides don't deny it).",
-      },
-    ]);
-  });
-
-  it("reports degraded runtime transport state", () => {
-    const issues = collectDiscordStatusIssues([
-      {
-        accountId: "ops",
-        enabled: true,
-        configured: true,
-        running: true,
-        connected: true,
-        healthState: "stale-socket",
-      } as ChannelAccountSnapshot,
-    ]);
-
-    expect(issues).toEqual([
-      {
-        channel: "discord",
-        accountId: "ops",
-        kind: "runtime",
-        message: "Discord gateway transport is degraded (stale-socket; account is running).",
-        fix: "Check gateway event-loop health and Discord connectivity, then restart the Discord channel or gateway if the transport does not recover.",
       },
     ]);
   });

@@ -1,3 +1,4 @@
+/** Tests ACP translator session-list cursor and page-size helpers. */
 import { describe, expect, it } from "vitest";
 import {
   ACP_LIST_SESSIONS_MAX_FETCH_LIMIT,
@@ -26,6 +27,18 @@ describe("ACP translator session list helpers", () => {
         ).toString("base64url"),
       ),
     ).toThrow("Invalid ACP session list cursor offset.");
+  });
+
+  it("rejects altered and non-emitted cursor spellings", () => {
+    const canonical = encodeListSessionsCursor({ offset: 25, cwd: "/tmp/work" });
+    const extraField = Buffer.from(
+      JSON.stringify({ v: 1, offset: 25, cwd: "/tmp/work", extra: true }),
+      "utf8",
+    ).toString("base64url");
+
+    for (const cursor of [`${canonical}$`, `${canonical}=`, ` ${canonical} `, extraField]) {
+      expect(() => decodeListSessionsCursor(cursor)).toThrow("Invalid ACP session list cursor.");
+    }
   });
 
   it("clamps page size metadata to the bridge maximum", () => {

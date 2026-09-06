@@ -1,21 +1,26 @@
+/**
+ * Shared auth profile data contracts.
+ * These types describe credential payloads, runtime selection state, and repair
+ * results consumed by providers, sessions, doctor, and plugin-facing seams.
+ */
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { SecretRef } from "../../config/types.secrets.js";
+import type { OAuthCredentialMetadata } from "./credential-schema.js";
+import type { LegacyOAuthRef } from "./legacy-oauth-ref.js";
 
+/** Provider identifier recorded on auth profile credentials. */
 export type OAuthProvider = string;
 
-export type OAuthCredentials = {
+/** Refreshable OAuth credential fields persisted for provider auth profiles. */
+export type OAuthCredentials = OAuthCredentialMetadata & {
   access: string;
   refresh: string;
   expires: number;
   provider?: OAuthProvider;
   email?: string;
-  enterpriseUrl?: string;
-  projectId?: string;
-  accountId?: string;
-  chatgptPlanType?: string;
-  idToken?: string;
 };
 
+/** API-key credential with optional secret reference indirection. */
 export type ApiKeyCredential = {
   type: "api_key";
   provider: string;
@@ -29,6 +34,7 @@ export type ApiKeyCredential = {
   metadata?: Record<string, string>;
 };
 
+/** Static token credential that OpenClaw does not refresh. */
 export type TokenCredential = {
   /**
    * Static bearer-style token (often OAuth access token / PAT).
@@ -46,10 +52,11 @@ export type TokenCredential = {
   displayName?: string;
 };
 
+/** Refreshable OAuth credential plus provider metadata and legacy references. */
 export type OAuthCredential = OAuthCredentials & {
   type: "oauth";
   provider: string;
-  clientId?: string;
+  oauthRef?: LegacyOAuthRef;
   /**
    * OAuth refresh tokens are not portable by default. Provider-owned flows may
    * set this only when copying refresh material across agents is known safe.
@@ -59,8 +66,10 @@ export type OAuthCredential = OAuthCredentials & {
   displayName?: string;
 };
 
+/** Credential variants supported by auth profiles. */
 export type AuthProfileCredential = ApiKeyCredential | TokenCredential | OAuthCredential;
 
+/** Closed reasons that drive cooldown, disable, and failure counters. */
 export type AuthProfileFailureReason =
   | "auth"
   | "auth_permanent"
@@ -76,7 +85,12 @@ export type AuthProfileFailureReason =
   | "unclassified"
   | "unknown";
 
+/** Optional host diagnostic attached to a canonical cooldown reason. */
+export type AuthProfileCooldownClassification = "wham_token_expired" | "wham_account_dead";
+
+/** Profile-wide blocked reason reported by provider usage probes. */
 export type AuthProfileBlockedReason = "subscription_limit";
+/** Source that marked a profile as blocked. */
 export type AuthProfileBlockedSource = "codex_rate_limits" | "wham";
 
 /** Per-profile usage statistics for round-robin and cooldown tracking */
@@ -86,16 +100,20 @@ export type ProfileUsageStats = {
   blockedReason?: AuthProfileBlockedReason;
   blockedSource?: AuthProfileBlockedSource;
   blockedModel?: string;
+  blockedScope?: "model";
   cooldownUntil?: number;
   cooldownReason?: AuthProfileFailureReason;
+  cooldownClassification?: AuthProfileCooldownClassification;
   cooldownModel?: string;
   disabledUntil?: number;
   disabledReason?: AuthProfileFailureReason;
   errorCount?: number;
   failureCounts?: Partial<Record<AuthProfileFailureReason, number>>;
   lastFailureAt?: number;
+  lastProbeAt?: number;
 };
 
+/** Durable, non-secret auth profile selection state. */
 export type AuthProfileState = {
   /**
    * Optional per-agent preferred profile order overrides.
@@ -108,23 +126,37 @@ export type AuthProfileState = {
   usageStats?: Record<string, ProfileUsageStats>;
 };
 
+/** Persisted credential payload without runtime-only selection state. */
 export type AuthProfileSecretsStore = {
   version: number;
   profiles: Record<string, AuthProfileCredential>;
 };
 
+/** Persisted runtime-state payload with a schema version. */
 export type AuthProfileStateStore = {
   version: number;
 } & AuthProfileState;
 
+/** Effective in-memory auth store combining credentials, state, and overlays. */
 export type AuthProfileStore = AuthProfileSecretsStore &
   AuthProfileState & {
+    /** Runtime-only provenance for credentials cloned from persisted auth stores. */
+    runtimePersistedProfileIds?: string[];
     /** Runtime-only provenance for external OAuth profiles overlaid onto this store. */
     runtimeExternalProfileIds?: string[];
     /** True when the runtime external profile set was freshly resolved, even if empty. */
     runtimeExternalProfileIdsAuthoritative?: boolean;
   };
 
+/** Internal effective-store ownership metadata; never exposed through the plugin SDK. */
+export type RuntimeAuthProfileStore = AuthProfileStore & {
+  /** Runtime-only built-in CLI winners; internal provenance, never exposed or persisted. */
+  runtimeExternalCliProfileIds?: string[];
+  runtimeLocalProfileIds?: string[];
+  runtimeInheritsMainState?: boolean;
+};
+
+/** Result returned by config/store auth profile id repair. */
 export type AuthProfileIdRepairResult = {
   config: OpenClawConfig;
   changes: string[];

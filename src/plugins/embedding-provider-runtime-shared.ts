@@ -1,53 +1,18 @@
+/** Shared runtime helpers for embedding provider lookup across core and plugin capabilities. */
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   resolvePluginCapabilityProvider,
   resolvePluginCapabilityProviders,
+  type CapabilityProviderFor,
 } from "./capability-provider-runtime.js";
 
-type EmbeddingProviderCapabilityKey = "embeddingProviders" | "memoryEmbeddingProviders";
+type EmbeddingProviderCapabilityKey = "embeddingProviders";
 type RegisteredAdapterEntry<TAdapter> = {
   adapter: TAdapter;
 };
-type ConfiguredModelProvider = NonNullable<
-  NonNullable<OpenClawConfig["models"]>["providers"]
->[string];
 
-function resolveConfiguredProviderConfig(
-  providerId: string,
-  cfg?: OpenClawConfig,
-): ConfiguredModelProvider | undefined {
-  const providers = cfg?.models?.providers;
-  if (!providers) {
-    return undefined;
-  }
-  const normalized = normalizeProviderId(providerId);
-  return (
-    providers[providerId] ??
-    Object.entries(providers).find(
-      ([candidateId]) => normalizeProviderId(candidateId) === normalized,
-    )?.[1]
-  );
-}
-
-export function readConfiguredProviderApiId(params: {
-  providerId: string;
-  cfg?: OpenClawConfig;
-  resolveApiProviderId?: (normalizedApiId: string) => string | undefined;
-  resolveMissingApiProviderId?: (providerConfig: ConfiguredModelProvider) => string | undefined;
-}): string | undefined {
-  const providerConfig = resolveConfiguredProviderConfig(params.providerId, params.cfg);
-  if (!providerConfig) {
-    return undefined;
-  }
-  const normalized = normalizeProviderId(params.providerId);
-  const api = providerConfig.api?.trim();
-  const resolvedProviderId = api
-    ? (params.resolveApiProviderId?.(normalizeProviderId(api)) ?? normalizeProviderId(api))
-    : params.resolveMissingApiProviderId?.(providerConfig);
-  return resolvedProviderId && resolvedProviderId !== normalized ? resolvedProviderId : undefined;
-}
-
+/** Builds lookup ids for embedding providers, including configured API aliases. */
 export function resolveRuntimeEmbeddingProviderLookupIds(params: {
   id: string;
   cfg?: OpenClawConfig;
@@ -64,16 +29,19 @@ export function resolveRuntimeEmbeddingProviderLookupIds(params: {
   return ids;
 }
 
-export function listRuntimeEmbeddingProviderAdapters<TAdapter extends { id: string }>(params: {
-  key: EmbeddingProviderCapabilityKey;
+/** Lists registered and plugin-contributed embedding provider adapters for a capability key. */
+export function listRuntimeEmbeddingProviderAdapters<
+  K extends EmbeddingProviderCapabilityKey,
+>(params: {
+  key: K;
   cfg?: OpenClawConfig;
-  registered: TAdapter[];
-}): TAdapter[] {
+  registered: CapabilityProviderFor<K>[];
+}): CapabilityProviderFor<K>[] {
   const merged = new Map(params.registered.map((adapter) => [adapter.id, adapter]));
   const capabilityAdapters = resolvePluginCapabilityProviders({
     key: params.key,
     cfg: params.cfg,
-  }) as unknown as TAdapter[];
+  });
   for (const adapter of capabilityAdapters) {
     if (!merged.has(adapter.id)) {
       merged.set(adapter.id, adapter);
@@ -82,24 +50,29 @@ export function listRuntimeEmbeddingProviderAdapters<TAdapter extends { id: stri
   return [...merged.values()];
 }
 
-export function getRuntimeEmbeddingProviderAdapter<TAdapter extends { id: string }>(params: {
-  key: EmbeddingProviderCapabilityKey;
+/** Resolves one embedding provider adapter from registered providers before plugin capabilities. */
+export function getRuntimeEmbeddingProviderAdapter<
+  K extends EmbeddingProviderCapabilityKey,
+>(params: {
+  key: K;
   cfg?: OpenClawConfig;
   lookupIds: string[];
-  getRegisteredProvider: (id: string) => RegisteredAdapterEntry<TAdapter> | undefined;
-}): TAdapter | undefined {
+  getRegisteredProvider: (
+    id: string,
+  ) => RegisteredAdapterEntry<CapabilityProviderFor<K>> | undefined;
+}): CapabilityProviderFor<K> | undefined {
+  // Resolve each exact id before trying the next configured alias. Otherwise a
+  // registered alias can shadow a plugin-owned adapter for the requested id.
   for (const candidateId of params.lookupIds) {
     const registered = params.getRegisteredProvider(candidateId);
     if (registered) {
       return registered.adapter;
     }
-  }
-  for (const candidateId of params.lookupIds) {
     const provider = resolvePluginCapabilityProvider({
       key: params.key,
       providerId: candidateId,
       cfg: params.cfg,
-    }) as TAdapter | undefined;
+    });
     if (provider) {
       return provider;
     }

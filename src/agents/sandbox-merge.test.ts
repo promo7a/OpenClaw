@@ -1,3 +1,4 @@
+// Verifies sandbox config merge precedence across global, agent, and shared scopes.
 import { describe, expect, it } from "vitest";
 import {
   resolveSandboxBrowserConfig,
@@ -60,6 +61,7 @@ describe("sandbox config merges", () => {
   });
 
   it("resolves docker binds and shared-scope override behavior", () => {
+    // Shared scope intentionally ignores agent-specific Docker overrides.
     for (const scenario of [
       {
         name: "merges sandbox docker binds (global + agent combined)",
@@ -125,12 +127,12 @@ describe("sandbox config merges", () => {
   it("applies per-agent browser and prune overrides (ignored under shared scope)", () => {
     const browser = resolveSandboxBrowserConfig({
       scope: "agent",
-      globalBrowser: { enabled: false, headless: false, enableNoVnc: true },
-      agentBrowser: { enabled: true, headless: true, enableNoVnc: false },
+      globalBrowser: { enabled: false, headless: false, noVncEnabled: true },
+      agentBrowser: { enabled: true, headless: true, noVncEnabled: false },
     });
     expect(browser.enabled).toBe(true);
     expect(browser.headless).toBe(true);
-    expect(browser.enableNoVnc).toBe(false);
+    expect(browser.noVncEnabled).toBe(false);
 
     const prune = resolveSandboxPruneConfig({
       scope: "agent",

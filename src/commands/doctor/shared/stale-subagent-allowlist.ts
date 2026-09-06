@@ -1,25 +1,21 @@
-import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import { listAgentIds } from "../../../agents/agent-scope-config.js";
+// Doctor scanner and repair for subagent allowlists that reference missing agents.
+import { listAgentEntries, listAgentIds } from "../../../agents/agent-scope-config.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
-import { normalizeAgentId } from "../../../routing/session-key.js";
+import { normalizeAgentId, normalizeOptionalAgentId } from "../../../routing/session-key.js";
+import { listMutableCodexRouteAgentEntries } from "./codex-route-agent-entries.js";
 
-export type StaleSubagentAllowlistHit = {
+type StaleSubagentAllowlistHit = {
+  /** Config path containing the stale allowAgents entry. */
   pathLabel: string;
+  /** Original configured agent id. */
   agentId: string;
+  /** Normalized agent id used for matching configured targets. */
   normalizedAgentId: string;
 };
 
-function normalizeOptionalAgentId(value: string | undefined | null): string | undefined {
-  const trimmed = normalizeOptionalString(value) ?? "";
-  if (!trimmed) {
-    return undefined;
-  }
-  return normalizeAgentId(trimmed);
-}
-
 function collectConfiguredSubagentTargetIds(cfg: OpenClawConfig): Set<string> {
   const ids = new Set<string>(listAgentIds(cfg));
-  for (const agent of cfg.agents?.list ?? []) {
+  for (const agent of listAgentEntries(cfg)) {
     if (agent.runtime?.type !== "acp") {
       continue;
     }
@@ -80,6 +76,7 @@ function collectStaleAllowlistEntries(params: {
   return hits;
 }
 
+/** Find subagent allowlist entries not backed by configured agent or ACP targets. */
 export function scanStaleSubagentAllowlistReferences(
   cfg: OpenClawConfig,
 ): StaleSubagentAllowlistHit[] {
@@ -92,12 +89,14 @@ export function scanStaleSubagentAllowlistReferences(
       configuredTargetIds,
     }),
   );
-  const agents = Array.isArray(cfg.agents?.list) ? cfg.agents.list : [];
-  for (const [index, agent] of agents.entries()) {
+  for (const { agent, path } of listMutableCodexRouteAgentEntries(cfg)) {
     hits.push(
       ...collectStaleAllowlistEntries({
-        allowAgents: agent?.subagents?.allowAgents,
-        pathLabel: `agents.list.${index}.subagents.allowAgents`,
+        allowAgents:
+          agent.subagents && typeof agent.subagents === "object"
+            ? (agent.subagents as { allowAgents?: unknown }).allowAgents
+            : undefined,
+        pathLabel: `${path}.subagents.allowAgents`,
         configuredTargetIds,
       }),
     );
@@ -105,6 +104,7 @@ export function scanStaleSubagentAllowlistReferences(
   return hits;
 }
 
+/** Format warnings for stale subagent allowlist entries. */
 export function collectStaleSubagentAllowlistWarnings(params: {
   hits: readonly StaleSubagentAllowlistHit[];
   doctorFixCommand: string;
@@ -131,6 +131,7 @@ function filterAllowAgents(params: {
   });
 }
 
+/** Remove stale subagent allowlist entries while preserving valid targets and wildcards. */
 export function maybeRepairStaleSubagentAllowlists(cfg: OpenClawConfig): {
   config: OpenClawConfig;
   changes: string[];
@@ -155,16 +156,19 @@ export function maybeRepairStaleSubagentAllowlists(cfg: OpenClawConfig): {
     });
   }
 
-  const agents = Array.isArray(next.agents?.list) ? next.agents.list : [];
-  for (const [index, agent] of agents.entries()) {
-    const pathLabel = `agents.list.${index}.subagents.allowAgents`;
+  for (const { agent, path } of listMutableCodexRouteAgentEntries(next)) {
+    const pathLabel = `${path}.subagents.allowAgents`;
     const agentHits = hitsByPath.get(pathLabel) ?? [];
-    if (agentHits.length === 0 || !Array.isArray(agent?.subagents?.allowAgents)) {
+    const subagents =
+      agent.subagents && typeof agent.subagents === "object"
+        ? (agent.subagents as { allowAgents?: string[] })
+        : undefined;
+    if (agentHits.length === 0 || !Array.isArray(subagents?.allowAgents)) {
       continue;
     }
     const staleTargetIds = new Set(agentHits.map((hit) => hit.normalizedAgentId));
-    agent.subagents.allowAgents = filterAllowAgents({
-      allowAgents: agent.subagents.allowAgents,
+    subagents.allowAgents = filterAllowAgents({
+      allowAgents: subagents.allowAgents,
       staleTargetIds,
     });
   }

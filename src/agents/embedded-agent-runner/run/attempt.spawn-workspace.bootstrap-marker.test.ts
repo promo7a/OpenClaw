@@ -1,5 +1,6 @@
+// Coverage for deciding when bootstrap completion markers are persisted.
 import { describe, expect, it } from "vitest";
-import { shouldPersistCompletedBootstrapTurn } from "./attempt.thread-helpers.js";
+import { shouldPersistCompletedBootstrapTurn } from "./attempt-thread-helpers.js";
 
 describe("runEmbeddedAttempt bootstrap completion marker", () => {
   it("keeps marker persistence enabled for clean sessions_yield exits", () => {
@@ -39,6 +40,8 @@ describe("runEmbeddedAttempt bootstrap completion marker", () => {
   });
 
   it("skips marker persistence for prompt errors and compaction-side outcomes", () => {
+    // Bootstrap completion only records clean model handoff, not compaction or
+    // interrupted prompt-side outcomes.
     expect(
       shouldPersistCompletedBootstrapTurn({
         shouldRecordCompletedBootstrapTurn: true,

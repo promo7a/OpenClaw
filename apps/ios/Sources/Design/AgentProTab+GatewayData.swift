@@ -29,45 +29,26 @@ extension AgentProTab {
 
     func agentDetail(for agent: AgentSummary) -> String {
         let parts = [
-            self.normalized(agent.workspace),
             self.modelLabel(for: agent),
-            agent.id == self.appModel.gatewayDefaultAgentId ? "default" : nil,
+            agent.id == self.appModel.gatewayDefaultAgentId ? "Default" : nil,
         ].compactMap(\.self)
         return parts.isEmpty ? agent.id : parts.joined(separator: " • ")
     }
 
-    func agentSessionSummary(_ agent: AgentSummary) -> String {
-        guard self.gatewayConnected else { return "0" }
-        if agent.id == self.activeAgentID {
-            return self.appModel.isOperatorGatewayConnected ? "1 running" : "0"
-        }
-        return "0"
-    }
-
-    func agentRuntimeSummary(_ agent: AgentSummary) -> String {
-        if let runtime = agent.agentruntime,
-           let id = runtime["id"]?.value as? String,
-           let normalized = self.normalized(id)
-        {
-            return normalized
-        }
-        if let model = self.modelLabel(for: agent) {
-            return Self.shortModelLabel(model)
-        }
-        return "default"
+    func agentAccessibilityLabel(
+        _ agent: AgentSummary,
+        isActive: Bool,
+        state: AgentRosterState) -> String
+    {
+        let status = state == .online ? "Online" : "Ready"
+        let selection = isActive ? "Selected" : "Not selected"
+        return "\(self.agentName(for: agent)), \(self.agentDetail(for: agent)), \(status), \(selection)"
     }
 
     func agentRosterState(for agent: AgentSummary) -> AgentRosterState {
-        guard self.gatewayConnected else { return .idle }
+        guard self.gatewayConnected else { return .ready }
         if agent.id == self.activeAgentID { return .online }
-        if self.cronJobsContain(agentID: agent.id) { return .busy }
-        return .idle
-    }
-
-    func cronJobsContain(agentID: String) -> Bool {
-        self.recentCronJobs.contains { job in
-            self.normalized(job.agentid) == agentID && job.enabled
-        }
+        return .ready
     }
 
     func modelLabel(for agent: AgentSummary) -> String? {
@@ -80,15 +61,6 @@ extension AgentProTab {
             }
         }
         return nil
-    }
-
-    static func shortModelLabel(_ model: String) -> String {
-        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "default" }
-        let leaf = trimmed.split(separator: "/").last.map(String.init) ?? trimmed
-        return leaf
-            .replacingOccurrences(of: "claude-", with: "")
-            .replacingOccurrences(of: "gpt-", with: "")
     }
 
     func presenceLabel(_ entry: PresenceEntry) -> String? {
@@ -123,20 +95,33 @@ extension AgentProTab {
 
     @MainActor
     func refreshOverview(force: Bool) async {
-        guard self.scenePhase == .active else { return }
-        guard self.appModel.isOperatorGatewayConnected else {
+        if self.appModel.isScreenshotFixtureModeEnabled {
+            self.overview = .screenshotFixture
+            self.overviewErrorText = nil
+            self.overviewLoading = false
+            return
+        }
+        guard self.scenePhase == .active, self.liveGatewayConnected else {
+            _ = self.overviewRefreshGate.begin()
             self.overview = nil
             self.overviewErrorText = nil
             self.overviewLoading = false
             return
         }
-        if self.overviewLoading, force == false {
+        if self.overviewLoading, !force {
             return
         }
+        let generation = self.overviewRefreshGate.begin()
+        let requestContext = self.overviewTaskID
+        guard let gatewayID = self.appModel.connectedGatewayID else { return }
 
         self.overviewLoading = true
         self.overviewErrorText = nil
-        defer { self.overviewLoading = false }
+        defer {
+            if self.overviewRefreshGate.isCurrent(generation) {
+                self.overviewLoading = false
+            }
+        }
 
         let activeAgentID = self.activeAgentID
         let skillsParams = Self.agentScopedParams(agentId: activeAgentID)
@@ -147,17 +132,19 @@ extension AgentProTab {
         async let config = self.requestOptional(ConfigSnapshotLite.self, method: "config.get")
         async let presence = self.requestOptional([PresenceEntry].self, method: "system-presence")
         async let cronStatus = self.requestOptional(CronStatusLite.self, method: "cron.status")
-        async let cronJobs = self.requestOptional(
-            CronJobsListLite.self,
-            method: "cron.list",
-            paramsJSON: "{\"includeDisabled\":true,\"limit\":8,\"sortBy\":\"nextRunAtMs\",\"sortDir\":\"asc\"}",
-            timeoutSeconds: 12)
-        async let dreaming = self.requestOptional(DreamingStatusEnvelope.self, method: "doctor.memory.status")
-        async let dreamDiary = self.requestOptional(DreamDiaryLite.self, method: "doctor.memory.dreamDiary")
+        async let cronJobs = self.requestAllCronJobs()
+        async let dreaming = self.requestOptional(
+            DreamingStatusEnvelope.self,
+            method: "doctor.memory.status",
+            paramsJSON: skillsParams)
+        async let dreamDiary = self.requestOptional(
+            DreamDiaryLite.self,
+            method: "doctor.memory.dreamDiary",
+            paramsJSON: skillsParams)
         async let usage = self.requestOptional(
             CostUsageSummaryLite.self,
             method: "usage.cost",
-            paramsJSON: "{\"days\":31}",
+            paramsJSON: CostUsageRequest.monthParamsJSON(),
             timeoutSeconds: 12)
 
         let loadedSkills = await skills
@@ -169,6 +156,7 @@ extension AgentProTab {
         let loadedDreamDiary = await dreamDiary
         let loadedUsage = await usage
         let snapshot = AgentOverviewSnapshot(
+            gatewayID: gatewayID,
             skills: loadedSkills,
             presence: loadedPresence ?? [],
             cronStatus: loadedCronStatus,
@@ -176,11 +164,14 @@ extension AgentProTab {
             dreaming: loadedDreaming?.dreaming,
             dreamDiary: loadedDreamDiary,
             usage: loadedUsage,
-            activeAgentId: activeAgentID,
             agentSkillFilter: loadedSkills?.agentSkillFilter
-                ?? loadedConfig?.effectiveSkillFilter(agentId: activeAgentID),
-            loadedAt: Date())
+                ?? loadedConfig?.effectiveSkillFilter(agentId: activeAgentID))
 
+        guard self.overviewRefreshGate.isCurrent(generation),
+              self.overviewTaskID == requestContext
+        else {
+            return
+        }
         if snapshot.hasAnyLiveData {
             self.overview = snapshot
         } else {
@@ -203,6 +194,32 @@ extension AgentProTab {
             return try JSONDecoder().decode(T.self, from: data)
         } catch {
             return nil
+        }
+    }
+
+    func requestAllCronJobs() async -> CronJobsListLite? {
+        for _ in 0..<3 {
+            if let snapshot = await self.requestCronJobsSnapshot() {
+                return snapshot
+            }
+        }
+        return nil
+    }
+
+    private func requestCronJobsSnapshot() async -> CronJobsListLite? {
+        await CronJobsListLite.collect(maximumPageCount: 100, maximumJobCount: 20000) { offset in
+            guard let paramsJSON = try? Self.automationParams([
+                "includeDisabled": true,
+                "limit": 200,
+                "offset": offset,
+                "sortBy": "name",
+                "sortDir": "asc",
+            ]) else { return nil }
+            return await self.requestOptional(
+                CronJobsListLite.self,
+                method: "cron.list",
+                paramsJSON: paramsJSON,
+                timeoutSeconds: 12)
         }
     }
 

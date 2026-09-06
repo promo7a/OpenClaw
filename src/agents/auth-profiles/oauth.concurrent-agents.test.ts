@@ -1,3 +1,8 @@
+/**
+ * Tests concurrent OAuth refresh across agent stores.
+ * Verifies shared refresh locks let concurrent agents adopt one fresh token
+ * instead of racing single-use refresh tokens.
+ */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { beforeAll, describe, expect, it, vi } from "vitest";
@@ -14,11 +19,8 @@ import {
   resolveApiKeyForProfileInTest,
   resetOAuthProviderRuntimeMocks,
 } from "./oauth-test-utils.js";
-import {
-  clearRuntimeAuthProfileStoreSnapshots,
-  ensureAuthProfileStore,
-  saveAuthProfileStore,
-} from "./store.js";
+import { clearRuntimeAuthProfileStoreSnapshots } from "./runtime-snapshots.js";
+import { ensureAuthProfileStore, saveAuthProfileStore } from "./store.js";
 
 const {
   refreshProviderOAuthCredentialWithPluginMock,
@@ -26,7 +28,7 @@ const {
 } = getOAuthProviderRuntimeMocks();
 
 let resolveApiKeyForProfile: typeof import("./oauth.js").resolveApiKeyForProfile;
-let resetOAuthRefreshQueuesForTest: typeof import("./oauth.js").resetOAuthRefreshQueuesForTest;
+let resetOAuthRefreshQueuesForTest: typeof import("./oauth.test-support.js").resetOAuthRefreshQueuesForTest;
 type ResolveApiKeyResult = NonNullable<
   Awaited<ReturnType<typeof import("./oauth.js").resolveApiKeyForProfile>>
 >;
@@ -38,7 +40,8 @@ type ConcurrentRefreshResult = {
 };
 
 async function loadOAuthModuleForTest() {
-  ({ resolveApiKeyForProfile, resetOAuthRefreshQueuesForTest } = await import("./oauth.js"));
+  ({ resolveApiKeyForProfile } = await import("./oauth.js"));
+  ({ resetOAuthRefreshQueuesForTest } = await import("./oauth.test-support.js"));
 }
 
 vi.mock("../../llm/oauth.js", () => ({

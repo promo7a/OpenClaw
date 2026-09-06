@@ -1,21 +1,31 @@
+// Codex tests cover schema normalization runtime contract plugin behavior.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { EmbeddedRunAttemptParams } from "openclaw/plugin-sdk/agent-harness";
+import type { EmbeddedRunAttemptParamsV2 as EmbeddedRunAttemptParams } from "openclaw/plugin-sdk/agent-harness";
 import {
   createParameterFreeTool,
   createPermissiveTool,
   normalizedParameterFreeSchema,
 } from "openclaw/plugin-sdk/agent-runtime-test-contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createCodexTestHostCapabilities } from "./host-capability.test-support.js";
 import type { CodexThreadStartParams } from "./protocol.js";
+import { testCodexAppServerBindingStore } from "./session-binding.test-helpers.js";
 import { createCodexTestModel } from "./test-support.js";
-import { startOrResumeThread } from "./thread-lifecycle.js";
+import { startOrResumeThread as startOrResumeThreadImpl } from "./thread-lifecycle.js";
+
+function startOrResumeThread(
+  params: Omit<Parameters<typeof startOrResumeThreadImpl>[0], "bindingStore">,
+) {
+  return startOrResumeThreadImpl({ ...params, bindingStore: testCodexAppServerBindingStore });
+}
 
 let tempDir: string;
 
 function createParams(sessionFile: string, workspaceDir: string): EmbeddedRunAttemptParams {
   return {
+    hostCapabilities: createCodexTestHostCapabilities(),
     prompt: "hello",
     sessionId: "session-1",
     sessionKey: "agent:main:session-1",
@@ -43,11 +53,13 @@ function createAppServerOptions(): Parameters<typeof startOrResumeThread>[0]["ap
       headers: {},
     },
     codeModeOnly: false,
+    loopDetectionPreToolUseRelay: true,
     requestTimeoutMs: 60_000,
-    turnCompletionIdleTimeoutMs: 60_000,
     approvalPolicy: "never",
     approvalsReviewer: "user",
     sandbox: "workspace-write",
+    connectionClass: "local-loopback",
+    remoteAppsSubstrate: "preconfigured",
   };
 }
 
@@ -65,7 +77,8 @@ function threadStartResult(threadId = "thread-1", serviceTier: string | null = n
       status: { type: "idle" },
       path: null,
       cwd: tempDir,
-      cliVersion: "0.125.0",
+      projectId: null,
+      cliVersion: "0.149.0",
       source: "unknown",
       agentNickname: null,
       agentRole: null,
@@ -96,16 +109,23 @@ describe("Codex app-server dynamic tool schema boundary contract", () => {
     vi.restoreAllMocks();
   });
 
-  it("passes prepared executable dynamic tool schemas through thread start unchanged", async () => {
+  it("passes prepared executable dynamic tool schemas through canonical thread start specs", async () => {
     const sessionFile = path.join(tempDir, "session.jsonl");
     const workspaceDir = path.join(tempDir, "workspace");
     const parameterFreeTool = createParameterFreeTool("message");
     const dynamicTool = {
+      type: "function" as const,
       name: parameterFreeTool.name,
       description: parameterFreeTool.description,
       inputSchema: normalizedParameterFreeSchema(),
     };
     const request = vi.fn(async (method: string, _payload?: unknown) => {
+      if (method === "config/read") {
+        return { config: {}, origins: {}, layers: [] };
+      }
+      if (method === "configRequirements/read") {
+        return { requirements: null };
+      }
       if (method === "thread/start") {
         return threadStartResult();
       }
@@ -120,13 +140,25 @@ describe("Codex app-server dynamic tool schema boundary contract", () => {
       appServer: createAppServerOptions(),
     });
 
-    expect(request).toHaveBeenCalledTimes(1);
-    const [method, payload] = request.mock.calls[0] ?? [];
-    if (method !== "thread/start") {
-      throw new Error(`expected thread/start request, got ${method}`);
+    expect(request.mock.calls.map(([method]) => method)).toEqual([
+      "config/read",
+      "configRequirements/read",
+      "thread/start",
+    ]);
+    const [startMethod, payload] =
+      request.mock.calls.find(([method]) => method === "thread/start") ?? [];
+    if (startMethod !== "thread/start") {
+      throw new Error(`expected thread/start request, got ${startMethod}`);
     }
     const startPayload = payload as CodexThreadStartParams | undefined;
-    expect(startPayload?.dynamicTools).toStrictEqual([dynamicTool]);
+    expect(startPayload?.dynamicTools).toStrictEqual([
+      {
+        type: "function",
+        name: dynamicTool.name,
+        description: dynamicTool.description,
+        inputSchema: dynamicTool.inputSchema,
+      },
+    ]);
     expect(startPayload?.cwd).toBe(workspaceDir);
     expect(startPayload?.model).toBe("gpt-5.4");
     expect(startPayload?.modelProvider).toBeUndefined();
@@ -135,7 +167,6 @@ describe("Codex app-server dynamic tool schema boundary contract", () => {
     expect(startPayload?.sandbox).toBe("workspace-write");
     expect(startPayload?.serviceName).toBe("OpenClaw");
     expect(startPayload?.experimentalRawEvents).toBe(true);
-    expect(startPayload?.persistExtendedHistory).toBe(true);
     expect(typeof startPayload?.developerInstructions).toBe("string");
     expect(startPayload?.developerInstructions).toContain("OpenClaw");
   });
@@ -144,6 +175,12 @@ describe("Codex app-server dynamic tool schema boundary contract", () => {
     const sessionFile = path.join(tempDir, "session.jsonl");
     const workspaceDir = path.join(tempDir, "workspace");
     const request = vi.fn(async (method: string) => {
+      if (method === "config/read") {
+        return { config: {}, origins: {}, layers: [] };
+      }
+      if (method === "configRequirements/read") {
+        return { requirements: null };
+      }
       if (method === "thread/start") {
         return threadStartResult("thread-priority", "priority");
       }
@@ -167,6 +204,12 @@ describe("Codex app-server dynamic tool schema boundary contract", () => {
     const appServer = createAppServerOptions();
     let nextThreadId = 1;
     const request = vi.fn(async (method: string) => {
+      if (method === "config/read") {
+        return { config: {}, origins: {}, layers: [] };
+      }
+      if (method === "configRequirements/read") {
+        return { requirements: null };
+      }
       if (method === "thread/start") {
         return threadStartResult(`thread-${nextThreadId++}`);
       }
@@ -179,6 +222,7 @@ describe("Codex app-server dynamic tool schema boundary contract", () => {
       cwd: workspaceDir,
       dynamicTools: [
         {
+          type: "function",
           name: "message",
           description: "Permissive test tool",
           inputSchema: { type: "object" },
@@ -193,6 +237,7 @@ describe("Codex app-server dynamic tool schema boundary contract", () => {
       cwd: workspaceDir,
       dynamicTools: [
         {
+          type: "function",
           name: permissiveTool.name,
           description: permissiveTool.description,
           inputSchema: permissiveTool.parameters,
@@ -201,6 +246,13 @@ describe("Codex app-server dynamic tool schema boundary contract", () => {
       appServer,
     });
 
-    expect(request.mock.calls.map(([method]) => method)).toEqual(["thread/start", "thread/start"]);
+    expect(request.mock.calls.map(([method]) => method)).toEqual([
+      "config/read",
+      "configRequirements/read",
+      "thread/start",
+      "config/read",
+      "configRequirements/read",
+      "thread/start",
+    ]);
   });
 });

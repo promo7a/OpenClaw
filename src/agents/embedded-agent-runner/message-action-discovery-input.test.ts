@@ -1,11 +1,15 @@
+// Coverage for embedded message-action discovery input normalization.
 import { describe, expect, it } from "vitest";
 import { buildEmbeddedMessageActionDiscoveryInput } from "./message-action-discovery-input.js";
 
 describe("buildEmbeddedMessageActionDiscoveryInput", () => {
   it("maps sender and routing scope into message-action discovery context", () => {
+    // Discovery needs both current message routing and requester identity so
+    // plugins can decide which actions are safe to expose.
     expect(
       buildEmbeddedMessageActionDiscoveryInput({
         channel: "telegram",
+        chatType: "direct",
         currentChannelId: "chat-1",
         currentThreadTs: "thread-9",
         currentMessageId: "msg-42",
@@ -18,6 +22,7 @@ describe("buildEmbeddedMessageActionDiscoveryInput", () => {
     ).toEqual({
       cfg: undefined,
       channel: "telegram",
+      chatType: "direct",
       currentChannelId: "chat-1",
       currentThreadTs: "thread-9",
       currentMessageId: "msg-42",

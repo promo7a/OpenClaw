@@ -1,9 +1,12 @@
+// Collects core dependency status for plugin diagnostics.
 import fs from "node:fs";
 import path from "node:path";
 
+/** Dependency name-to-version map from a plugin package manifest. */
 export type PluginDependencySpecMap = Record<string, string>;
 
-export type PluginDependencyEntry = {
+/** Installation status for one plugin dependency. */
+type PluginDependencyEntry = {
   name: string;
   spec: string;
   installed: boolean;
@@ -11,6 +14,7 @@ export type PluginDependencyEntry = {
   resolvedPath?: string;
 };
 
+/** Aggregate installation status for required and optional plugin dependencies. */
 export type PluginDependencyStatus = {
   hasDependencies: boolean;
   installed: boolean;
@@ -20,6 +24,23 @@ export type PluginDependencyStatus = {
   missingOptional: string[];
   dependencies: PluginDependencyEntry[];
   optionalDependencies: PluginDependencyEntry[];
+};
+
+type PluginDependencyHealthRegistry = {
+  plugins: Array<{
+    id: string;
+    source: string;
+    enabled: boolean;
+    status: "loaded" | "disabled" | "error";
+    error?: string;
+    dependencyStatus?: PluginDependencyStatus;
+  }>;
+  diagnostics: Array<{
+    level: "warn" | "error";
+    message: string;
+    pluginId?: string;
+    source?: string;
+  }>;
 };
 
 function normalizeDependencyMap(raw: unknown): PluginDependencySpecMap {
@@ -37,6 +58,7 @@ function normalizeDependencyMap(raw: unknown): PluginDependencySpecMap {
   return normalized;
 }
 
+/** Normalizes raw package dependency maps into sorted plugin dependency specs. */
 export function normalizePluginDependencySpecs(params: {
   dependencies?: unknown;
   optionalDependencies?: unknown;
@@ -44,9 +66,14 @@ export function normalizePluginDependencySpecs(params: {
   dependencies: PluginDependencySpecMap;
   optionalDependencies: PluginDependencySpecMap;
 } {
+  const dependencies = normalizeDependencyMap(params.dependencies);
+  const optionalDependencies = normalizeDependencyMap(params.optionalDependencies);
+  for (const name of Object.keys(optionalDependencies)) {
+    delete dependencies[name];
+  }
   return {
-    dependencies: normalizeDependencyMap(params.dependencies),
-    optionalDependencies: normalizeDependencyMap(params.optionalDependencies),
+    dependencies,
+    optionalDependencies,
   };
 }
 
@@ -104,6 +131,7 @@ function buildDependencyEntries(params: {
     });
 }
 
+/** Builds dependency installation status for a plugin package root. */
 export function buildPluginDependencyStatus(params: {
   rootDir?: string;
   dependencies?: PluginDependencySpecMap;
@@ -135,4 +163,47 @@ export function buildPluginDependencyStatus(params: {
     dependencies,
     optionalDependencies,
   };
+}
+
+/** Projects missing required dependencies consistently across cold plugin status surfaces. */
+export function projectPluginDependencyHealth<T extends PluginDependencyHealthRegistry>(
+  registry: T,
+): T {
+  const diagnostics = [...registry.diagnostics];
+  const plugins = registry.plugins.map((plugin) => {
+    const status = plugin.dependencyStatus;
+    if (!plugin.enabled || status?.requiredInstalled !== false) {
+      return plugin;
+    }
+    const message =
+      `Plugin "${plugin.id}" cannot load because required dependencies are missing: ` +
+      `${status.missing.join(", ")}. Install the plugin dependencies or reinstall/update the ` +
+      "plugin, then restart the Gateway.";
+    const existingDiagnosticIndex = diagnostics.findIndex(
+      (entry) => entry.level === "error" && entry.pluginId === plugin.id,
+    );
+    if (existingDiagnosticIndex === -1) {
+      diagnostics.push({ level: "error", pluginId: plugin.id, source: plugin.source, message });
+    } else {
+      const existingDiagnostic = diagnostics[existingDiagnosticIndex];
+      if (existingDiagnostic && !existingDiagnostic.message.includes(message)) {
+        diagnostics[existingDiagnosticIndex] = {
+          ...existingDiagnostic,
+          message: `${existingDiagnostic.message}\n${message}`,
+        };
+      }
+    }
+    if (plugin.status === "error") {
+      const existingError = plugin.error;
+      return {
+        ...plugin,
+        error:
+          existingError && !existingError.includes(message)
+            ? `${existingError}\n${message}`
+            : (existingError ?? message),
+      };
+    }
+    return { ...plugin, status: "error" as const, error: message };
+  });
+  return { ...registry, plugins, diagnostics };
 }

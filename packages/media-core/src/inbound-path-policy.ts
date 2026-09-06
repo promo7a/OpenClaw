@@ -1,3 +1,4 @@
+// Media Core module implements inbound path policy behavior.
 import path from "node:path";
 
 const WILDCARD_SEGMENT = "*";
@@ -9,6 +10,8 @@ function normalizePosixAbsolutePath(value: string): string | undefined {
   if (!trimmed || trimmed.includes("\0")) {
     return undefined;
   }
+  // Compare all roots as POSIX-style absolute paths so channel configs can use
+  // stable patterns even when a source reports Windows separators.
   const normalized = path.posix.normalize(trimmed.replaceAll("\\", "/"));
   const isAbsolute = normalized.startsWith("/") || WINDOWS_DRIVE_ABS_RE.test(normalized);
   if (!isAbsolute || normalized === "/") {
@@ -18,32 +21,62 @@ function normalizePosixAbsolutePath(value: string): string | undefined {
   if (WINDOWS_DRIVE_ROOT_RE.test(withoutTrailingSlash)) {
     return undefined;
   }
-  return withoutTrailingSlash;
+  return WINDOWS_DRIVE_ABS_RE.test(withoutTrailingSlash)
+    ? withoutTrailingSlash.toLowerCase()
+    : withoutTrailingSlash;
 }
 
 function splitPathSegments(value: string): string[] {
   return value.split("/").filter(Boolean);
 }
 
-function matchesRootPattern(params: { candidatePath: string; rootPattern: string }): boolean {
+export type InboundPathRootMatch = {
+  anchorRoot: string;
+  matchedRoot: string;
+};
+
+function joinAbsolutePathSegments(candidatePath: string, segments: readonly string[]): string {
+  const joined = segments.join("/");
+  if (!WINDOWS_DRIVE_ABS_RE.test(candidatePath)) {
+    return `/${joined}`;
+  }
+  return segments.length === 1 ? `${joined}/` : joined;
+}
+
+function resolveRootPatternMatch(params: {
+  candidatePath: string;
+  rootPattern: string;
+}): InboundPathRootMatch | undefined {
   const candidateSegments = splitPathSegments(params.candidatePath);
   const rootSegments = splitPathSegments(params.rootPattern);
   if (candidateSegments.length < rootSegments.length) {
-    return false;
+    return undefined;
   }
-  for (let idx = 0; idx < rootSegments.length; idx += 1) {
-    const expected = rootSegments[idx];
+  const resolvedSegments: string[] = [];
+  for (const [idx, expected] of rootSegments.entries()) {
     const actual = candidateSegments[idx];
+    if (!actual) {
+      return undefined;
+    }
     if (expected === WILDCARD_SEGMENT) {
+      resolvedSegments.push(actual);
       continue;
     }
     if (expected !== actual) {
-      return false;
+      return undefined;
     }
+    resolvedSegments.push(expected);
   }
-  return true;
+  const firstWildcardIndex = rootSegments.indexOf(WILDCARD_SEGMENT);
+  const anchorSegments =
+    firstWildcardIndex === -1 ? resolvedSegments : rootSegments.slice(0, firstWildcardIndex);
+  return {
+    anchorRoot: joinAbsolutePathSegments(params.candidatePath, anchorSegments),
+    matchedRoot: joinAbsolutePathSegments(params.candidatePath, resolvedSegments),
+  };
 }
 
+/** Validates an absolute inbound root pattern with whole-segment wildcards only. */
 export function isValidInboundPathRootPattern(value: string): boolean {
   const normalized = normalizePosixAbsolutePath(value);
   if (!normalized) {
@@ -56,6 +89,7 @@ export function isValidInboundPathRootPattern(value: string): boolean {
   return segments.every((segment) => segment === WILDCARD_SEGMENT || !segment.includes("*"));
 }
 
+/** Normalizes configured inbound attachment roots, dropping invalid or duplicate patterns. */
 export function normalizeInboundPathRoots(roots?: readonly string[]): string[] {
   const normalized: string[] = [];
   const seen = new Set<string>();
@@ -76,6 +110,7 @@ export function normalizeInboundPathRoots(roots?: readonly string[]): string[] {
   return normalized;
 }
 
+/** Merges inbound attachment root lists while preserving first-seen priority. */
 export function mergeInboundPathRoots(
   ...rootsLists: Array<readonly string[] | undefined>
 ): string[] {
@@ -94,20 +129,36 @@ export function mergeInboundPathRoots(
   return merged;
 }
 
-export function isInboundPathAllowed(params: {
+/** Resolves the concrete lexical root matched by an inbound path pattern. */
+export function resolveInboundPathRoot(params: {
   filePath: string;
   roots: readonly string[];
   fallbackRoots?: readonly string[];
-}): boolean {
+}): InboundPathRootMatch | undefined {
   const candidatePath = normalizePosixAbsolutePath(params.filePath);
   if (!candidatePath) {
-    return false;
+    return undefined;
   }
   const roots = normalizeInboundPathRoots(params.roots);
   const effectiveRoots =
     roots.length > 0 ? roots : normalizeInboundPathRoots(params.fallbackRoots ?? undefined);
   if (effectiveRoots.length === 0) {
-    return false;
+    return undefined;
   }
-  return effectiveRoots.some((rootPattern) => matchesRootPattern({ candidatePath, rootPattern }));
+  for (const rootPattern of effectiveRoots) {
+    const resolved = resolveRootPatternMatch({ candidatePath, rootPattern });
+    if (resolved) {
+      return resolved;
+    }
+  }
+  return undefined;
+}
+
+/** Checks whether a candidate inbound media path is covered by configured or fallback roots. */
+export function isInboundPathAllowed(params: {
+  filePath: string;
+  roots: readonly string[];
+  fallbackRoots?: readonly string[];
+}): boolean {
+  return resolveInboundPathRoot(params) !== undefined;
 }

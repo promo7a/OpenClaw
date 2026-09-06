@@ -1,17 +1,119 @@
+// QA channel protocol helpers validate synthetic channel messages used by QA plugins.
 import { isRecord } from "../../packages/normalization-core/src/record-coerce.js";
 
+/** Conversation shape supported by the synthetic QA channel bus. */
 export type QaBusConversationKind = "direct" | "channel" | "group";
 
+/** Parsed QA channel target with case-preserving conversation identifiers. */
+export type QaTargetParts = {
+  chatType: QaBusConversationKind;
+  conversationId: string;
+  threadId?: string;
+};
+
+/** Encode a canonical QA channel target. */
+function buildQaTargetCore(params: {
+  chatType: QaBusConversationKind;
+  conversationId: string;
+  threadId?: string | null;
+}): string {
+  if (params.threadId) {
+    // Direct/group thread targets need their kind and escaped ids to survive
+    // message-action parse/build cycles; channel threads retain shipped syntax.
+    if (params.chatType !== "channel") {
+      const kind = params.chatType === "direct" ? "dm" : "group";
+      return `thread:/v1/${kind}/${encodeURIComponent(params.conversationId)}/${encodeURIComponent(params.threadId)}`;
+    }
+    return `thread:${params.conversationId}/${params.threadId}`;
+  }
+  return `${params.chatType === "direct" ? "dm" : params.chatType}:${params.conversationId}`;
+}
+
+export { buildQaTargetCore as buildQaTarget };
+
+/** Parse the lowercase, prefix-scoped target grammar shared by QA Channel and QA Lab. */
+function parseQaTargetCore(
+  raw: string,
+  options?: { defaultChatType?: QaBusConversationKind },
+): QaTargetParts {
+  const normalized = raw.trim();
+  if (!normalized) {
+    throw new Error("qa-channel target is required");
+  }
+  const prefixed = /^(thread|channel|group|dm):(.*)$/u.exec(normalized);
+  if (!prefixed && /^(thread|channel|group|dm):/iu.test(normalized)) {
+    throw new Error(`qa-channel target prefixes must be lowercase: ${normalized}`);
+  }
+  const prefix = prefixed?.[1];
+  const rest = prefixed?.[2]?.trim();
+  if (prefix === "thread") {
+    if (!rest) {
+      throw new Error(`invalid qa-channel thread target: ${normalized}`);
+    }
+    const versioned = rest.startsWith("/v1/");
+    const components = rest.slice(versioned ? "/v1/".length : 0).split("/");
+    const explicitKind =
+      versioned && components.length === 3 && (components[0] === "dm" || components[0] === "group")
+        ? components.shift()
+        : undefined;
+    if (components.length !== 2) {
+      throw new Error(`invalid qa-channel thread target: ${normalized}`);
+    }
+    let conversationId = components[0]?.trim() ?? "";
+    let threadId = components[1]?.trim() ?? "";
+    if (versioned) {
+      try {
+        conversationId = decodeURIComponent(conversationId).trim();
+        threadId = decodeURIComponent(threadId).trim();
+      } catch {
+        throw new Error(`invalid qa-channel thread target: ${normalized}`);
+      }
+    }
+    if (!conversationId || !threadId) {
+      throw new Error(`invalid qa-channel thread target: ${normalized}`);
+    }
+    return {
+      chatType: versioned ? (explicitKind === "dm" ? "direct" : "group") : "channel",
+      conversationId,
+      threadId,
+    };
+  }
+  if (prefix) {
+    if (!rest) {
+      throw new Error(`invalid qa-channel ${prefix} target: ${normalized}`);
+    }
+    return {
+      chatType: prefix === "dm" ? "direct" : prefix === "group" ? "group" : "channel",
+      conversationId: rest,
+    };
+  }
+  return {
+    chatType: options?.defaultChatType ?? "direct",
+    conversationId: normalized,
+  };
+}
+
+export { parseQaTargetCore as parseQaTarget };
+
+/** Addressable conversation used by QA bus messages and thread state. */
 export type QaBusConversation = {
   id: string;
   kind: QaBusConversationKind;
   title?: string;
 };
 
+/** Account-qualified conversation record returned in QA bus snapshots. */
+export type QaBusSnapshotConversation = QaBusConversation & {
+  accountId: string;
+};
+
+/** Media/file attachment fixture accepted by QA bus message APIs. */
 export type QaBusAttachment = {
   id: string;
   kind: "image" | "video" | "audio" | "file";
   mimeType: string;
+  /** Selects how QA Channel projects an inline fixture after saving it locally. */
+  mediaFactCarrier?: "path" | "media-store-url";
   fileName?: string;
   inline?: boolean;
   url?: string;
@@ -23,11 +125,18 @@ export type QaBusAttachment = {
   transcript?: string;
 };
 
+/** Tool-call fixture attached to QA messages for agent-runtime tests. */
 export type QaBusToolCall = {
   name: string;
   arguments?: Record<string, unknown>;
 };
 
+/** Channel-native command metadata attached to a synthetic inbound message. */
+export type QaBusNativeCommand = {
+  name: string;
+};
+
+/** Stored QA bus message after defaults, reactions, and account ids are normalized. */
 export type QaBusMessage = {
   id: string;
   accountId: string;
@@ -36,6 +145,8 @@ export type QaBusMessage = {
   senderId: string;
   senderName?: string;
   text: string;
+  /** Runtime-authored failure marker; copy wording is not a QA contract. */
+  isError?: boolean;
   timestamp: number;
   threadId?: string;
   threadTitle?: string;
@@ -43,6 +154,7 @@ export type QaBusMessage = {
   deleted?: boolean;
   editedAt?: number;
   attachments?: QaBusAttachment[];
+  nativeCommand?: QaBusNativeCommand;
   toolCalls?: QaBusToolCall[];
   reactions: Array<{
     emoji: string;
@@ -51,6 +163,7 @@ export type QaBusMessage = {
   }>;
 };
 
+/** Synthetic thread record created inside a QA bus channel conversation. */
 export type QaBusThread = {
   id: string;
   accountId: string;
@@ -60,6 +173,7 @@ export type QaBusThread = {
   createdBy: string;
 };
 
+/** Ordered event emitted by QA bus polling and state snapshots. */
 export type QaBusEvent =
   | { cursor: number; kind: "inbound-message"; accountId: string; message: QaBusMessage }
   | { cursor: number; kind: "outbound-message"; accountId: string; message: QaBusMessage }
@@ -75,6 +189,7 @@ export type QaBusEvent =
       senderId: string;
     };
 
+/** Input for injecting an inbound message from a synthetic user/channel. */
 export type QaBusInboundMessageInput = {
   accountId?: string;
   conversation: QaBusConversation;
@@ -86,15 +201,19 @@ export type QaBusInboundMessageInput = {
   threadTitle?: string;
   replyToId?: string;
   attachments?: QaBusAttachment[];
+  nativeCommand?: QaBusNativeCommand;
   toolCalls?: QaBusToolCall[];
 };
 
+/** Input for recording an outbound message sent by an OpenClaw runtime. */
 export type QaBusOutboundMessageInput = {
   accountId?: string;
   to: string;
   senderId?: string;
   senderName?: string;
   text: string;
+  /** Preserves ReplyPayload.isError through the synthetic channel transport. */
+  isError?: boolean;
   timestamp?: number;
   threadId?: string;
   replyToId?: string;
@@ -102,6 +221,7 @@ export type QaBusOutboundMessageInput = {
   toolCalls?: QaBusToolCall[];
 };
 
+/** Input for creating a synthetic QA bus thread. */
 export type QaBusCreateThreadInput = {
   accountId?: string;
   conversationId: string;
@@ -110,6 +230,7 @@ export type QaBusCreateThreadInput = {
   timestamp?: number;
 };
 
+/** Input for adding a reaction event to an existing QA bus message. */
 export type QaBusReactToMessageInput = {
   accountId?: string;
   messageId: string;
@@ -118,6 +239,7 @@ export type QaBusReactToMessageInput = {
   timestamp?: number;
 };
 
+/** Input for editing an existing QA bus message. */
 export type QaBusEditMessageInput = {
   accountId?: string;
   messageId: string;
@@ -125,40 +247,50 @@ export type QaBusEditMessageInput = {
   timestamp?: number;
 };
 
+/** Input for marking an existing QA bus message as deleted. */
 export type QaBusDeleteMessageInput = {
   accountId?: string;
   messageId: string;
   timestamp?: number;
 };
 
+/** Search filter accepted by QA bus message lookup helpers. */
 export type QaBusSearchMessagesInput = {
   accountId?: string;
   query?: string;
   conversationId?: string;
-  threadId?: string;
+  conversationKind?: QaBusConversationKind;
+  /** Omit for any thread scope; use null for root-only results. */
+  threadId?: string | null;
   limit?: number;
 };
 
+/** Lookup key for reading one QA bus message. */
 export type QaBusReadMessageInput = {
   accountId?: string;
   messageId: string;
 };
 
+/** Cursor and timeout options used by QA bus polling. */
 export type QaBusPollInput = {
   accountId?: string;
   cursor?: number;
+  /** Highest contiguous event cursor whose consumer work completed successfully. */
+  acknowledgedCursor?: number;
   timeoutMs?: number;
   limit?: number;
 };
 
+/** Poll response containing the next cursor and ordered events. */
 export type QaBusPollResult = {
   cursor: number;
   events: QaBusEvent[];
 };
 
+/** Complete QA bus state snapshot exposed to tests and diagnostics. */
 export type QaBusStateSnapshot = {
   cursor: number;
-  conversations: QaBusConversation[];
+  conversations: QaBusSnapshotConversation[];
   threads: QaBusThread[];
   messages: QaBusMessage[];
   events: QaBusEvent[];
@@ -211,6 +343,7 @@ function sanitizeQaBusToolCallValue(value: unknown, depth: number, key?: string)
   return undefined;
 }
 
+/** Sanitize arbitrary tool-call arguments before storing them in QA bus messages. */
 export function sanitizeQaBusToolCallArguments(
   value: unknown,
 ): Record<string, unknown> | undefined {
@@ -221,6 +354,7 @@ export function sanitizeQaBusToolCallArguments(
   return isRecord(sanitized) ? sanitized : undefined;
 }
 
+/** Normalize and redact a bounded list of tool calls from untrusted QA input. */
 export function sanitizeQaBusToolCalls(value: unknown): QaBusToolCall[] | undefined {
   if (!Array.isArray(value)) {
     return undefined;
@@ -244,6 +378,7 @@ export function sanitizeQaBusToolCalls(value: unknown): QaBusToolCall[] | undefi
   return sanitized.length > 0 ? sanitized : undefined;
 }
 
+/** Predicate input used by QA helpers that wait for bus events or messages. */
 export type QaBusWaitForInput =
   | {
       timeoutMs?: number;

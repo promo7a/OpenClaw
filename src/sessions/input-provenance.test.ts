@@ -1,8 +1,11 @@
+// Input provenance tests cover source metadata attached to session inputs.
 import { describe, expect, it } from "vitest";
 import {
   annotateInterSessionPromptText,
+  INTER_SESSION_PROMPT_PREFIX_BASE,
   isAgentMediatedCompletionSourceTool,
   shouldPreserveUserFacingSessionStateForInputProvenance,
+  stripInterSessionPromptPrefixForDisplay,
 } from "./input-provenance.js";
 
 describe("annotateInterSessionPromptText", () => {
@@ -67,6 +70,36 @@ describe("annotateInterSessionPromptText", () => {
   });
 });
 
+describe("stripInterSessionPromptPrefixForDisplay", () => {
+  it("removes generated inter-session envelope text from display content", () => {
+    const marked = annotateInterSessionPromptText("forwarded report", {
+      kind: "inter_session",
+      sourceSessionKey: "agent:main:discord:source",
+      sourceTool: "sessions_send",
+    });
+
+    expect(stripInterSessionPromptPrefixForDisplay(marked)).toBe("forwarded report");
+  });
+});
+
+describe("inter-session body whitespace", () => {
+  it("round-trips the body's own blank lines and code indentation", () => {
+    const body = "\n    first line\n      second line\n\n";
+    const marked = annotateInterSessionPromptText(body, {
+      kind: "inter_session",
+      sourceTool: "sessions_send",
+    });
+    expect(stripInterSessionPromptPrefixForDisplay(marked)).toBe(body);
+  });
+
+  it.each([
+    [`${INTER_SESSION_PROMPT_PREFIX_BASE}\n\n    code`, "\n    code"],
+    [`${INTER_SESSION_PROMPT_PREFIX_BASE}    code`, "    code"],
+  ])("preserves body bytes when the generated explanation is absent: %j", (input, body) => {
+    expect(stripInterSessionPromptPrefixForDisplay(input)).toBe(body);
+  });
+});
+
 describe("isAgentMediatedCompletionSourceTool", () => {
   it.each(["agent_harness_task", "image_generate", "music_generate", "video_generate"])(
     "identifies %s as an agent-mediated completion source",
@@ -86,6 +119,7 @@ describe("isAgentMediatedCompletionSourceTool", () => {
 describe("shouldPreserveUserFacingSessionStateForInputProvenance", () => {
   it.each([
     "agent_harness_task",
+    "exec_approval_followup",
     "image_generate",
     "music_generate",
     "subagent_announce",

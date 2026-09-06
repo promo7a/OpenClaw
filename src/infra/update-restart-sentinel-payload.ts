@@ -1,3 +1,4 @@
+// Builds restart sentinel payloads for update handoff reporting.
 import {
   buildRestartSuccessContinuation,
   formatDoctorNonInteractiveHint,
@@ -5,7 +6,15 @@ import {
 } from "./restart-sentinel.js";
 import type { UpdateRunResult } from "./update-runner.js";
 
+// Update restart sentinel payloads carry update result details across a process
+// restart so the next gateway can report completion or failure.
+/** Metadata needed to route update restart continuation messages. */
 export type UpdateRestartSentinelMeta = {
+  runId?: string;
+  /** Internal helper fact: when the owning service stop was issued. */
+  serviceStoppedAtMs?: number;
+  root?: string;
+  target?: string;
   sessionKey?: string;
   deliveryContext?: {
     channel?: string;
@@ -18,12 +27,38 @@ export type UpdateRestartSentinelMeta = {
   continuationMessage?: string | null;
 };
 
+export function normalizeControlPlaneUpdateResult(result: UpdateRunResult): UpdateRunResult {
+  const beforeSha = result.before?.sha?.trim();
+  const afterSha = result.after?.sha?.trim();
+  return result.status === "ok" &&
+    result.mode === "git" &&
+    result.postUpdate?.plugins?.changed !== true &&
+    beforeSha &&
+    afterSha &&
+    beforeSha === afterSha
+    ? { ...result, status: "skipped", reason: "already-current" }
+    : result;
+}
+
+function resolvePersistedRecovery(result: UpdateRunResult): UpdateRunResult["recovery"] {
+  if (!result.recovery) {
+    return undefined;
+  }
+  const recovery = { ...result.recovery };
+  // Restored runtimes parse this object strictly, so persist only the pre-update shape.
+  delete recovery.packageRollbackVerified;
+  return recovery;
+}
+
+/** Build the restart sentinel payload written after update runs. */
 export function buildUpdateRestartSentinelPayload(params: {
   result: UpdateRunResult;
   meta: UpdateRestartSentinelMeta;
   nowMs?: number;
 }): RestartSentinelPayload {
-  const { result, meta } = params;
+  const result = normalizeControlPlaneUpdateResult(params.result);
+  const recovery = resolvePersistedRecovery(result);
+  const { meta } = params;
   const continuation =
     result.status === "ok"
       ? buildRestartSuccessContinuation({
@@ -42,9 +77,12 @@ export function buildUpdateRestartSentinelPayload(params: {
     ...(continuation ? { continuation } : {}),
     doctorHint: formatDoctorNonInteractiveHint(),
     stats: {
+      ...(meta.runId || result.runId ? { runId: meta.runId ?? result.runId } : {}),
       mode: result.mode,
-      ...(result.root ? { root: result.root } : {}),
+      ...(meta.root || result.root ? { root: meta.root ?? result.root } : {}),
+      ...(meta.target ? { target: meta.target } : {}),
       ...(meta.handoffId ? { handoffId: meta.handoffId } : {}),
+      ...(recovery ? { recovery } : {}),
       before: result.before ?? null,
       after: result.after ?? null,
       steps: result.steps.map((step) => ({
@@ -52,6 +90,7 @@ export function buildUpdateRestartSentinelPayload(params: {
         command: step.command,
         cwd: step.cwd,
         durationMs: step.durationMs,
+        ...(step.advisory ? { advisory: true } : {}),
         log: {
           stdoutTail: step.stdoutTail ?? null,
           stderrTail: step.stderrTail ?? null,

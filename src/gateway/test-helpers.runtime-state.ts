@@ -1,10 +1,12 @@
+// Runtime-state test helpers hold hoisted mutable mocks shared by gateway
+// Vitest suites and module mocks.
 import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { vi } from "vitest";
 import type { Mock } from "vitest";
-import type { GetReplyOptions } from "../auto-reply/get-reply-options.types.js";
 import type { ReplyPayload } from "../auto-reply/reply-payload.js";
+import type { InternalGetReplyOptions } from "../auto-reply/reply/get-reply.types.js";
 import type { MsgContext } from "../auto-reply/templating.js";
 import type { AgentBinding } from "../config/types.agents.js";
 import type { HooksConfig } from "../config/types.hooks.js";
@@ -13,9 +15,12 @@ import type { RunCronAgentTurnResult } from "../cron/isolated-agent/run.types.js
 import type { TailscaleWhoisIdentity } from "../infra/tailscale.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 
+/**
+ * Hoisted mutable state shared by gateway Vitest module mocks.
+ */
 export type GetReplyFromConfigFn = (
   ctx: MsgContext,
-  opts?: GetReplyOptions,
+  opts?: InternalGetReplyOptions,
   configOverride?: OpenClawConfig,
 ) => Promise<ReplyPayload | ReplyPayload[] | undefined>;
 type CronIsolatedRunFn = (...args: unknown[]) => Promise<RunCronAgentTurnResult>;
@@ -37,6 +42,8 @@ type GatewayTestHoistedState = {
       name?: string;
       provider: string;
       contextWindow?: number;
+      contextWindows?: Array<{ id: string; label: string; contextWindow: number }>;
+      contextWindowDefault?: string;
       reasoning?: boolean;
       input?: string[];
     }>;
@@ -46,15 +53,23 @@ type GatewayTestHoistedState = {
   runBtwSideQuestion: Mock<RunBtwSideQuestionFn>;
   dispatchInboundMessage: Mock<DispatchInboundMessageFn>;
   testIsNixMode: { value: boolean };
-  sessionStoreSaveDelayMs: { value: number };
   embeddedRunMock: {
     activeIds: Set<string>;
     abortCalls: string[];
     waitCalls: string[];
     waitResults: Map<string, boolean>;
+    endWaitCalls: string[];
+    endWaiters: Map<string, (ended: boolean) => void>;
+    resolveEndBeforeTimeoutIds: Set<string>;
     compactEmbeddedAgentSession: Mock<CompactEmbeddedAgentSessionFn>;
   };
-  testTailscaleWhois: { value: TailscaleWhoisIdentity | null };
+  testTailscaleWhois: {
+    value: TailscaleWhoisIdentity | null;
+    calls: Array<{
+      ip: string;
+      opts?: { timeoutMs?: number; cacheTtlMs?: number; errorTtlMs?: number };
+    }>;
+  };
   getReplyFromConfig: Mock<GetReplyFromConfigFn>;
   sendWhatsAppMock: Mock<SendWhatsAppFn>;
   testState: {
@@ -67,6 +82,7 @@ type GatewayTestHoistedState = {
     allowFrom: string[] | undefined;
     cronStorePath: string | undefined;
     cronEnabled: boolean | undefined;
+    cronTriggersEnabled: boolean | undefined;
     gatewayBind: "auto" | "lan" | "tailnet" | "loopback" | undefined;
     gatewayAuth: Record<string, unknown> | undefined;
     gatewayControlUi: Record<string, unknown> | undefined;
@@ -96,12 +112,14 @@ const gatewayTestHoisted = vi.hoisted(() => {
     runBtwSideQuestion: vi.fn().mockResolvedValue(undefined),
     dispatchInboundMessage: vi.fn(),
     testIsNixMode: { value: false },
-    sessionStoreSaveDelayMs: { value: 0 },
     embeddedRunMock: {
       activeIds: new Set<string>(),
       abortCalls: [],
       waitCalls: [],
       waitResults: new Map<string, boolean>(),
+      endWaitCalls: [],
+      endWaiters: new Map<string, (ended: boolean) => void>(),
+      resolveEndBeforeTimeoutIds: new Set<string>(),
       compactEmbeddedAgentSession: vi.fn().mockResolvedValue({
         ok: true,
         compacted: true,
@@ -113,7 +131,7 @@ const gatewayTestHoisted = vi.hoisted(() => {
         },
       }),
     },
-    testTailscaleWhois: { value: null },
+    testTailscaleWhois: { value: null, calls: [] },
     getReplyFromConfig: vi.fn<GetReplyFromConfigFn>().mockResolvedValue(undefined),
     sendWhatsAppMock: vi.fn().mockResolvedValue({ messageId: "msg-1", toJid: "jid-1" }),
     testState: {
@@ -126,6 +144,7 @@ const gatewayTestHoisted = vi.hoisted(() => {
       allowFrom: undefined,
       cronStorePath: undefined,
       cronEnabled: false,
+      cronTriggersEnabled: undefined,
       gatewayBind: undefined,
       gatewayAuth: undefined,
       gatewayControlUi: undefined,
@@ -140,6 +159,7 @@ const gatewayTestHoisted = vi.hoisted(() => {
   return created;
 });
 
+/** Returns the singleton state object used by gateway test module mocks. */
 export function getGatewayTestHoistedState(): GatewayTestHoistedState {
   return gatewayTestHoisted;
 }
@@ -148,23 +168,22 @@ export const testTailnetIPv4 = gatewayTestHoisted.testTailnetIPv4;
 export const testTailscaleWhois = gatewayTestHoisted.testTailscaleWhois;
 export const agentDiscoveryMock = gatewayTestHoisted.agentDiscoveryMock;
 export const cronIsolatedRun = gatewayTestHoisted.cronIsolatedRun;
-export const agentCommand = gatewayTestHoisted.agentCommand;
-export const runBtwSideQuestion = gatewayTestHoisted.runBtwSideQuestion;
+export const agentCommandMock = gatewayTestHoisted.agentCommand;
 export const dispatchInboundMessageMock = gatewayTestHoisted.dispatchInboundMessage;
-export const getReplyFromConfig = gatewayTestHoisted.getReplyFromConfig;
+export const gatewayReplyMock = gatewayTestHoisted.getReplyFromConfig;
 export const mockGetReplyFromConfigOnce = (impl: GetReplyFromConfigFn) => {
-  getReplyFromConfig.mockImplementationOnce(impl);
+  gatewayReplyMock.mockImplementationOnce(impl);
 };
 export const sendWhatsAppMock = gatewayTestHoisted.sendWhatsAppMock;
 export const testState = gatewayTestHoisted.testState;
 export const testIsNixMode = gatewayTestHoisted.testIsNixMode;
-export const sessionStoreSaveDelayMs = gatewayTestHoisted.sessionStoreSaveDelayMs;
 export const embeddedRunMock = gatewayTestHoisted.embeddedRunMock;
 
 export const testConfigRoot = resolveGlobalSingleton(GATEWAY_TEST_CONFIG_ROOT_KEY, () => ({
   value: path.join(os.tmpdir(), `openclaw-gateway-test-${process.pid}-${crypto.randomUUID()}`),
 }));
 
+/** Updates the config root used by gateway config-module mocks. */
 export function setTestConfigRoot(root: string): void {
   testConfigRoot.value = root;
   process.env.OPENCLAW_CONFIG_PATH = path.join(root, "openclaw.json");

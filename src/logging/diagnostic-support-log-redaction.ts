@@ -1,3 +1,5 @@
+// Support log redaction helpers scrub sensitive fields from diagnostic log payloads.
+import { safeParseJsonRecord } from "@openclaw/normalization-core";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { isBlockedObjectKey } from "../infra/prototype-keys.js";
 import {
@@ -5,6 +7,7 @@ import {
   type SupportRedactionContext,
 } from "./diagnostic-support-redaction.js";
 
+// Sanitizes JSON log records before they enter support bundles.
 const LOG_STRING_FIELD_RE =
   /^(?:action|channel|code|component|endpoint|event|handshake|kind|level|localAddr|logger|method|model|module|msg|name|outcome|phase|pluginId|provider|reason|remoteAddr|requestId|runId|service|source|status|subsystem|surface|target|time|traceId|type)$/iu;
 const LOG_SCALAR_FIELD_RE =
@@ -12,7 +15,7 @@ const LOG_SCALAR_FIELD_RE =
 const OMITTED_LOG_FIELD_RE =
   /(?:authorization|body|chat|content|cookie|credential|detail|error|header|instruction|message|password|payload|prompt|result|secret|session[-_]?id|session[-_]?key|text|token|tool|transcript|url)/iu;
 const UNSAFE_LOG_MESSAGE_RE =
-  /(?:\b(?:ai response|assistant said|chat text|message contents|prompt|raw webhook body|tool output|tool result|transcript|user said|webhook body)\b|auto-responding\b.*:\s*["']|partial for\b.*:)/iu;
+  /(?:\blastAssistant\s*=|\b(?:ai response|assistant said|chat text|message contents|prompt|raw webhook body|tool output|tool result|transcript|user said|webhook body)\b|auto-responding\b.*:\s*["']|partial for\b.*:)/iu;
 const MAX_LOG_STRING_LENGTH = 240;
 const LOGTAPE_META_FIELD = "_meta";
 const LOGTAPE_ARG_FIELD_RE = /^\d+$/u;
@@ -30,6 +33,7 @@ function createLogRecord(): Record<string, unknown> {
   return Object.create(null) as Record<string, unknown>;
 }
 
+/** Parses and sanitizes one log line into safe support-bundle metadata. */
 export function sanitizeSupportLogRecord(
   line: string,
   redaction: SupportRedactionContext,
@@ -114,6 +118,7 @@ function addLogTapeArgFields(
     .filter(([key]) => LOGTAPE_ARG_FIELD_RE.test(key))
     .toSorted(([left], [right]) => Number(left) - Number(right));
 
+  // LogTape stores message args as numeric keys; only structured safe fields survive.
   for (const [, value] of args) {
     const record = typeof value === "string" ? parseJsonRecord(value) : asOptionalRecord(value);
     if (record) {
@@ -156,11 +161,7 @@ function parseJsonRecord(value: string): Record<string, unknown> | undefined {
   if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
     return undefined;
   }
-  try {
-    return asOptionalRecord(JSON.parse(trimmed));
-  } catch {
-    return undefined;
-  }
+  return safeParseJsonRecord(trimmed);
 }
 
 function addLogObjectFields(

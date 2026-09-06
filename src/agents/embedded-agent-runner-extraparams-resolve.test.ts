@@ -1,3 +1,4 @@
+// Covers resolving configured extra params before provider stream wrapping.
 import { describe, expect, it } from "vitest";
 import { resolveExtraParams } from "./embedded-agent-runner/extra-params.js";
 
@@ -23,6 +24,16 @@ describe("resolveExtraParams", () => {
       parallel_tool_calls: true,
       text_verbosity: "low",
     });
+  });
+
+  it("does not apply OpenAI GPT-5 defaults to OpenRouter models", () => {
+    const result = resolveExtraParams({
+      cfg: undefined,
+      provider: "openrouter",
+      modelId: "gpt-5.4",
+    });
+
+    expect(result).toBeUndefined();
   });
 
   it("returns params for exact provider/model key", () => {
@@ -94,6 +105,8 @@ describe("resolveExtraParams", () => {
   });
 
   it("merges per-agent params over global model defaults", () => {
+    // Agent-specific params are narrower than model defaults and must win on
+    // overlapping keys.
     const result = resolveExtraParams({
       cfg: {
         agents: {
@@ -127,6 +140,8 @@ describe("resolveExtraParams", () => {
   });
 
   it("preserves higher-precedence agent parallelToolCalls override across alias styles", () => {
+    // Canonicalization must happen after precedence resolution, or a broad
+    // snake_case value can overwrite the agent's camelCase override.
     const result = resolveExtraParams({
       cfg: {
         agents: {
@@ -194,6 +209,8 @@ describe("resolveExtraParams", () => {
   });
 
   it("canonicalizes response format alias styles with agent override precedence", () => {
+    // Response-format aliases feed provider payloads directly, so merge order and
+    // key normalization have to produce one canonical response_format value.
     const result = resolveExtraParams({
       cfg: {
         agents: {

@@ -1,3 +1,4 @@
+// Plugin tool allowlist warning tests cover doctor warnings for stale tool allowlists.
 import { describe, expect, it } from "vitest";
 import type { PluginManifestRegistry } from "../../../plugins/manifest-registry.js";
 import { collectPluginToolAllowlistWarnings } from "./plugin-tool-allowlist-warnings.js";
@@ -136,6 +137,26 @@ describe("collectPluginToolAllowlistWarnings", () => {
     expect(warnings).toEqual([
       '- mcp.servers defines 2 MCP servers ("gmail", "outlook"), but tools.sandbox.tools.alsoAllow does not include "bundle-mcp", "group:plugins", or a matching server-prefixed MCP tool name/glob such as "<server>__*". Sandboxed agents will filter bundled MCP tools before provider requests. Add "bundle-mcp" to tools.sandbox.tools.alsoAllow (or use "group:plugins" / server globs) if those MCP tools should be visible; use tools.sandbox.tools.allow: [] only when you intentionally want no sandbox allow gate.',
     ]);
+  });
+
+  it("does not warn when all configured MCP servers are disabled", () => {
+    const warnings = collectPluginToolAllowlistWarnings({
+      cfg: {
+        agents: { defaults: { sandbox: { mode: "all" } } },
+        mcp: {
+          servers: {
+            supabase: {
+              url: "http://localhost:54321/mcp",
+              enabled: false,
+            },
+          },
+        },
+        tools: { sandbox: { tools: { alsoAllow: ["web_search"] } } },
+      },
+      manifestRegistry,
+    });
+
+    expect(warnings).toStrictEqual([]);
   });
 
   it("uses a config-path source label when sandbox allowlist is unset", () => {

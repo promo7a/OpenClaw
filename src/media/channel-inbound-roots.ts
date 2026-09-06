@@ -1,3 +1,4 @@
+// Channel inbound root helpers resolve media roots for channel-delivered files.
 import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import type { MsgContext } from "../auto-reply/templating.js";
 import type { OpenClawConfig } from "../config/types.js";
@@ -15,23 +16,16 @@ type ChannelMediaContractApi = {
 };
 type ChannelMediaRootResolver = keyof ChannelMediaContractApi;
 
-const mediaContractApiByChannel = new Map<string, ChannelMediaContractApi | null>();
-
 function loadChannelMediaContractApi(
   channelId: string,
   resolver: ChannelMediaRootResolver,
 ): ChannelMediaContractApi | undefined {
-  if (mediaContractApiByChannel.has(channelId)) {
-    const cached = mediaContractApiByChannel.get(channelId);
-    return cached && typeof cached[resolver] === "function" ? cached : undefined;
-  }
-
   try {
+    // Media-root resolution must stay a narrow artifact load, not full channel bootstrap.
     const loaded = loadBundledPluginPublicArtifactModuleSync<ChannelMediaContractApi>({
       dirName: channelId,
       artifactBasename: "media-contract-api.js",
     });
-    mediaContractApiByChannel.set(channelId, loaded);
     if (typeof loaded[resolver] === "function") {
       return loaded;
     }
@@ -47,7 +41,6 @@ function loadChannelMediaContractApi(
     }
   }
 
-  mediaContractApiByChannel.set(channelId, null);
   return undefined;
 }
 
@@ -62,6 +55,7 @@ function findChannelMediaContractApi(
   return loadChannelMediaContractApi(normalized, resolver);
 }
 
+/** Resolves local inbound attachment roots from the channel named in a message context. */
 export function resolveChannelInboundAttachmentRoots(params: {
   cfg: OpenClawConfig;
   ctx: MsgContext;
@@ -73,6 +67,7 @@ export function resolveChannelInboundAttachmentRoots(params: {
   });
 }
 
+/** Resolves local inbound attachment roots for callers that already know the channel id. */
 export function resolveChannelInboundAttachmentRootsForChannel(params: {
   cfg: OpenClawConfig;
   channelId?: string | null;
@@ -91,6 +86,7 @@ export function resolveChannelInboundAttachmentRootsForChannel(params: {
   return undefined;
 }
 
+/** Resolves remote staging roots for inbound channel attachments without loading full channel code. */
 export function resolveChannelRemoteInboundAttachmentRoots(params: {
   cfg: OpenClawConfig;
   ctx: MsgContext;

@@ -1,7 +1,9 @@
+/** Discovers agent models and auth storage with provider/plugin normalization hooks. */
 import path from "node:path";
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { Model } from "../llm/types.js";
+import type { PluginMetadataSnapshotOwnerMaps } from "../plugins/plugin-metadata-snapshot.types.js";
 import { normalizeModelCompat } from "../plugins/provider-model-compat.js";
 import {
   applyProviderResolvedTransportWithPlugin,
@@ -9,20 +11,20 @@ import {
 } from "../plugins/provider-runtime.js";
 import { isRecord } from "../utils.js";
 import {
-  resolveAgentCredentialsForDiscovery,
-  scrubLegacyStaticAuthJsonEntriesForDiscovery,
+  resolveAgentDiscoveryAuthFacts,
   type DiscoverAuthStorageOptions,
 } from "./agent-auth-discovery.js";
 import { resolveModelPluginMetadataSnapshot } from "./model-discovery-context.js";
-import type { PluginModelCatalogMetadataSnapshot } from "./plugin-model-catalog.js";
+import type {
+  PluginModelCatalogMetadataSnapshot,
+  PersistedPluginModelCatalog,
+} from "./plugin-model-catalog.js";
 import {
   AuthStorage,
   ModelRegistry,
   type AuthStorage as AgentAuthStorage,
   type ModelRegistry as AgentModelRegistry,
 } from "./sessions/index.js";
-
-export { AuthStorage, ModelRegistry };
 
 type ProviderRuntimeModelLike = Model & {
   contextTokens?: number;
@@ -32,15 +34,37 @@ type DiscoveredProviderRuntimeModelLike = Omit<ProviderRuntimeModelLike, "api"> 
   api?: string | null;
 };
 
+const CAPTURED_MODELS_JSON_SOURCE_PATH = "captured:models.json";
+
 type DiscoverModelsOptions = {
   config?: OpenClawConfig;
+  includePluginCatalogs?: boolean;
+  modelsJsonContents?: string | null;
+  pluginCatalogs?: readonly PersistedPluginModelCatalog[];
   providerFilter?: string;
   pluginMetadataSnapshot?: PluginModelCatalogMetadataSnapshot;
   workspaceDir?: string;
   normalizeModels?: boolean;
 };
 
-export function normalizeDiscoveredAgentModel<T>(value: T, agentDir: string): T {
+type NormalizeDiscoveredModelOptions = Pick<DiscoverModelsOptions, "config" | "workspaceDir"> & {
+  providerMetadataOwners?: PluginMetadataSnapshotOwnerMaps;
+};
+
+type DiscoverCapturedModelsOptions = Omit<
+  DiscoverModelsOptions,
+  "modelsJsonContents" | "normalizeModels" | "pluginCatalogs"
+> & {
+  modelsJsonContents: string | null;
+  pluginCatalogs: readonly PersistedPluginModelCatalog[];
+};
+
+/** Applies plugin model normalization and transport hooks to discovered agent models. */
+export function normalizeDiscoveredAgentModel<T>(
+  value: T,
+  agentDir: string,
+  options?: NormalizeDiscoveredModelOptions,
+): T {
   if (!isRecord(value)) {
     return value;
   }
@@ -52,9 +76,15 @@ export function normalizeDiscoveredAgentModel<T>(value: T, agentDir: string): T 
     return value;
   }
   const model = value as unknown as DiscoveredProviderRuntimeModelLike;
+  const runtimeContext = {
+    ...(options?.config !== undefined ? { config: options.config } : {}),
+    ...(options?.workspaceDir !== undefined ? { workspaceDir: options.workspaceDir } : {}),
+  };
   const pluginNormalized =
     normalizeProviderResolvedModelWithPlugin({
       provider: model.provider,
+      modelId: model.id,
+      ...runtimeContext,
       context: {
         provider: model.provider,
         modelId: model.id,
@@ -65,6 +95,8 @@ export function normalizeDiscoveredAgentModel<T>(value: T, agentDir: string): T 
   const transportNormalized =
     applyProviderResolvedTransportWithPlugin({
       provider: model.provider,
+      modelId: model.id,
+      ...runtimeContext,
       context: {
         provider: model.provider,
         modelId: model.id,
@@ -81,13 +113,13 @@ export function normalizeDiscoveredAgentModel<T>(value: T, agentDir: string): T 
   ) {
     return value;
   }
-  return normalizeModelCompat(transportNormalized as Model) as T;
+  return normalizeModelCompat(transportNormalized as Model, options?.providerMetadataOwners) as T;
 }
 
 function createOpenClawModelRegistry(
   authStorage: AgentAuthStorage,
   modelsJsonPath: string,
-  agentDir: string,
+  agentDir: string | undefined,
   options?: DiscoverModelsOptions,
 ): AgentModelRegistry {
   const pluginMetadataSnapshot = resolveModelPluginMetadataSnapshot({
@@ -99,7 +131,16 @@ function createOpenClawModelRegistry(
     allowWorkspaceScopedCurrent: options?.workspaceDir === undefined,
     useRuntimeConfig: options?.config === undefined,
   });
-  const registryOptions = pluginMetadataSnapshot ? { pluginMetadataSnapshot } : {};
+  const registryOptions = {
+    ...(pluginMetadataSnapshot ? { pluginMetadataSnapshot } : {}),
+    ...(options?.includePluginCatalogs !== undefined
+      ? { includePluginCatalogs: options.includePluginCatalogs }
+      : {}),
+    ...(options?.modelsJsonContents !== undefined
+      ? { modelsJsonContents: options.modelsJsonContents }
+      : {}),
+    ...(options?.pluginCatalogs !== undefined ? { pluginCatalogs: options.pluginCatalogs } : {}),
+  };
   const registry = ModelRegistry.create(authStorage, modelsJsonPath, registryOptions);
   const getAll = registry.getAll.bind(registry);
   const getAvailable = registry.getAvailable.bind(registry);
@@ -110,20 +151,28 @@ function createOpenClawModelRegistry(
     !providerFilter || normalizeProviderId(entry.provider) === providerFilter;
   const shouldNormalize = options?.normalizeModels !== false;
   const findCache = new Map<string, Model | undefined>();
-  const normalizeEntry = (entry: Model) =>
-    shouldNormalize ? normalizeDiscoveredAgentModel(entry, agentDir) : entry;
+  const normalizeEntry = (entry: Model) => {
+    if (!shouldNormalize) {
+      return entry;
+    }
+    if (!agentDir) {
+      throw new Error("agent directory is required for model normalization");
+    }
+    return normalizeDiscoveredAgentModel(entry, agentDir, {
+      ...options,
+      ...(pluginMetadataSnapshot?.owners
+        ? { providerMetadataOwners: pluginMetadataSnapshot.owners }
+        : {}),
+    });
+  };
 
   registry.getAll = () => {
     const entries = getAll().filter((entry: Model) => matchesProviderFilter(entry));
-    return shouldNormalize
-      ? entries.map((entry: Model) => normalizeDiscoveredAgentModel(entry, agentDir))
-      : entries;
+    return shouldNormalize ? entries.map(normalizeEntry) : entries;
   };
   registry.getAvailable = () => {
     const entries = getAvailable().filter((entry: Model) => matchesProviderFilter(entry));
-    return shouldNormalize
-      ? entries.map((entry: Model) => normalizeDiscoveredAgentModel(entry, agentDir))
-      : entries;
+    return shouldNormalize ? entries.map(normalizeEntry) : entries;
   };
   registry.find = (provider: string, modelId: string) => {
     const normalizedProvider = normalizeProviderId(provider);
@@ -144,19 +193,32 @@ function createOpenClawModelRegistry(
   return registry;
 }
 
+/** Builds auth storage for model discovery without prompting for secrets. */
 export function discoverAuthStorage(
   agentDir: string,
   options?: DiscoverAuthStorageOptions,
 ): AgentAuthStorage {
-  const credentials =
-    options?.skipCredentials === true ? {} : resolveAgentCredentialsForDiscovery(agentDir, options);
-  const authPath = path.join(agentDir, "auth.json");
-  if (options?.readOnly !== true) {
-    scrubLegacyStaticAuthJsonEntriesForDiscovery(authPath);
-  }
-  return AuthStorage.inMemory(credentials);
+  return discoverAuthStorageFacts(agentDir, options).authStorage;
 }
 
+/** Captures the effective profile store and its AuthStorage projection as one generation. */
+export function discoverAuthStorageFacts(
+  agentDir: string,
+  options?: DiscoverAuthStorageOptions,
+): {
+  authStorage: AgentAuthStorage;
+  store: import("./auth-profiles/types.js").AuthProfileStore;
+  credentials: import("./agent-auth-credentials.js").AgentCredentialMap;
+} {
+  const facts =
+    options?.skipCredentials === true
+      ? { store: { version: 1, profiles: {} }, credentials: {} }
+      : resolveAgentDiscoveryAuthFacts(agentDir, options);
+  return { ...facts, authStorage: AuthStorage.inMemory(facts.credentials) };
+}
+
+/** Creates the model registry used by agent model discovery. */
+/** Creates a model registry for one agent directory, optionally filtered and plugin-normalized. */
 export function discoverModels(
   authStorage: AgentAuthStorage,
   agentDir: string,
@@ -170,9 +232,16 @@ export function discoverModels(
   );
 }
 
-export {
-  addEnvBackedAgentCredentials,
-  resolveAgentCredentialsForDiscovery,
-  scrubLegacyStaticAuthJsonEntriesForDiscovery,
-  type DiscoverAuthStorageOptions,
-} from "./agent-auth-discovery.js";
+/**
+ * Parses complete lifecycle-captured sources without retaining an agent-directory dependency.
+ * Callers may share the resulting immutable catalog snapshot across exact source generations.
+ */
+export function discoverModelsFromCapturedSources(
+  authStorage: AgentAuthStorage,
+  options: DiscoverCapturedModelsOptions,
+): AgentModelRegistry {
+  return createOpenClawModelRegistry(authStorage, CAPTURED_MODELS_JSON_SOURCE_PATH, undefined, {
+    ...options,
+    normalizeModels: false,
+  });
+}

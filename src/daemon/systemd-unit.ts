@@ -1,3 +1,4 @@
+/** Renders and parses systemd unit snippets for managed gateway services. */
 import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
 import { splitArgsPreservingQuotes } from "./arg-split.js";
 import type { GatewayServiceRenderArgs } from "./service-types.js";
@@ -15,15 +16,21 @@ function systemdEscapeArg(value: string): string {
   if (!/[\s"\\]/.test(value)) {
     return value;
   }
-  return `"${value.replace(/\\\\/g, "\\\\\\\\").replace(/"/g, '\\\\"')}"`;
+  // systemd ExecStart/Environment parsing consumes one backslash before the next
+  // character, so every backslash and quote must be escaped for the value to
+  // survive the round-trip byte-for-byte. Escaping only backslash pairs left a
+  // lone backslash unescaped, and the reader then swallowed the byte after it.
+  const escaped = value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+  return `"${escaped}"`;
 }
 
 function renderEnvLines(env: Record<string, string | undefined> | undefined): string[] {
   if (!env) {
     return [];
   }
+  // An explicit empty NODE_OPTIONS blocks inherited supervisor preload/heap flags.
   const entries = Object.entries(env).filter(
-    ([, value]) => typeof value === "string" && value.trim(),
+    ([key, value]) => typeof value === "string" && (value.trim() || key === "NODE_OPTIONS"),
   );
   if (entries.length === 0) {
     return [];
@@ -75,9 +82,16 @@ export function buildSystemdUnit({
     "Restart=always",
     "RestartSec=5",
     "RestartPreventExitStatus=78",
-    "TimeoutStopSec=30",
+    // Must cover the gateway's SIGTERM drain budget (five minutes) plus its
+    // teardown reserve. Otherwise systemd kills the embedded model/tool
+    // process before the gateway can finish the cooperative drain.
+    "TimeoutStopSec=330",
     "TimeoutStartSec=30",
     "SuccessExitStatus=0 143",
+    // Transient child processes may be selected by the OOM killer before the
+    // gateway. Keep the service running when that happens; the child surface is
+    // already responsible for reporting the failed command/session.
+    "OOMPolicy=continue",
     // Keep service children in the same lifecycle so restarts do not leave
     // orphan ACP/runtime workers behind.
     "KillMode=control-group",
@@ -97,55 +111,43 @@ export function parseSystemdExecStart(value: string): string[] {
   return splitArgsPreservingQuotes(value, { escapeMode: "backslash" });
 }
 
-export function parseSystemdEnvAssignment(raw: string): { key: string; value: string } | null {
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return null;
-  }
-
-  const unquoted = (() => {
-    const quote = trimmed[0];
-    if (!((quote === '"' || quote === "'") && trimmed.endsWith(quote))) {
-      return trimmed;
-    }
-    let out = "";
-    let escapeNext = false;
-    for (const ch of trimmed.slice(1, -1)) {
-      if (escapeNext) {
-        out += ch;
-        escapeNext = false;
-        continue;
-      }
-      if (ch === "\\\\") {
-        escapeNext = true;
-        continue;
-      }
-      out += ch;
-    }
-    return out;
-  })();
-
-  const eq = unquoted.indexOf("=");
-  if (eq <= 0) {
-    return null;
-  }
-  const key = unquoted.slice(0, eq).trim();
-  if (!key) {
-    return null;
-  }
-  const value = unquoted.slice(eq + 1);
-  return { key, value };
-}
-
 export function parseSystemdEnvAssignments(raw: string): Array<{ key: string; value: string }> {
   return splitArgsPreservingQuotes(raw, {
     escapeMode: "backslash",
     quoteChars: ['"', "'"],
     quoteStart: "item-start",
   }).flatMap((entry) => {
-    const parsed = parseSystemdEnvAssignment(entry);
-    return parsed ? [parsed] : [];
+    // The splitter has already removed quotes and consumed escapes.
+    const assignment = entry.trim();
+    const separator = assignment.indexOf("=");
+    return separator <= 0
+      ? []
+      : [{ key: assignment.slice(0, separator).trim(), value: assignment.slice(separator + 1) }];
   });
+}
+
+export function splitSystemdLogicalLines(content: string): string[] {
+  const lines: string[] = [];
+  let continued = "";
+  for (const physicalLine of content.split(/\r?\n/)) {
+    // systemd skips physical comments before continuation handling. Keep standalone
+    // comments for unit rewrites, but never let their backslashes consume directives.
+    if (/^\s*[#;]/u.test(physicalLine)) {
+      if (!continued) {
+        lines.push(physicalLine);
+      }
+      continue;
+    }
+    const line = continued + physicalLine;
+    // Only an unmatched final backslash continues; indentation inside quotes is data.
+    if (/(?:^|[^\\])(?:\\\\)*\\$/u.test(line)) {
+      continued = `${line.slice(0, -1)} `;
+    } else {
+      lines.push(line);
+      continued = "";
+    }
+  }
+  return continued ? [...lines, continued] : lines;
 }
 
 export function renderSystemdEnvAssignment(key: string, value: string): string {

@@ -1,10 +1,16 @@
+/**
+ * Extracts native Codex subagent completion notifications from trusted
+ * inter-agent commentary messages emitted by the app-server.
+ */
+import { readStringField as readString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { CodexServerNotification, JsonObject, JsonValue } from "./protocol.js";
 import { isJsonObject } from "./protocol.js";
 
 const CODEX_SUBAGENT_NOTIFICATION_START = "<subagent_notification>";
 const CODEX_SUBAGENT_NOTIFICATION_END = "</subagent_notification>";
 
-export type CodexNativeSubagentCompletionStatus = "succeeded" | "failed" | "cancelled";
+/** Terminal status values OpenClaw accepts for Codex native subagent completion. */
+type CodexNativeSubagentCompletionStatus = "succeeded" | "failed" | "cancelled";
 
 type CodexNativeSubagentCompletionDetails = {
   status: CodexNativeSubagentCompletionStatus;
@@ -12,15 +18,18 @@ type CodexNativeSubagentCompletionDetails = {
   result: string;
 };
 
+/** Completion associated with a resolved child thread id. */
 export type CodexNativeSubagentCompletion = CodexNativeSubagentCompletionDetails & {
   childThreadId: string;
 };
 
-export type CodexNativeSubagentNotificationCompletion = CodexNativeSubagentCompletionDetails & {
+/** Completion parsed from a notification payload before agent-path matching resolves the thread. */
+type CodexNativeSubagentNotificationCompletion = CodexNativeSubagentCompletionDetails & {
   agentPath: string;
 };
 
-export function extractCodexNativeSubagentCompletions(
+/** Extracts trusted subagent completion payloads from a Codex server notification. */
+function extractCodexNativeSubagentCompletions(
   notification: CodexServerNotification,
 ): CodexNativeSubagentNotificationCompletion[] {
   const params = isJsonObject(notification.params) ? notification.params : undefined;
@@ -41,7 +50,8 @@ export function extractCodexNativeSubagentCompletions(
   );
 }
 
-export function extractCodexNativeSubagentCompletionsFromText(
+/** Parses one or more tagged subagent completion payloads from commentary text. */
+function extractCodexNativeSubagentCompletionsFromText(
   text: string,
 ): CodexNativeSubagentNotificationCompletion[] {
   const completions: CodexNativeSubagentNotificationCompletion[] = [];
@@ -63,6 +73,44 @@ export function extractCodexNativeSubagentCompletionsFromText(
     cursor = end + CODEX_SUBAGENT_NOTIFICATION_END.length;
   }
   return completions;
+}
+
+export const codexNativeSubagentNotifications = {
+  fromNotification: extractCodexNativeSubagentCompletions,
+  fromText: extractCodexNativeSubagentCompletionsFromText,
+  deliveredAgentPaths: readDeliveredNativeCompletionPaths,
+};
+
+/** Reads native delivery receipts, leaving status and result ownership with the child lifecycle. */
+function readDeliveredNativeCompletionPaths(notification: CodexServerNotification): string[] {
+  if (notification.method !== "rawResponseItem/completed") {
+    return [];
+  }
+  const params = isJsonObject(notification.params) ? notification.params : undefined;
+  const item = isJsonObject(params?.item) ? params.item : undefined;
+  if (!item || readString(item, "type") !== "agent_message") {
+    return extractCodexNativeSubagentCompletions(notification).map(
+      (completion) => completion.agentPath,
+    );
+  }
+  const author = readString(item, "author");
+  const recipient = readString(item, "recipient");
+  const content = item.content;
+  if (!author || !recipient || !Array.isArray(content) || content.length !== 1) {
+    return [];
+  }
+  const part = content[0];
+  if (!isJsonObject(part) || readString(part, "type") !== "input_text") {
+    return [];
+  }
+  const text = readString(part, "text");
+  // Codex's native completion envelope identifies both endpoints outside the
+  // payload. Ordinary messages and quoted completion text are not receipts.
+  return text?.startsWith(
+    `Message Type: FINAL_ANSWER\nTask name: ${recipient}\nSender: ${author}\nPayload:\n`,
+  )
+    ? [author]
+    : [];
 }
 
 function parseCodexNativeSubagentNotificationBody(
@@ -107,10 +155,13 @@ function readCompletionStatus(status: JsonObject):
     if (!mappedStatus) {
       continue;
     }
+    const result = stringifyResult(value, mappedStatus);
+    const noFinalAssistantMessage =
+      mappedStatus === "succeeded" && result.kind === "no_final_assistant_message";
     return {
       status: mappedStatus,
-      label: rawKey,
-      result: stringifyResult(value),
+      label: noFinalAssistantMessage ? "completed_without_final_message" : rawKey,
+      result: result.text,
     };
   }
   return undefined;
@@ -140,18 +191,42 @@ function mapCompletionStatus(value: string): CodexNativeSubagentCompletionStatus
   return undefined;
 }
 
-function stringifyResult(value: JsonValue | undefined): string {
+function stringifyResult(
+  value: JsonValue | undefined,
+  status: CodexNativeSubagentCompletionStatus,
+): {
+  text: string;
+  kind?: "no_final_assistant_message";
+} {
   if (typeof value === "string") {
-    return value.trim() || "(no output)";
+    const text = value.trim();
+    if (text) {
+      return { text };
+    }
+    return status === "succeeded"
+      ? completedWithoutFinalAssistantMessage()
+      : { text: "(no output)" };
   }
   if (value === null || value === undefined) {
-    return "(no output)";
+    return status === "succeeded"
+      ? completedWithoutFinalAssistantMessage()
+      : { text: "(no output)" };
   }
   try {
-    return JSON.stringify(value);
+    return { text: JSON.stringify(value) };
   } catch {
-    return "(unserializable output)";
+    return { text: "(unserializable output)" };
   }
+}
+
+function completedWithoutFinalAssistantMessage(): {
+  text: string;
+  kind: "no_final_assistant_message";
+} {
+  return {
+    text: "Codex native subagent completed without a final assistant message.",
+    kind: "no_final_assistant_message",
+  };
 }
 
 function readTrustedInterAgentCommunicationContent(item: JsonObject): string | undefined {
@@ -210,11 +285,6 @@ function extractSingleTextPart(item: JsonObject): string | undefined {
     return undefined;
   }
   return readString(entry, "text")?.trim();
-}
-
-function readString(record: JsonObject, key: string): string | undefined {
-  const value = record[key];
-  return typeof value === "string" ? value : undefined;
 }
 
 function normalizeStatusKey(value: string): string {

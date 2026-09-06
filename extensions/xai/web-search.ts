@@ -1,17 +1,14 @@
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+// Xai plugin module implements web search behavior.
 import type {
   WebSearchProviderPlugin,
   WebSearchProviderSetupContext,
 } from "openclaw/plugin-sdk/provider-web-search-config-contract";
 import { buildXaiWebSearchProviderBase } from "./web-search-provider-shared.js";
 
-type XaiWebSearchProviderRuntime = typeof import("./src/web-search-provider.runtime.js");
-
-let xaiWebSearchProviderRuntimePromise: Promise<XaiWebSearchProviderRuntime> | undefined;
-
-function loadXaiWebSearchProviderRuntime(): Promise<XaiWebSearchProviderRuntime> {
-  xaiWebSearchProviderRuntimePromise ??= import("./src/web-search-provider.runtime.js");
-  return xaiWebSearchProviderRuntimePromise;
-}
+const loadXaiWebSearchProviderRuntime = createLazyRuntimeModule(
+  () => import("./src/web-search-provider.runtime.js"),
+);
 
 const GenericXaiSearchSchema = {
   type: "object",
@@ -42,9 +39,10 @@ export function createXaiWebSearchProvider(): WebSearchProviderPlugin {
       description:
         "Search the web using xAI Grok. Returns AI-synthesized answers with citations from real-time web search.",
       parameters: GenericXaiSearchSchema,
-      execute: async (args) => {
+      execute: async (args, executionContext) => {
+        executionContext?.signal?.throwIfAborted();
         const { executeXaiWebSearchProviderTool } = await loadXaiWebSearchProviderRuntime();
-        return await executeXaiWebSearchProviderTool(ctx, args);
+        return await executeXaiWebSearchProviderTool(ctx, args, executionContext);
       },
     }),
   };

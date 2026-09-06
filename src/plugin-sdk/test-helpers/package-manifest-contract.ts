@@ -1,7 +1,11 @@
+/**
+ * Contract suite for bundled plugin package manifests and host version floors.
+ */
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { isAtLeast, parseMinHostVersionRequirement, parseSemver } from "../testing.js";
+import { compareOpenClawVersions } from "../../config/version.js";
+import { parseMinHostVersionRequirement } from "../../plugins/min-host-version.js";
 
 type PackageManifest = {
   dependencies?: Record<string, string>;
@@ -28,6 +32,7 @@ function bundledPluginFile(pluginId: string, relativePath: string): string {
   return `extensions/${pluginId}/${relativePath}`;
 }
 
+/** Installs manifest contract tests for one bundled plugin package. */
 export function describePackageManifestContract(params: PackageManifestContractParams) {
   const packagePath = bundledPluginFile(params.pluginId, "package.json");
 
@@ -53,12 +58,6 @@ export function describePackageManifestContract(params: PackageManifestContractP
     const minHostVersionBaseline = params.minHostVersionBaseline;
     if (minHostVersionBaseline) {
       it("declares a parseable minHostVersion floor at or above the baseline", () => {
-        const baseline = parseSemver(minHostVersionBaseline);
-        expect(baseline).not.toBeNull();
-        if (!baseline) {
-          return;
-        }
-
         const manifest = readPackageManifest(packagePath);
         const requirement = parseMinHostVersionRequirement(
           manifest.openclaw?.install?.minHostVersion ?? null,
@@ -72,16 +71,19 @@ export function describePackageManifestContract(params: PackageManifestContractP
           return;
         }
 
-        const minimum = parseSemver(requirement.minimumLabel);
-        expect(minimum, `${packagePath} should use a parseable semver floor`).not.toBeNull();
-        if (!minimum) {
+        const comparison = compareOpenClawVersions(
+          requirement.minimumLabel,
+          minHostVersionBaseline,
+        );
+        expect(comparison, `${packagePath} should use a parseable semver floor`).not.toBeNull();
+        if (comparison === null) {
           return;
         }
 
         expect(
-          isAtLeast(minimum, baseline),
+          comparison,
           `${packagePath} should require at least OpenClaw ${minHostVersionBaseline}`,
-        ).toBe(true);
+        ).toBeGreaterThanOrEqual(0);
       });
     }
   });

@@ -1,12 +1,16 @@
+/**
+ * Shared plugin-registry mock used by gateway server-agent tests.
+ */
 import { vi } from "vitest";
 import { createEmptyPluginRegistry, type PluginRegistry } from "../plugins/registry.js";
 import { setActivePluginRegistry as setActivePluginRegistryLocal } from "../plugins/runtime.js";
 import { setTestPluginRegistry } from "./test-helpers.plugin-registry.js";
 
-export const registryState: { registry: PluginRegistry } = {
+const registryState: { registry: PluginRegistry } = {
   registry: createEmptyPluginRegistry(),
 };
 
+/** Installs the supplied registry into both gateway test and plugin runtime globals. */
 export function setRegistry(registry: PluginRegistry) {
   registryState.registry = registry;
   setTestPluginRegistry(registry);
@@ -26,6 +30,5 @@ vi.mock("./server-plugins.js", async () => {
         gatewayMethods: params.baseMethods ?? [],
       };
     },
-    setFallbackGatewayContextResolver: vi.fn(),
   };
 });

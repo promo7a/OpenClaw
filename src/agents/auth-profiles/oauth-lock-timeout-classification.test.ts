@@ -1,10 +1,16 @@
+/**
+ * Tests OAuth refresh lock timeout classification.
+ * Verifies only the global refresh lock becomes refresh_contention and that the
+ * original file-lock cause is preserved.
+ */
 import { describe, expect, it } from "vitest";
 import { FILE_LOCK_TIMEOUT_ERROR_CODE, type FileLockTimeoutError } from "../../infra/file-lock.js";
 import {
   buildRefreshContentionError,
   isGlobalRefreshLockTimeoutError,
 } from "./oauth-refresh-lock-errors.js";
-import { resolveAuthStorePath, resolveOAuthRefreshLockPath } from "./paths.js";
+import { resolveOAuthRefreshLockPath } from "./paths.js";
+import { resolveAuthProfileDatabasePath } from "./sqlite.js";
 
 function createLockTimeoutError(lockPath: string): FileLockTimeoutError {
   return Object.assign(new Error(`file lock timeout for ${lockPath.slice(0, -5)}`), {
@@ -18,7 +24,9 @@ describe("OAuth refresh lock timeout classification", () => {
     const profileId = "openai:default";
     const provider = "openai";
     const refreshLockPath = resolveOAuthRefreshLockPath(provider, profileId);
-    const authStoreLockPath = resolveAuthStorePath("/tmp/openclaw-oauth-lock-timeout/agent");
+    const authStoreLockPath = resolveAuthProfileDatabasePath(
+      "/tmp/openclaw-oauth-lock-timeout/agent",
+    );
 
     expect(
       isGlobalRefreshLockTimeoutError(

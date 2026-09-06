@@ -1,7 +1,9 @@
+// Doctor detection and cleanup for stale global plugin-runtime symlinks.
 import fs from "node:fs/promises";
 import path from "node:path";
-import { sortUniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import { note } from "../../../../packages/terminal-core/src/note.js";
+import type { HealthFinding } from "../../../flows/health-checks.js";
+import { resolveOpenClawPackageRootSync } from "../../../infra/openclaw-root.js";
 import { shortenHomePath } from "../../../utils.js";
 
 const PLUGIN_RUNTIME_DEPS_MARKER = "plugin-runtime-deps";
@@ -26,15 +28,18 @@ interface StatsLike {
   isSymbolicLink(): boolean;
 }
 
-export interface StalePluginRuntimeSymlink {
+interface StalePluginRuntimeSymlink {
+  /** Package or scoped package name for the stale symlink. */
   readonly name: string;
+  /** Symlink path under the containing node_modules directory. */
   readonly path: string;
+  /** Target recorded by the symlink, for diagnostic output. */
   readonly target: string;
 }
 
-export interface PluginRuntimeSymlinkOptions {
+interface PluginRuntimeSymlinkOptions {
+  /** Filesystem adapter for tests and doctor cleanup callers. */
   readonly fs?: FsLike;
-  readonly staleRoots?: readonly string[];
 }
 
 const DEFAULT_FS: FsLike = {
@@ -46,8 +51,13 @@ const DEFAULT_FS: FsLike = {
   unlink: (file) => fs.unlink(file),
 };
 
-export async function collectStalePluginRuntimeSymlinks(
-  packageRoot: string | null | undefined,
+/** Find global node_modules symlinks that still point at stale plugin-runtime deps. */
+async function collectStalePluginRuntimeSymlinks(
+  packageRoot: string | null = resolveOpenClawPackageRootSync({
+    argv1: process.argv[1],
+    moduleUrl: import.meta.url,
+    cwd: process.cwd(),
+  }),
   options: PluginRuntimeSymlinkOptions = {},
 ): Promise<StalePluginRuntimeSymlink[]> {
   if (!packageRoot) {
@@ -59,7 +69,6 @@ export async function collectStalePluginRuntimeSymlinks(
   }
 
   const fsApi = options.fs ?? DEFAULT_FS;
-  const staleRoots = uniqueResolvedRoots(options.staleRoots ?? []);
   const stale: StalePluginRuntimeSymlink[] = [];
   const entries = await fsApi
     .readdir(containingNodeModules, { withFileTypes: true })
@@ -72,7 +81,7 @@ export async function collectStalePluginRuntimeSymlinks(
         .catch(() => [] as DirentLike[]);
       for (const scopeEntry of scopeEntries) {
         const fullPath = path.join(scopeDir, scopeEntry.name);
-        const target = await inspectCandidate(fullPath, fsApi, staleRoots);
+        const target = await inspectCandidate(fullPath, fsApi);
         if (target) {
           stale.push({ name: `${entry.name}/${scopeEntry.name}`, path: fullPath, target });
         }
@@ -83,7 +92,7 @@ export async function collectStalePluginRuntimeSymlinks(
       continue;
     }
     const fullPath = path.join(containingNodeModules, entry.name);
-    const target = await inspectCandidate(fullPath, fsApi, staleRoots);
+    const target = await inspectCandidate(fullPath, fsApi);
     if (target) {
       stale.push({ name: entry.name, path: fullPath, target });
     }
@@ -92,6 +101,27 @@ export async function collectStalePluginRuntimeSymlinks(
   return stale.toSorted((left, right) => left.name.localeCompare(right.name));
 }
 
+function stalePluginRuntimeSymlinkToHealthFinding(item: StalePluginRuntimeSymlink): HealthFinding {
+  return {
+    checkId: "core/doctor/stale-plugin-runtime-symlinks",
+    severity: "warning",
+    message: `Stale plugin-runtime symlink ${item.name} points at ${item.target}.`,
+    path: item.path,
+    target: item.path,
+    requirement: "stale-plugin-runtime-symlink-removed",
+    fixHint: "Run `openclaw doctor --fix` to remove stale plugin-runtime symlinks.",
+  };
+}
+
+export async function collectStalePluginRuntimeSymlinkHealthFindings(
+  params: { packageRoot?: string | null } & PluginRuntimeSymlinkOptions = {},
+): Promise<HealthFinding[]> {
+  return (await collectStalePluginRuntimeSymlinks(params.packageRoot, params)).map(
+    stalePluginRuntimeSymlinkToHealthFinding,
+  );
+}
+
+/** Emit a doctor note describing stale plugin-runtime symlinks, if any exist. */
 export async function noteStalePluginRuntimeSymlinks(
   packageRoot: string | null | undefined,
   options: PluginRuntimeSymlinkOptions & {
@@ -120,8 +150,9 @@ export async function noteStalePluginRuntimeSymlinks(
   (options.noteFn ?? note)(lines.join("\n"), "Plugin-runtime symlinks");
 }
 
+/** Remove stale plugin-runtime symlinks and report changes/warnings. */
 export async function removeStalePluginRuntimeSymlinks(
-  packageRoot: string | null | undefined,
+  packageRoot?: string | null,
   options: PluginRuntimeSymlinkOptions = {},
 ): Promise<{ changes: string[]; warnings: string[] }> {
   const fsApi = options.fs ?? DEFAULT_FS;
@@ -142,20 +173,7 @@ export async function removeStalePluginRuntimeSymlinks(
   return { changes, warnings };
 }
 
-function uniqueResolvedRoots(values: readonly string[]): string[] {
-  return sortUniqueStrings(values.map((value) => path.resolve(value)));
-}
-
-function isPathInsideRoot(candidate: string, root: string): boolean {
-  const relativePath = path.relative(root, candidate);
-  return relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath));
-}
-
-async function inspectCandidate(
-  fullPath: string,
-  fsApi: FsLike,
-  staleRoots: readonly string[],
-): Promise<string | null> {
+async function inspectCandidate(fullPath: string, fsApi: FsLike): Promise<string | null> {
   const stat = await fsApi.lstat(fullPath).catch(() => null);
   if (!stat?.isSymbolicLink()) {
     return null;
@@ -164,17 +182,14 @@ async function inspectCandidate(
   if (!target || !target.includes(PLUGIN_RUNTIME_DEPS_MARKER)) {
     return null;
   }
-  const resolvedTarget = path.isAbsolute(target)
-    ? target
-    : path.resolve(path.dirname(fullPath), target);
-  if (staleRoots.some((root) => isPathInsideRoot(resolvedTarget, root))) {
-    return resolvedTarget;
-  }
+  // Paths and cache markers cannot authorize removal. Check the alias itself:
+  // lexical ".." normalization can erase an intermediate directory symlink
+  // and make a live shared-cache target appear missing.
   try {
-    await fsApi.stat(resolvedTarget);
+    await fsApi.stat(fullPath);
     return null;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException | undefined)?.code;
-    return code === "ENOENT" || code === "ENOTDIR" ? resolvedTarget : null;
+    return code === "ENOENT" || code === "ENOTDIR" ? target : null;
   }
 }

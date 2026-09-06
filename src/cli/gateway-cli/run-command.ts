@@ -1,4 +1,9 @@
-import type { Command } from "commander";
+// Gateway run command option registration and lazy handoff to runtime startup.
+import { Option, type Command } from "commander";
+import { WINDOWS_TASK_SUPERVISOR_FLAG } from "../../daemon/windows-task-supervisor-contract.js";
+import type { GatewayRunOpts } from "./run-options.js";
+import { resolveGatewayRunOptions } from "./run-options.js";
+import { getGatewayRunRuntimeHooks } from "./runtime-hooks.js";
 
 const GATEWAY_AUTH_MODES = ["none", "token", "password", "trusted-proxy"] as const;
 const GATEWAY_TAILSCALE_MODES = ["off", "serve", "funnel"] as const;
@@ -7,7 +12,11 @@ function formatModeChoices(modes: readonly string[]): string {
   return modes.map((mode) => `"${mode}"`).join("|");
 }
 
-export function addGatewayRunCommand(cmd: Command): Command {
+type GatewayRunCommandHooks = {
+  beforeRun?: (opts: Pick<GatewayRunOpts, "force" | "reset">) => Promise<void> | void;
+};
+
+export function addGatewayRunCommand(cmd: Command, hooks: GatewayRunCommandHooks = {}): Command {
   return cmd
     .option("--port <port>", "Port for the gateway WebSocket")
     .option(
@@ -25,11 +34,7 @@ export function addGatewayRunCommand(cmd: Command): Command {
       "--tailscale <mode>",
       `Tailscale exposure mode (${formatModeChoices(GATEWAY_TAILSCALE_MODES)})`,
     )
-    .option(
-      "--tailscale-reset-on-exit",
-      "Reset Tailscale serve/funnel configuration on shutdown",
-      false,
-    )
+    .addOption(new Option("--tailscale-reset-on-exit").hideHelp())
     .option(
       "--allow-unconfigured",
       "Allow gateway start without enforcing gateway.mode=local in config (does not repair config)",
@@ -37,10 +42,18 @@ export function addGatewayRunCommand(cmd: Command): Command {
     )
     .option("--dev", "Create a dev config + workspace if missing (no BOOTSTRAP.md)", false)
     .option(
+      "--ambient-channels",
+      "Allow the gateway to auto-configure channels from ambient environment variables",
+      false,
+    )
+    .option("--dev-ambient-channels", "Deprecated alias for --ambient-channels", false)
+    .option(
       "--reset",
       "Reset dev config + credentials + sessions + workspace (requires --dev)",
       false,
     )
+    .addOption(new Option(WINDOWS_TASK_SUPERVISOR_FLAG).hideHelp())
+    .addOption(new Option("--update-canary").hideHelp())
     .option("--force", "Kill any existing listener on the target port before starting", false)
     .option("--verbose", "Verbose logging to stdout/stderr", false)
     .option(
@@ -54,7 +67,16 @@ export function addGatewayRunCommand(cmd: Command): Command {
     .option("--raw-stream", "Log raw model stream events to jsonl", false)
     .option("--raw-stream-path <path>", "Raw stream jsonl path")
     .action(async (opts, command) => {
-      const { resolveGatewayRunOptions, runGatewayCommand } = await import("./run.js");
-      await runGatewayCommand(resolveGatewayRunOptions(opts, command));
+      const resolved = resolveGatewayRunOptions(opts, command);
+      try {
+        await hooks.beforeRun?.(resolved);
+        const { runGatewayCommand } = await import("./run.js");
+        await runGatewayCommand(resolved, getGatewayRunRuntimeHooks());
+      } catch (error) {
+        const { handleGatewayStartupMaintenance } = await import("./startup-maintenance.js");
+        if (!(await handleGatewayStartupMaintenance(error))) {
+          throw error;
+        }
+      }
     });
 }

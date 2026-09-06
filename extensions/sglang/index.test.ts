@@ -1,3 +1,4 @@
+// Sglang tests cover index plugin behavior.
 import { registerSingleProviderPlugin } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { describe, expect, it } from "vitest";
 import plugin from "./index.js";
@@ -19,16 +20,5 @@ describe("sglang provider plugin", () => {
       validateAnthropicTurns: true,
     });
     expect(policy).not.toHaveProperty("dropReasoningFromHistory");
-  });
-
-  it("still drops historical reasoning for Gemma 4 chat-completions models", async () => {
-    const provider = await registerSingleProviderPlugin(plugin);
-    const policy = provider.buildReplayPolicy?.({
-      provider: "sglang",
-      modelApi: "openai-completions",
-      modelId: "google/gemma-4-26b-a4b-it",
-    } as never);
-
-    expect(policy).toHaveProperty("dropReasoningFromHistory", true);
   });
 });

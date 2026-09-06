@@ -1,12 +1,9 @@
+// Plugin SDK barrel for mention-gating policy helpers used by channel plugins.
 export type {
   InboundImplicitMentionKind,
   InboundMentionDecision,
   InboundMentionFacts,
   InboundMentionPolicy,
-  MentionGateParams,
-  MentionGateResult,
-  MentionGateWithBypassParams,
-  MentionGateWithBypassResult,
   ResolveInboundMentionDecisionFlatParams,
   ResolveInboundMentionDecisionNestedParams,
   ResolveInboundMentionDecisionParams,
@@ -14,10 +11,6 @@ export type {
 export {
   implicitMentionKindWhen,
   resolveInboundMentionDecision,
-  // @deprecated Prefer `resolveInboundMentionDecision({ facts, policy })`.
-  resolveMentionGating,
-  // @deprecated Prefer `resolveInboundMentionDecision({ facts, policy })`.
-  resolveMentionGatingWithBypass,
 } from "../channels/mention-gating.js";
 export {
   CURRENT_MESSAGE_MARKER,

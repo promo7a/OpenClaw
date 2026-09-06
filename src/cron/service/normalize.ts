@@ -1,47 +1,40 @@
-import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import { normalizeAgentId } from "../../routing/session-key.js";
-import { truncateUtf16Safe } from "../../utils.js";
+import { truncateWithMarker } from "@openclaw/normalization-core/utf16-slice";
+/** Name, agent id, and payload text normalization helpers for cron service ops. */
+import { normalizeOptionalAgentId } from "../../routing/session-key.js";
 import type { CronPayload } from "../types.js";
 
 /** Normalizes a required cron job name and throws the public validation error when absent. */
 export function normalizeRequiredName(raw: unknown) {
   if (typeof raw !== "string") {
-    throw new Error("cron job name is required");
+    throw new Error("automation name is required");
   }
   const name = raw.trim();
   if (!name) {
-    throw new Error("cron job name is required");
+    throw new Error("automation name is required");
   }
   return name;
 }
 
 function truncateText(input: string, maxLen: number) {
-  if (input.length <= maxLen) {
-    return input;
-  }
-  return `${truncateUtf16Safe(input, Math.max(0, maxLen - 1)).trimEnd()}…`;
+  return truncateWithMarker(input, maxLen, { marker: "…", reserve: 1, trimEnd: true });
 }
 
 /** Normalizes optional cron agent ids through the canonical session-key agent id rules. */
-export function normalizeOptionalAgentId(raw: unknown) {
-  const trimmed = normalizeOptionalString(raw);
-  if (!trimmed) {
-    return undefined;
-  }
-  return normalizeAgentId(trimmed);
-}
+export { normalizeOptionalAgentId };
 
 /** Infers a compact cron job name from payload text first, then schedule shape. */
 export function inferCronJobName(job: {
   schedule?: { kind?: unknown; everyMs?: unknown; expr?: unknown };
-  payload?: { kind?: unknown; text?: unknown; message?: unknown };
+  payload?: { kind?: unknown; text?: unknown; message?: unknown; argv?: unknown };
 }) {
   const text =
     job?.payload?.kind === "systemEvent" && typeof job.payload.text === "string"
       ? job.payload.text
       : job?.payload?.kind === "agentTurn" && typeof job.payload.message === "string"
         ? job.payload.message
-        : "";
+        : job?.payload?.kind === "command" && Array.isArray(job.payload.argv)
+          ? job.payload.argv.join(" ")
+          : "";
   const firstLine =
     text
       .split("\n")
@@ -63,7 +56,7 @@ export function inferCronJobName(job: {
   if (kind === "at") {
     return "One-shot";
   }
-  return "Cron job";
+  return "Automation";
 }
 
 /** Extracts the executable text from cron payload variants for main-session queueing. */
@@ -71,5 +64,7 @@ export function normalizePayloadToSystemText(payload: CronPayload) {
   if (payload.kind === "systemEvent") {
     return typeof payload.text === "string" ? payload.text.trim() : "";
   }
-  return typeof payload.message === "string" ? payload.message.trim() : "";
+  return payload.kind === "agentTurn" && typeof payload.message === "string"
+    ? payload.message.trim()
+    : "";
 }

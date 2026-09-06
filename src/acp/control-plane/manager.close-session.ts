@@ -1,9 +1,11 @@
+/** Close/reset path for ACP runtime sessions and persisted manager metadata. */
 import {
   identityHasStableSessionId,
   resolveSessionIdentityFromMeta,
 } from "@openclaw/acp-core/runtime/session-identity";
 import { toAcpRuntimeError, withAcpRuntimeErrorBoundary } from "../runtime/errors.js";
 import type { ManagerRuntimeHandleCache } from "./manager.runtime-handle-cache.js";
+import { isAcpOwnerRepairRequired } from "./manager.runtime-owner.js";
 import {
   discardPersistedManagerRuntimeState,
   isRecoverableManagerAcpxExitError,
@@ -19,19 +21,22 @@ import type {
 } from "./manager.types.js";
 import { requireReadySessionMeta, resolveAcpSessionResolutionError } from "./manager.utils.js";
 
+/** Closes an ACP session runtime handle and optionally discards persistent state/meta. */
 export async function runManagerCloseSession(params: {
   input: AcpCloseSessionInput;
   sessionKey: string;
+  agentId: string;
   deps: Pick<AcpSessionManagerDeps, "getRuntimeBackend">;
   runtimeHandles: ManagerRuntimeHandleCache;
   resolveSession: ResolveManagerSession;
   ensureRuntimeHandle: EnsureManagerRuntimeHandle;
   writeSessionMeta: WriteManagerSessionMeta;
 }): Promise<AcpCloseSessionResult> {
-  const { input, sessionKey } = params;
+  const { input, sessionKey, agentId } = params;
   const resolution = params.resolveSession({
     cfg: input.cfg,
     sessionKey,
+    agentId,
   });
   const resolutionError = resolveAcpSessionResolutionError(resolution);
   if (resolutionError) {
@@ -58,14 +63,16 @@ export async function runManagerCloseSession(params: {
       cfg: input.cfg,
       meta,
       sessionKey,
+      agentId,
       logPrefix: "acp close fast-reset",
     });
-    params.runtimeHandles.clear(sessionKey);
+    params.runtimeHandles.clear(params);
   } else {
     try {
       const { runtime: ensuredRuntime, handle } = await params.ensureRuntimeHandle({
         cfg: input.cfg,
         sessionKey,
+        agentId,
         meta,
       });
       await withAcpRuntimeErrorBoundary({
@@ -79,7 +86,7 @@ export async function runManagerCloseSession(params: {
         fallbackMessage: "ACP close failed before completion.",
       });
       runtimeClosed = true;
-      params.runtimeHandles.clear(sessionKey);
+      params.runtimeHandles.clear(params);
     } catch (error) {
       const acpError = toAcpRuntimeError({
         error,
@@ -87,6 +94,7 @@ export async function runManagerCloseSession(params: {
         fallbackMessage: "ACP close failed before completion.",
       });
       if (
+        !isAcpOwnerRepairRequired(acpError) &&
         input.allowBackendUnavailable &&
         (acpError.code === "ACP_BACKEND_MISSING" ||
           acpError.code === "ACP_BACKEND_UNAVAILABLE" ||
@@ -100,13 +108,14 @@ export async function runManagerCloseSession(params: {
             cfg: input.cfg,
             meta,
             sessionKey,
+            agentId,
             logPrefix: "acp close recovery",
             missingBackendError: acpError,
           });
         }
-        // Treat unavailable backends as terminal for this cached handle so it
-        // cannot continue counting against maxConcurrentSessions.
-        params.runtimeHandles.clear(sessionKey);
+        // Treat unavailable backends as terminal for this cached handle so a
+        // later operation cannot reuse an unusable runtime.
+        params.runtimeHandles.clear(params);
         runtimeNotice = acpError.message;
       } else {
         throw acpError;
@@ -119,6 +128,7 @@ export async function runManagerCloseSession(params: {
     await discardPersistedManagerRuntimeState({
       cfg: input.cfg,
       sessionKey,
+      agentId,
       writeSessionMeta: params.writeSessionMeta,
     });
   }
@@ -127,6 +137,7 @@ export async function runManagerCloseSession(params: {
     await params.writeSessionMeta({
       cfg: input.cfg,
       sessionKey,
+      agentId,
       mutate: (_current, entry) => {
         if (!entry) {
           return null;

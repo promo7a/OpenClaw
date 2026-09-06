@@ -1,16 +1,22 @@
+// Diagnostic stability helpers compare diagnostic outputs across runs.
+import { parseStrictNonNegativeInteger } from "@openclaw/normalization-core/number-coercion";
 import {
-  onDiagnosticEvent,
+  onInternalDiagnosticEvent,
   type DiagnosticEventPayload,
   type DiagnosticMemoryUsage,
 } from "../infra/diagnostic-events.js";
 
+// Ring-buffer recorder for stability diagnostics and support-bundle snapshots.
 const DEFAULT_DIAGNOSTIC_STABILITY_CAPACITY = 1000;
 const DEFAULT_DIAGNOSTIC_STABILITY_LIMIT = 50;
 export const MAX_DIAGNOSTIC_STABILITY_LIMIT = DEFAULT_DIAGNOSTIC_STABILITY_CAPACITY;
+const MAX_DIAGNOSTIC_EXPORTER_STATES = 16;
 const LIVENESS_EVENT_LOOP_DELAY_WARN_MS = 1_000;
 
 const SAFE_REASON_CODE = /^[A-Za-z0-9_.:-]{1,120}$/u;
+const SAFE_EXPORTER_CODE = /^[A-Za-z0-9_-]{1,120}$/u;
 
+/** Sanitized diagnostic event record retained in the stability ring buffer. */
 export type DiagnosticStabilityEventRecord = {
   seq: number;
   ts: number;
@@ -22,6 +28,7 @@ export type DiagnosticStabilityEventRecord = {
   surface?: string;
   action?: string;
   reason?: string;
+  errorCategory?: string;
   outcome?: string;
   mode?: string;
   level?: string;
@@ -32,6 +39,7 @@ export type DiagnosticStabilityEventRecord = {
   transport?: string;
   brain?: string;
   toolName?: string;
+  approvalId?: string;
   activeWorkKind?: string;
   pairedToolName?: string;
   provider?: string;
@@ -91,6 +99,7 @@ export type DiagnosticStabilityEventRecord = {
   };
 };
 
+/** Point-in-time stability snapshot with records and derived summaries. */
 export type DiagnosticStabilitySnapshot = {
   generatedAt: string;
   capacity: number;
@@ -135,7 +144,28 @@ type DiagnosticStabilityState = {
   nextIndex: number;
   count: number;
   dropped: number;
+  exporterSeq: number;
+  exporterRecords: Map<string, DiagnosticStabilityEventRecord>;
+  exporterDropped: number;
   unsubscribe: (() => void) | null;
+};
+
+export type DiagnosticExporterHealthUpdate = {
+  signal: "traces" | "metrics" | "logs";
+  transport: string;
+  endpointMode?: "configured" | "default_endpoint";
+  status: "started" | "failure" | "recovered" | "dropped";
+  reason?:
+    | "configured"
+    | "default_endpoint"
+    | "export_failed"
+    | "handler_failed"
+    | "emit_failed"
+    | "queue_full"
+    | "shutdown_failed"
+    | "start_failed"
+    | "unsupported_protocol";
+  errorCategory?: string;
 };
 
 function createState(capacity = DEFAULT_DIAGNOSTIC_STABILITY_CAPACITY): DiagnosticStabilityState {
@@ -145,6 +175,9 @@ function createState(capacity = DEFAULT_DIAGNOSTIC_STABILITY_CAPACITY): Diagnost
     nextIndex: 0,
     count: 0,
     dropped: 0,
+    exporterSeq: 0,
+    exporterRecords: new Map(),
+    exporterDropped: 0,
     unsubscribe: null,
   };
 }
@@ -161,11 +194,27 @@ function copyMemory(memory: DiagnosticMemoryUsage): DiagnosticMemoryUsage {
   return { ...memory };
 }
 
-function copyReasonCode(reason: string | undefined): string | undefined {
-  if (!reason || !SAFE_REASON_CODE.test(reason)) {
+function copyReasonCode(reason: unknown): string | undefined {
+  if (typeof reason !== "string" || !SAFE_REASON_CODE.test(reason)) {
     return undefined;
   }
   return reason;
+}
+
+function copyExporterCode(value: unknown): string | undefined {
+  return typeof value === "string" && SAFE_EXPORTER_CODE.test(value) ? value : undefined;
+}
+
+function isDiagnosticExporterSignal(
+  value: unknown,
+): value is DiagnosticExporterHealthUpdate["signal"] {
+  return value === "traces" || value === "metrics" || value === "logs";
+}
+
+function isDiagnosticExporterStatus(
+  value: unknown,
+): value is DiagnosticExporterHealthUpdate["status"] {
+  return value === "started" || value === "failure" || value === "recovered" || value === "dropped";
 }
 
 function assignReasonCode(
@@ -184,13 +233,11 @@ function resolveDiagnosticLivenessRecordLevel(
   const hasBlockingWork = event.waiting > 0 || event.queued > 0;
   const hasSustainedEventLoopDelay =
     (event.eventLoopDelayP99Ms ?? 0) >= LIVENESS_EVENT_LOOP_DELAY_WARN_MS;
-  return hasBlockingWork || (event.active > 0 && hasSustainedEventLoopDelay) ? "warning" : "info";
-}
-
-function isRecord(
-  record: DiagnosticStabilityEventRecord | undefined,
-): record is DiagnosticStabilityEventRecord {
-  return record !== undefined;
+  return event.degradedSinceMs !== undefined ||
+    hasBlockingWork ||
+    (event.active > 0 && hasSustainedEventLoopDelay)
+    ? "warning"
+    : "info";
 }
 
 function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabilityEventRecord {
@@ -201,6 +248,11 @@ function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabi
   };
 
   switch (event.type) {
+    case "gateway.rpc":
+    case "gateway.event_loop.sample":
+    case "diagnostic.gc":
+      // High-volume measurements are exporter-only and excluded by the subscription.
+      break;
     case "model.usage":
       record.channel = event.channel;
       record.provider = event.provider;
@@ -211,14 +263,12 @@ function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabi
       record.durationMs = event.durationMs;
       break;
     case "webhook.received":
+    case "webhook.error":
       record.channel = event.channel;
       break;
     case "webhook.processed":
       record.channel = event.channel;
       record.durationMs = event.durationMs;
-      break;
-    case "webhook.error":
-      record.channel = event.channel;
       break;
     case "message.queued":
       record.channel = event.channel;
@@ -226,9 +276,6 @@ function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabi
       record.queueDepth = event.queueDepth;
       break;
     case "message.received":
-      record.channel = event.channel;
-      record.source = event.source;
-      break;
     case "message.dispatch.started":
       record.channel = event.channel;
       record.source = event.source;
@@ -337,6 +384,12 @@ function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabi
     case "run.progress":
       assignReasonCode(record, event.reason);
       break;
+    case "run.execution_phase":
+      record.phase = event.phase;
+      record.provider = event.provider;
+      record.model = event.model;
+      record.toolName = event.tool;
+      break;
     case "context.assembled":
       record.channel = event.channel;
       record.provider = event.provider;
@@ -345,7 +398,6 @@ function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabi
       record.bytes = event.promptChars;
       record.context =
         event.contextTokenBudget !== undefined ? { limit: event.contextTokenBudget } : undefined;
-      record.bytes = event.promptChars;
       break;
     case "diagnostic.heartbeat":
       record.webhooks = { ...event.webhooks };
@@ -355,7 +407,7 @@ function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabi
       break;
     case "diagnostic.liveness.warning":
       record.level = resolveDiagnosticLivenessRecordLevel(event);
-      record.durationMs = event.intervalMs;
+      record.durationMs = event.degradedSinceMs ?? event.intervalMs;
       record.count = event.reasons.length;
       assignReasonCode(record, event.reasons[0]);
       record.eventLoopDelayP99Ms = event.eventLoopDelayP99Ms;
@@ -401,6 +453,9 @@ function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabi
       record.source = event.toolSource;
       record.pluginId = event.toolOwner;
       record.durationMs = event.durationMs;
+      if (event.terminalReason) {
+        record.outcome = event.terminalReason;
+      }
       assignReasonCode(record, event.errorCategory);
       break;
     case "tool.execution.blocked":
@@ -426,6 +481,11 @@ function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabi
       record.timedOut = event.timedOut;
       record.failureKind = event.failureKind;
       assignReasonCode(record, event.failureKind);
+      break;
+    case "exec.approval.followup_suppressed":
+      record.approvalId = event.approvalId;
+      record.phase = event.phase;
+      assignReasonCode(record, event.reason);
       break;
     case "run.started":
       record.provider = event.provider;
@@ -495,6 +555,14 @@ function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabi
       record.level = event.level;
       record.source = event.loggerName;
       break;
+    case "security.event":
+      record.source = event.category;
+      record.action = event.action;
+      record.outcome = event.outcome;
+      record.level = event.severity;
+      record.target = event.target?.name ?? event.target?.kind;
+      assignReasonCode(record, event.reason ?? event.policy?.reason);
+      break;
     case "diagnostic.memory.sample":
       record.memory = copyMemory(event.memory);
       break;
@@ -517,7 +585,7 @@ function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabi
       assignReasonCode(record, event.reason);
       break;
     case "telemetry.exporter":
-      record.source = event.exporter;
+      record.source = copyExporterCode(event.exporter);
       record.target = event.signal;
       record.outcome = event.status;
       assignReasonCode(record, event.reason ?? event.errorCategory);
@@ -552,18 +620,90 @@ function appendRecord(record: DiagnosticStabilityEventRecord): void {
   state.dropped += 1;
 }
 
+function upsertExporterRecord(record: DiagnosticStabilityEventRecord): void {
+  if (!record.source) {
+    return;
+  }
+  const state = getDiagnosticStabilityState();
+  const key = `${record.source}\u0000${record.target ?? "unknown"}\u0000${record.transport ?? "unknown"}`;
+  if (record.outcome === "dropped") {
+    state.exporterRecords.delete(key);
+    return;
+  }
+  const previous = state.exporterRecords.get(key);
+  if (!record.mode && previous?.mode) {
+    record.mode = previous.mode;
+  }
+  if (
+    !state.exporterRecords.has(key) &&
+    state.exporterRecords.size >= MAX_DIAGNOSTIC_EXPORTER_STATES
+  ) {
+    const oldestKey = state.exporterRecords.keys().next().value;
+    if (oldestKey !== undefined) {
+      state.exporterRecords.delete(oldestKey);
+      state.exporterDropped += 1;
+    }
+  }
+  state.exporterRecords.delete(key);
+  state.exporterRecords.set(key, record);
+}
+
+/** Records a trusted diagnostics-exporter health transition outside the public event contract. */
+export function recordDiagnosticExporterHealth(
+  exporter: string,
+  update: DiagnosticExporterHealthUpdate,
+): void {
+  const source = copyExporterCode(exporter);
+  if (
+    !source ||
+    !isDiagnosticExporterSignal(update.signal) ||
+    !isDiagnosticExporterStatus(update.status)
+  ) {
+    return;
+  }
+  const state = getDiagnosticStabilityState();
+  state.exporterSeq += 1;
+  const record: DiagnosticStabilityEventRecord = {
+    seq: state.exporterSeq,
+    ts: Date.now(),
+    type: "telemetry.exporter",
+    source,
+    target: update.signal,
+    outcome: update.status,
+  };
+  const transport = copyExporterCode(update.transport);
+  if (transport) {
+    record.transport = transport;
+  }
+  if (update.endpointMode === "configured" || update.endpointMode === "default_endpoint") {
+    record.mode = update.endpointMode;
+  }
+  const errorCategory = copyReasonCode(update.errorCategory);
+  if (errorCategory) {
+    record.errorCategory = errorCategory;
+  }
+  assignReasonCode(record, update.reason ?? update.errorCategory);
+  upsertExporterRecord(record);
+}
+
 function listRecords(): DiagnosticStabilityEventRecord[] {
   const state = getDiagnosticStabilityState();
-  if (state.count === 0) {
-    return [];
+  const records: DiagnosticStabilityEventRecord[] = [];
+  const start = state.count < state.capacity ? 0 : state.nextIndex;
+  // Capture the ordered view before query normalization or summary getters can re-enter.
+  for (let offset = 0; offset < state.count; offset += 1) {
+    const record = state.records[(start + offset) % state.capacity];
+    if (record !== undefined) {
+      records.push(record);
+    }
   }
-  if (state.count < state.capacity) {
-    return state.records.slice(0, state.count).filter(isRecord);
-  }
-  return [
-    ...state.records.slice(state.nextIndex),
-    ...state.records.slice(0, state.nextIndex),
-  ].filter(isRecord);
+  return records;
+}
+
+function listExporterRecords(): DiagnosticStabilityEventRecord[] {
+  return [...getDiagnosticStabilityState().exporterRecords.values()].toSorted(
+    (left, right) => left.seq - right.seq,
+  );
 }
 
 function summarizeRecords(
@@ -659,9 +799,15 @@ function parseOptionalNonNegativeInteger(value: unknown, field: string): number 
   if (value === undefined || value === null || value === "") {
     return undefined;
   }
-  const parsed =
-    typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
-  if (!Number.isInteger(parsed) || parsed < 0) {
+  if (typeof value === "string") {
+    // Gate on strict decimal digits before parsing so non-decimal forms such as
+    // "0x2", "1e2", "0b101", "+5", or " 5 " are rejected instead of coerced.
+    if (!/^\d+$/.test(value)) {
+      throw new Error(`${field} must be a non-negative integer`);
+    }
+  }
+  const parsed = parseStrictNonNegativeInteger(value);
+  if (parsed === undefined) {
     throw new Error(`${field} must be a non-negative integer`);
   }
   return parsed;
@@ -688,6 +834,7 @@ function normalizeLimit(limit: unknown, defaultLimit = DEFAULT_DIAGNOSTIC_STABIL
   return parsed;
 }
 
+/** Normalizes user-facing snapshot query options. */
 export function normalizeDiagnosticStabilityQuery(
   input: DiagnosticStabilityQueryInput = {},
   options?: { defaultLimit?: number },
@@ -699,34 +846,62 @@ export function normalizeDiagnosticStabilityQuery(
   };
 }
 
+/** Starts the process-wide diagnostic event recorder if it is not already active. */
 export function startDiagnosticStabilityRecorder(): void {
   const state = getDiagnosticStabilityState();
   if (state.unsubscribe) {
     return;
   }
-  state.unsubscribe = onDiagnosticEvent((event) => {
-    appendRecord(sanitizeDiagnosticEvent(event));
-  });
+  state.unsubscribe = onInternalDiagnosticEvent(
+    (event, metadata) => {
+      // Model-call instrumentation is trusted core telemetry required by recovery.
+      // Other trusted events retain their dedicated owners outside this ring.
+      if (
+        metadata.trusted &&
+        event.type !== "model.call.started" &&
+        event.type !== "model.call.completed" &&
+        event.type !== "model.call.error"
+      ) {
+        return;
+      }
+      appendRecord(sanitizeDiagnosticEvent(event));
+    },
+    {
+      exclude: [
+        "log.record",
+        "telemetry.exporter",
+        "gateway.rpc",
+        "gateway.event_loop.sample",
+        "diagnostic.gc",
+      ],
+    },
+  );
 }
 
+/** Stops the process-wide diagnostic event recorder. */
 export function stopDiagnosticStabilityRecorder(): void {
   const state = getDiagnosticStabilityState();
   state.unsubscribe?.();
   state.unsubscribe = null;
 }
 
+/** Returns a sanitized stability snapshot from the process-wide ring buffer. */
 export function getDiagnosticStabilitySnapshot(options?: {
   limit?: number;
   type?: string;
   sinceSeq?: number;
 }): DiagnosticStabilitySnapshot {
   const state = getDiagnosticStabilityState();
-  const { filtered, events } = selectRecords(listRecords(), options);
+  const exporterQuery = options?.type === "telemetry.exporter";
+  const { filtered, events } = selectRecords(
+    exporterQuery ? listExporterRecords() : listRecords(),
+    options,
+  );
   return {
     generatedAt: new Date().toISOString(),
-    capacity: state.capacity,
+    capacity: exporterQuery ? MAX_DIAGNOSTIC_EXPORTER_STATES : state.capacity,
     count: filtered.length,
-    dropped: state.dropped,
+    dropped: exporterQuery ? state.exporterDropped : state.dropped,
     firstSeq: filtered[0]?.seq,
     lastSeq: filtered.at(-1)?.seq,
     events,
@@ -734,6 +909,7 @@ export function getDiagnosticStabilitySnapshot(options?: {
   };
 }
 
+/** Applies filtering/limits to an existing snapshot without mutating its source records. */
 export function selectDiagnosticStabilitySnapshot(
   snapshot: DiagnosticStabilitySnapshot,
   options?: {
@@ -753,6 +929,7 @@ export function selectDiagnosticStabilitySnapshot(
   };
 }
 
+/** Resets recorder state and subscriptions for isolated tests. */
 export function resetDiagnosticStabilityRecorderForTest(): void {
   const state = getDiagnosticStabilityState();
   state.unsubscribe?.();
@@ -762,3 +939,4 @@ export function resetDiagnosticStabilityRecorderForTest(): void {
   };
   globalStore["__openclawDiagnosticStabilityState"] = next;
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

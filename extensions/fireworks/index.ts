@@ -1,24 +1,26 @@
 import type { ProviderResolveDynamicModelContext } from "openclaw/plugin-sdk/plugin-entry";
 import { defineSingleProviderPluginEntry } from "openclaw/plugin-sdk/provider-entry";
 import {
+  buildProviderReplayFamilyHooks,
   cloneFirstTemplateModel,
   DEFAULT_CONTEXT_TOKENS,
   normalizeModelCompat,
-  OPENAI_COMPATIBLE_REPLAY_HOOKS,
 } from "openclaw/plugin-sdk/provider-model-shared";
 import { isFireworksKimiModelId } from "./model-id.js";
-import { applyFireworksConfig, FIREWORKS_DEFAULT_MODEL_REF } from "./onboard.js";
+import { applyFireworksConfig } from "./onboard.js";
+import manifest from "./openclaw.plugin.json" with { type: "json" };
 import {
-  buildFireworksProvider,
   FIREWORKS_BASE_URL,
   FIREWORKS_DEFAULT_CONTEXT_WINDOW,
   FIREWORKS_DEFAULT_MAX_TOKENS,
   FIREWORKS_DEFAULT_MODEL_ID,
+  isFireworksCatalogModelId,
 } from "./provider-catalog.js";
 import { wrapFireworksProviderStream } from "./stream.js";
 import { resolveFireworksThinkingProfile } from "./thinking-policy.js";
 
 const PROVIDER_ID = "fireworks";
+
 function isFireworksGlmModelId(modelId: string): boolean {
   const normalized = modelId.trim().toLowerCase();
   const lastSegment = normalized.split("/").pop() ?? normalized;
@@ -34,6 +36,11 @@ function resolveFireworksDynamicModel(ctx: ProviderResolveDynamicModelContext) {
   if (!modelId) {
     return undefined;
   }
+
+  if (isFireworksCatalogModelId(modelId)) {
+    return undefined;
+  }
+
   const isKimiModel = isFireworksKimiModelId(modelId);
   const input = resolveFireworksDynamicInput(modelId);
 
@@ -68,28 +75,18 @@ export default defineSingleProviderPluginEntry({
   id: PROVIDER_ID,
   name: "Fireworks Provider",
   description: "Bundled Fireworks AI provider plugin",
+  manifest,
   provider: {
     label: "Fireworks",
     aliases: ["fireworks-ai"],
     docsPath: "/providers/fireworks",
-    auth: [
-      {
-        methodId: "api-key",
-        label: "Fireworks API key",
-        hint: "API key",
-        optionKey: "fireworksApiKey",
-        flagName: "--fireworks-api-key",
-        envVar: "FIREWORKS_API_KEY",
-        promptMessage: "Enter Fireworks API key",
-        defaultModel: FIREWORKS_DEFAULT_MODEL_REF,
-        applyConfig: (cfg) => applyFireworksConfig(cfg),
-      },
-    ],
+    manifestAuth: { applyConfig: applyFireworksConfig },
     catalog: {
-      buildProvider: buildFireworksProvider,
+      discoveryMode: "strict",
       allowExplicitBaseUrl: true,
+      liveModelDiscovery: true,
     },
-    ...OPENAI_COMPATIBLE_REPLAY_HOOKS,
+    ...buildProviderReplayFamilyHooks({ family: "openai-compatible" }),
     wrapStreamFn: wrapFireworksProviderStream,
     resolveThinkingProfile: ({ modelId }) => resolveFireworksThinkingProfile(modelId),
     resolveDynamicModel: (ctx) => resolveFireworksDynamicModel(ctx),

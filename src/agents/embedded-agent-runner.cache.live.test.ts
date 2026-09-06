@@ -1,3 +1,4 @@
+// Live cache-behavior checks for embedded-agent direct provider runs.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -5,20 +6,24 @@ import type { AssistantMessage, Message, Tool } from "openclaw/plugin-sdk/llm";
 import { Type } from "typebox";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
+import { disposeOpenClawAgentDatabaseByPath } from "../state/openclaw-agent-db.js";
+import { deleteTestEnvValue, setTestEnvValue } from "../test-utils/env.js";
+import { prepareSystemAgentRunAdmission } from "./admitted-run-context.js";
 import { runEmbeddedAgent } from "./embedded-agent-runner.js";
-import { compactEmbeddedAgentSessionDirect } from "./embedded-agent-runner/compact.runtime.js";
+import { compactEmbeddedAgentSessionOnDemand } from "./embedded-agent-runner/compact.runtime.js";
+import type { beginPromptCacheObservation } from "./embedded-agent-runner/prompt-cache-observability.js";
+import { extractEmbeddedAssistantText } from "./embedded-agent-utils.js";
 import {
   buildAssistantHistoryTurn as buildTypedAssistantHistoryTurn,
   buildStableCachePrefix,
   completeSimpleWithLiveTimeout,
   computeCacheHitRate,
-  extractAssistantText,
   LIVE_CACHE_TEST_ENABLED,
   logLiveCache,
   resolveLiveDirectModel,
   withLiveCacheHeartbeat,
 } from "./live-cache-test-support.js";
-import { buildZeroUsage } from "./stream-message-shared.js";
+import { buildUsageWithNoCost } from "./stream-message-shared.js";
 
 const describeCacheLive = LIVE_CACHE_TEST_ENABLED ? describe : describe.skip;
 
@@ -34,6 +39,7 @@ const OPENAI_TOOL_MIN_CACHE_READ = 4_096;
 const OPENAI_TOOL_MIN_HIT_RATE = 0.85;
 const OPENAI_IMAGE_MIN_CACHE_READ = 3_840;
 const OPENAI_IMAGE_MIN_HIT_RATE = 0.82;
+const LARGE_CACHE_PROMPT_SECTIONS = 1_024;
 const LIVE_TEST_PNG_URL = new URL(
   "../../apps/android/app/src/main/res/mipmap-xhdpi/ic_launcher.png",
   import.meta.url,
@@ -46,10 +52,12 @@ type CacheRun = {
   usage: AssistantMessage["usage"];
 };
 type CacheTraceEvent = {
+  runId?: string;
   sessionId?: string;
   stage?: string;
   note?: string;
   options?: {
+    snapshot?: ReturnType<typeof beginPromptCacheObservation>["snapshot"];
     previousCacheRead?: number;
     cacheRead?: number;
     changes?: Array<{ code?: string; detail?: string }>;
@@ -63,7 +71,7 @@ const NOOP_TOOL: Tool = {
   parameters: Type.Object({}, { additionalProperties: false }),
 };
 let liveTestPngBase64 = "";
-let liveRunnerRootDir: string | undefined;
+let liveRunnerPaths: { rootDir: string; agentDir: string; storePath: string } | undefined;
 let liveCacheTraceFile: string | undefined;
 let previousCacheTraceEnv: {
   enabled?: string;
@@ -91,6 +99,8 @@ function makeUserHistoryTurn(content: UserContent): Message {
 }
 
 function makeImageUserTurn(text: string): Message {
+  // Image cache tests use a small repo fixture so payload bytes are stable across
+  // runs and do not require external downloads.
   if (!liveTestPngBase64) {
     throw new Error("live test PNG not loaded");
   }
@@ -101,13 +111,18 @@ function makeImageUserTurn(text: string): Message {
 }
 
 function buildRunnerSessionPaths(sessionId: string) {
-  if (!liveRunnerRootDir) {
+  if (!liveRunnerPaths) {
     throw new Error("live runner temp root not initialized");
   }
   return {
-    agentDir: liveRunnerRootDir,
-    sessionFile: path.join(liveRunnerRootDir, `${sessionId}.jsonl`),
-    workspaceDir: path.join(liveRunnerRootDir, `${sessionId}-workspace`),
+    agentDir: liveRunnerPaths.agentDir,
+    sessionTarget: {
+      agentId: "main",
+      sessionId,
+      sessionKey: `agent:main:live-cache:${sessionId}`,
+      storePath: liveRunnerPaths.storePath,
+    },
+    workspaceDir: path.join(liveRunnerPaths.rootDir, `${sessionId}-workspace`),
   };
 }
 
@@ -117,6 +132,8 @@ function resolveProviderBaseUrl(model: LiveResolvedModel["model"]): string | und
 }
 
 async function readCacheTraceEvents(sessionId: string): Promise<CacheTraceEvent[]> {
+  // Trace events are JSONL so live assertions can inspect cache state transitions
+  // after the provider call completes.
   if (!liveCacheTraceFile) {
     throw new Error("live cache trace file not initialized");
   }
@@ -156,6 +173,8 @@ function resolveDefaultProviderBaseUrl(model: LiveResolvedModel["model"]): strin
 }
 
 function buildEmbeddedModelDefinition(model: LiveResolvedModel["model"]) {
+  // Live model discovery can return partial metadata; embedded runner tests need
+  // a complete config model definition.
   const contextWindowCandidate = (model as { contextWindow?: unknown }).contextWindow;
   const maxTokensCandidate = (model as { maxTokens?: unknown }).maxTokens;
   const reasoningCandidate = (model as { reasoning?: unknown }).reasoning;
@@ -204,7 +223,7 @@ function normalizeLiveUsage(
     | undefined,
 ): AssistantMessage["usage"] {
   if (!usage) {
-    return buildZeroUsage();
+    return buildUsageWithNoCost({});
   }
   const input = usage.input ?? 0;
   const output = usage.output ?? 0;
@@ -232,7 +251,10 @@ function normalizeLiveUsage(
 
 function buildEmbeddedRunnerConfig(
   params: LiveResolvedModel & {
+    agentDir: string;
     cacheRetention: "none" | "short" | "long";
+    compactionModel?: string;
+    modelAlias?: string;
     transport?: "sse" | "websocket";
   },
 ): OpenClawConfig {
@@ -253,15 +275,18 @@ function buildEmbeddedRunnerConfig(
       },
     },
     agents: {
+      entries: { main: { agentDir: params.agentDir } },
       defaults: {
         models: {
           [modelKey]: {
+            ...(params.modelAlias ? { alias: params.modelAlias } : {}),
             params: {
               cacheRetention: params.cacheRetention,
               ...(params.transport ? { transport: params.transport } : {}),
             },
           },
         },
+        ...(params.compactionModel ? { compaction: { model: params.compactionModel } } : {}),
       },
     },
   };
@@ -308,40 +333,49 @@ async function runEmbeddedCacheProbe(params: {
   promptSections?: number;
 }): Promise<CacheRun> {
   const sessionPaths = buildRunnerSessionPaths(params.sessionId);
+  const runId = `${params.sessionId}-${params.suffix}-${params.transport ?? "default"}`;
   await fs.mkdir(sessionPaths.workspaceDir, { recursive: true });
-  const result = await withLiveCacheHeartbeat(
-    runEmbeddedAgent({
-      sessionId: params.sessionId,
-      sessionKey: `live-cache:${params.providerTag}:${params.sessionId}`,
-      sessionFile: sessionPaths.sessionFile,
-      workspaceDir: sessionPaths.workspaceDir,
-      agentDir: sessionPaths.agentDir,
-      config: buildEmbeddedRunnerConfig({
-        apiKey: params.apiKey,
-        cacheRetention: params.cacheRetention,
-        model: params.model,
-        transport: params.transport,
+  const config = buildEmbeddedRunnerConfig({
+    agentDir: sessionPaths.agentDir,
+    apiKey: params.apiKey,
+    cacheRetention: params.cacheRetention,
+    model: params.model,
+    transport: params.transport,
+  });
+  // Full-runner probes own a real admission through settlement, just like production callers.
+  const preparedRunAdmission = prepareSystemAgentRunAdmission(config, runId, "main", "live-cache");
+  try {
+    const result = await withLiveCacheHeartbeat(
+      runEmbeddedAgent({
+        preparedRunAdmission,
+        sessionId: params.sessionId,
+        sessionTarget: sessionPaths.sessionTarget,
+        workspaceDir: sessionPaths.workspaceDir,
+        agentDir: sessionPaths.agentDir,
+        config,
+        prompt: buildEmbeddedCachePrompt(params.suffix, params.promptSections),
+        provider: params.model.provider,
+        model: params.model.id,
+        timeoutMs: params.providerTag === "openai" ? OPENAI_TIMEOUT_MS : ANTHROPIC_TIMEOUT_MS,
+        runId,
+        extraSystemPrompt: params.prefix,
+        disableTools: true,
+        cleanupBundleMcpOnRunEnd: true,
       }),
-      prompt: buildEmbeddedCachePrompt(params.suffix, params.promptSections),
-      provider: params.model.provider,
-      model: params.model.id,
-      timeoutMs: params.providerTag === "openai" ? OPENAI_TIMEOUT_MS : ANTHROPIC_TIMEOUT_MS,
-      runId: `${params.sessionId}-${params.suffix}-${params.transport ?? "default"}`,
-      extraSystemPrompt: params.prefix,
-      disableTools: true,
-      cleanupBundleMcpOnRunEnd: true,
-    }),
-    `${params.providerTag} embedded cache probe ${params.suffix}${params.transport ? ` (${params.transport})` : ""}`,
-  );
-  const text = extractRunPayloadText(result.payloads);
-  expect(text.toLowerCase()).toContain(params.suffix.toLowerCase());
-  const usage = normalizeLiveUsage(result.meta.agentMeta?.usage);
-  return {
-    suffix: params.suffix,
-    text,
-    usage,
-    hitRate: computeCacheHitRate(usage),
-  };
+      `${params.providerTag} embedded cache probe ${params.suffix}${params.transport ? ` (${params.transport})` : ""}`,
+    );
+    const text = extractRunPayloadText(result.payloads);
+    expect(text.toLowerCase()).toContain(params.suffix.toLowerCase());
+    const usage = normalizeLiveUsage(result.meta.agentMeta?.usage);
+    return {
+      suffix: params.suffix,
+      text,
+      usage,
+      hitRate: computeCacheHitRate(usage),
+    };
+  } finally {
+    preparedRunAdmission.close();
+  }
 }
 
 async function compactLiveCacheSession(params: {
@@ -354,16 +388,18 @@ async function compactLiveCacheSession(params: {
   const sessionPaths = buildRunnerSessionPaths(params.sessionId);
   await fs.mkdir(sessionPaths.workspaceDir, { recursive: true });
   return await withLiveCacheHeartbeat(
-    compactEmbeddedAgentSessionDirect({
+    compactEmbeddedAgentSessionOnDemand({
       sessionId: params.sessionId,
-      sessionKey: `live-cache:${params.providerTag}:${params.sessionId}`,
-      sessionFile: sessionPaths.sessionFile,
+      sessionTarget: sessionPaths.sessionTarget,
       workspaceDir: sessionPaths.workspaceDir,
       agentDir: sessionPaths.agentDir,
       config: buildEmbeddedRunnerConfig({
+        agentDir: sessionPaths.agentDir,
         apiKey: params.apiKey,
         cacheRetention: params.cacheRetention,
+        compactionModel: "live-compaction",
         model: params.model,
+        modelAlias: "live-compaction",
       }),
       provider: params.model.provider,
       model: params.model.id,
@@ -431,7 +467,7 @@ async function runToolOnlyTurn(params: {
   );
 
   let toolCall = extractFirstToolCall(response);
-  let text = extractAssistantText(response);
+  let text = extractEmbeddedAssistantText(response);
   for (let attempt = 0; attempt < 2 && (!toolCall || text.length > 0); attempt += 1) {
     prompt = `Return only a tool call for \`${params.tool.name}\` with {}. No text.`;
     response = await completeSimpleWithLiveTimeout(
@@ -459,7 +495,7 @@ async function runToolOnlyTurn(params: {
       params.providerTag === "openai" ? OPENAI_TIMEOUT_MS : ANTHROPIC_TIMEOUT_MS,
     );
     toolCall = extractFirstToolCall(response);
-    text = extractAssistantText(response);
+    text = extractEmbeddedAssistantText(response);
   }
 
   expect(text.length).toBe(0);
@@ -524,7 +560,7 @@ async function runOpenAiToolCacheProbe(params: {
     `openai cache probe ${params.suffix}`,
     OPENAI_TIMEOUT_MS,
   );
-  const text = extractAssistantText(response);
+  const text = extractEmbeddedAssistantText(response);
   expect(text.toLowerCase()).toContain(params.suffix.toLowerCase());
   return {
     suffix: params.suffix,
@@ -562,7 +598,7 @@ async function runOpenAiCacheProbe(params: {
     `openai cache probe ${params.suffix}`,
     OPENAI_TIMEOUT_MS,
   );
-  const text = extractAssistantText(response);
+  const text = extractEmbeddedAssistantText(response);
   expect(text.toLowerCase()).toContain(params.suffix.toLowerCase());
   return {
     suffix: params.suffix,
@@ -603,7 +639,7 @@ async function runOpenAiImageCacheProbe(params: {
     `openai image cache probe ${params.suffix}`,
     OPENAI_TIMEOUT_MS,
   );
-  const text = extractAssistantText(response);
+  const text = extractEmbeddedAssistantText(response);
   expect(text.toLowerCase()).toContain(params.suffix.toLowerCase());
   return {
     suffix: params.suffix,
@@ -642,7 +678,7 @@ async function runAnthropicCacheProbe(params: {
     `anthropic cache probe ${params.suffix} (${params.cacheRetention})`,
     ANTHROPIC_TIMEOUT_MS,
   );
-  const text = extractAssistantText(response);
+  const text = extractEmbeddedAssistantText(response);
   expect(text.toLowerCase()).toContain(params.suffix.toLowerCase());
   return {
     suffix: params.suffix,
@@ -701,7 +737,7 @@ async function runAnthropicToolCacheProbe(params: {
     `anthropic cache probe ${params.suffix} (${params.cacheRetention})`,
     ANTHROPIC_TIMEOUT_MS,
   );
-  const text = extractAssistantText(response);
+  const text = extractEmbeddedAssistantText(response);
   expect(text.toLowerCase()).toContain(params.suffix.toLowerCase());
   return {
     suffix: params.suffix,
@@ -742,7 +778,7 @@ async function runAnthropicImageCacheProbe(params: {
     `anthropic image cache probe ${params.suffix} (${params.cacheRetention})`,
     ANTHROPIC_TIMEOUT_MS,
   );
-  const text = extractAssistantText(response);
+  const text = extractEmbeddedAssistantText(response);
   expect(text.toLowerCase()).toContain(params.suffix.toLowerCase());
   return {
     suffix: params.suffix,
@@ -754,8 +790,18 @@ async function runAnthropicImageCacheProbe(params: {
 
 describeCacheLive("embedded agent runner prompt caching (live)", () => {
   beforeAll(async () => {
-    liveRunnerRootDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-live-cache-"));
-    liveCacheTraceFile = path.join(liveRunnerRootDir, "cache-trace.jsonl");
+    // Database disposal must use the registered path even when the temporary root is a symlink.
+    const rootDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-live-cache-")),
+    );
+    // Auth/catalog and transcript state share this database and must agree on its agent owner.
+    const agentDir = path.join(rootDir, "agents", "main", "agent");
+    liveRunnerPaths = {
+      rootDir,
+      agentDir,
+      storePath: path.join(agentDir, "openclaw-agent.sqlite"),
+    };
+    liveCacheTraceFile = path.join(rootDir, "cache-trace.jsonl");
     liveTestPngBase64 = (await fs.readFile(LIVE_TEST_PNG_URL)).toString("base64");
     previousCacheTraceEnv = {
       enabled: process.env.OPENCLAW_CACHE_TRACE,
@@ -764,11 +810,11 @@ describeCacheLive("embedded agent runner prompt caching (live)", () => {
       prompt: process.env.OPENCLAW_CACHE_TRACE_PROMPT,
       system: process.env.OPENCLAW_CACHE_TRACE_SYSTEM,
     };
-    process.env.OPENCLAW_CACHE_TRACE = "1";
-    process.env.OPENCLAW_CACHE_TRACE_FILE = liveCacheTraceFile;
-    process.env.OPENCLAW_CACHE_TRACE_MESSAGES = "0";
-    process.env.OPENCLAW_CACHE_TRACE_PROMPT = "0";
-    process.env.OPENCLAW_CACHE_TRACE_SYSTEM = "0";
+    setTestEnvValue("OPENCLAW_CACHE_TRACE", "1");
+    setTestEnvValue("OPENCLAW_CACHE_TRACE_FILE", liveCacheTraceFile);
+    setTestEnvValue("OPENCLAW_CACHE_TRACE_MESSAGES", "0");
+    setTestEnvValue("OPENCLAW_CACHE_TRACE_PROMPT", "0");
+    setTestEnvValue("OPENCLAW_CACHE_TRACE_SYSTEM", "0");
   }, 120_000);
 
   afterAll(async () => {
@@ -783,9 +829,9 @@ describeCacheLive("embedded agent runner prompt caching (live)", () => {
         value: string | undefined,
       ) => {
         if (value === undefined) {
-          delete process.env[key];
+          deleteTestEnvValue(key);
         } else {
-          process.env[key] = value;
+          setTestEnvValue(key, value);
         }
       };
       restore("OPENCLAW_CACHE_TRACE", previousCacheTraceEnv.enabled);
@@ -796,10 +842,11 @@ describeCacheLive("embedded agent runner prompt caching (live)", () => {
     }
     previousCacheTraceEnv = null;
     liveCacheTraceFile = undefined;
-    if (liveRunnerRootDir) {
-      await fs.rm(liveRunnerRootDir, { recursive: true, force: true });
+    if (liveRunnerPaths) {
+      disposeOpenClawAgentDatabaseByPath(liveRunnerPaths.storePath);
+      await fs.rm(liveRunnerPaths.rootDir, { recursive: true, force: true });
     }
-    liveRunnerRootDir = undefined;
+    liveRunnerPaths = undefined;
   });
 
   describe("openai", () => {
@@ -810,7 +857,7 @@ describeCacheLive("embedded agent runner prompt caching (live)", () => {
         provider: "openai",
         api: "openai-responses",
         envVar: "OPENCLAW_LIVE_OPENAI_CACHE_MODEL",
-        preferredModelIds: ["gpt-5.5", "gpt-5.4-mini", "gpt-5.4"],
+        preferredModelIds: ["gpt-5.6-luna", "gpt-5.5", "gpt-5.4-mini", "gpt-5.4"],
       });
       logLiveCache(`openai model=${fixture.model.provider}/${fixture.model.id}`);
     }, 120_000);
@@ -1013,6 +1060,40 @@ describeCacheLive("embedded agent runner prompt caching (live)", () => {
     );
 
     it(
+      "keeps OpenAI cache reuse across a large embedded prompt",
+      async () => {
+        const sessionId = `${OPENAI_SESSION_ID}-large`;
+        const warmup = await runEmbeddedCacheProbe({
+          ...fixture,
+          cacheRetention: "short",
+          prefix: OPENAI_PREFIX,
+          providerTag: "openai",
+          sessionId,
+          suffix: "large-warmup",
+          promptSections: LARGE_CACHE_PROMPT_SECTIONS,
+        });
+        const hit = await runEmbeddedCacheProbe({
+          ...fixture,
+          cacheRetention: "short",
+          prefix: OPENAI_PREFIX,
+          providerTag: "openai",
+          sessionId,
+          suffix: "large-hit",
+          promptSections: LARGE_CACHE_PROMPT_SECTIONS,
+        });
+        logLiveCache(
+          `openai large prompt sections=${LARGE_CACHE_PROMPT_SECTIONS} warmup=${warmup.usage.cacheWrite} hit=${hit.usage.cacheRead} input=${hit.usage.input} rate=${hit.hitRate.toFixed(3)}`,
+        );
+
+        expect(warmup.usage.cacheWrite ?? 0).toBeGreaterThan(0);
+        expect(hit.usage.cacheRead ?? 0).toBeGreaterThan(4_096);
+        expect(hit.hitRate).toBeGreaterThanOrEqual(0.4);
+        await expectCacheTraceStages(sessionId, ["cache:state", "cache:result"]);
+      },
+      12 * 60_000,
+    );
+
+    it(
       "keeps OpenAI cache reuse when structured system context only changes by whitespace and line endings",
       async () => {
         const sessionId = `${OPENAI_SESSION_ID}-structured-normalization`;
@@ -1066,7 +1147,7 @@ describeCacheLive("embedded agent runner prompt caching (live)", () => {
         provider: "anthropic",
         api: "anthropic-messages",
         envVar: "OPENCLAW_LIVE_ANTHROPIC_CACHE_MODEL",
-        preferredModelIds: ["claude-sonnet-4-6", "claude-sonnet-4-6", "claude-haiku-3-5"],
+        preferredModelIds: ["claude-sonnet-5", "claude-haiku-4-5"],
       });
       logLiveCache(`anthropic model=${fixture.model.provider}/${fixture.model.id}`);
     }, 120_000);
@@ -1254,6 +1335,14 @@ describeCacheLive("embedded agent runner prompt caching (live)", () => {
       "preserves cache-safe shaping across compaction followup turns",
       async () => {
         const sessionId = `${ANTHROPIC_SESSION_ID}-compaction`;
+        const { workspaceDir } = buildRunnerSessionPaths(sessionId);
+        await fs.mkdir(workspaceDir, { recursive: true });
+        // Extra system context sits after the cache boundary. Workspace context must
+        // make the marked prefix exceed Haiku 4.5's 4,096-token cache minimum.
+        await fs.writeFile(
+          path.join(workspaceDir, "AGENTS.md"),
+          buildStableCachePrefix("anthropic-compaction", 96),
+        );
         await runEmbeddedCacheProbe({
           ...fixture,
           cacheRetention: "short",
@@ -1298,7 +1387,31 @@ describeCacheLive("embedded agent runner prompt caching (live)", () => {
         );
 
         expect(followup.usage.cacheRead ?? 0).toBeGreaterThan(1_024);
-        expect(followup.hitRate).toBeGreaterThanOrEqual(0.3);
+        // Only previously written prefixes can hit; compacted history must be written again.
+        // Compare the marked stable prefix and policy, not the whole prompt's cache-hit fraction.
+        const cacheEvents = await readCacheTraceEvents(sessionId);
+        const cacheRunIds = ["compact-prime-a", "compact-prime-b", "compact-hit"].map(
+          (suffix) => `${sessionId}-${suffix}-default`,
+        );
+        const cacheSnapshots = cacheRunIds.map(
+          (runId) =>
+            cacheEvents.find((event) => event.stage === "cache:state" && event.runId === runId)
+              ?.options?.snapshot,
+        );
+        const primedCachePolicy = cacheSnapshots[0];
+        expect(primedCachePolicy).toMatchObject({
+          provider: fixture.model.provider,
+          modelId: fixture.model.id,
+          modelApi: "anthropic-messages",
+          cacheRetention: "short",
+          systemPromptDigest: expect.stringMatching(/\S/),
+          toolDigest: expect.stringMatching(/\S/),
+          toolCount: 0,
+          toolNames: [],
+        });
+        for (const [index, snapshot] of cacheSnapshots.entries()) {
+          expect(snapshot, `cache:state for ${cacheRunIds[index]}`).toEqual(primedCachePolicy);
+        }
         await expectCacheTraceStages(sessionId, ["cache:state", "cache:result"]);
       },
       10 * 60_000,
@@ -1349,5 +1462,40 @@ describeCacheLive("embedded agent runner prompt caching (live)", () => {
       },
       8 * 60_000,
     );
+
+    it(
+      "keeps Anthropic cache reuse across a large embedded prompt",
+      async () => {
+        const sessionId = `${ANTHROPIC_SESSION_ID}-large`;
+        const warmup = await runEmbeddedCacheProbe({
+          ...fixture,
+          cacheRetention: "short",
+          prefix: ANTHROPIC_PREFIX,
+          providerTag: "anthropic",
+          sessionId,
+          suffix: "large-warmup",
+          promptSections: LARGE_CACHE_PROMPT_SECTIONS,
+        });
+        const hit = await runEmbeddedCacheProbe({
+          ...fixture,
+          cacheRetention: "short",
+          prefix: ANTHROPIC_PREFIX,
+          providerTag: "anthropic",
+          sessionId,
+          suffix: "large-hit",
+          promptSections: LARGE_CACHE_PROMPT_SECTIONS,
+        });
+        logLiveCache(
+          `anthropic large prompt sections=${LARGE_CACHE_PROMPT_SECTIONS} warmup=${warmup.usage.cacheWrite} hit=${hit.usage.cacheRead} input=${hit.usage.input} rate=${hit.hitRate.toFixed(3)}`,
+        );
+
+        expect(warmup.usage.cacheWrite ?? 0).toBeGreaterThan(0);
+        expect(hit.usage.cacheRead ?? 0).toBeGreaterThan(4_096);
+        expect(hit.hitRate).toBeGreaterThanOrEqual(0.3);
+        await expectCacheTraceStages(sessionId, ["cache:state", "cache:result"]);
+      },
+      12 * 60_000,
+    );
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

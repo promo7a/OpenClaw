@@ -1,4 +1,9 @@
-import { sendTextMediaPayload } from "openclaw/plugin-sdk/reply-payload";
+/**
+ * Direct text/media outbound adapter helpers.
+ *
+ * Builds lightweight SDK-backed send adapters with chunking, sanitization, and media limits.
+ */
+import { asOptionalRecord as asRecord } from "@openclaw/normalization-core/record-coerce";
 import { chunkText } from "../../../auto-reply/chunk.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import type { OutboundSendDeps } from "../../../infra/outbound/deliver.js";
@@ -26,26 +31,15 @@ type DirectSendFn<TOpts extends Record<string, unknown>, TResult extends DirectS
   opts: TOpts,
 ) => Promise<TResult>;
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value != null && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
 function readNumberField(record: Record<string, unknown> | undefined, key: string) {
   const value = record?.[key];
   return typeof value === "number" ? value : undefined;
 }
 
-export {
-  resolvePayloadMediaUrls,
-  sendPayloadMediaSequence,
-  sendPayloadMediaSequenceAndFinalize,
-  sendPayloadMediaSequenceOrFallback,
-  sendTextMediaPayload,
-} from "openclaw/plugin-sdk/reply-payload";
-
-export function resolveScopedChannelMediaMaxBytes(params: {
+/**
+ * Resolves an account-scoped channel media byte limit.
+ */
+function resolveScopedChannelMediaMaxBytes(params: {
   cfg: OpenClawConfig;
   accountId?: string | null;
   resolveChannelLimitMb: (params: { cfg: OpenClawConfig; accountId: string }) => number | undefined;
@@ -57,6 +51,9 @@ export function resolveScopedChannelMediaMaxBytes(params: {
   });
 }
 
+/**
+ * Builds a media byte-limit resolver for channels with `mediaMaxMb` config.
+ */
 export function createScopedChannelMediaMaxBytesResolver(channel: string) {
   return (params: { cfg: OpenClawConfig; accountId?: string | null }) =>
     resolveScopedChannelMediaMaxBytes({
@@ -73,6 +70,9 @@ export function createScopedChannelMediaMaxBytesResolver(channel: string) {
     });
 }
 
+/**
+ * Creates a channel outbound adapter backed by direct text/media send functions.
+ */
 export function createDirectTextMediaOutbound<
   TOpts extends Record<string, unknown>,
   TResult extends DirectSendResult,
@@ -125,8 +125,10 @@ export function createDirectTextMediaOutbound<
     chunkerMode: "text",
     textChunkLimit: 4000,
     sanitizeText: ({ text }) => sanitizeForPlainText(text),
-    sendPayload: async (ctx) =>
-      await sendTextMediaPayload({ channel: params.channel, ctx, adapter: outbound }),
+    sendPayload: async (ctx) => {
+      const { sendTextMediaPayload } = await import("openclaw/plugin-sdk/reply-payload");
+      return await sendTextMediaPayload({ channel: params.channel, ctx, adapter: outbound });
+    },
     sendText: async ({ cfg, to, text, accountId, deps, replyToId }) => {
       return await sendDirect({
         cfg,
@@ -155,6 +157,8 @@ export function createDirectTextMediaOutbound<
         to,
         text,
         mediaUrl,
+        // Older callers pass local media access as split roots/readFile fields;
+        // normalize them into the newer mediaAccess object before option building.
         mediaAccess:
           mediaAccess ??
           (mediaLocalRoots || mediaReadFile

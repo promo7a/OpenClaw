@@ -1,47 +1,45 @@
-import type {
-  CodexAppServerRuntimeOptions,
-  CodexPluginConfig,
-  OpenClawExecPolicyForCodexAppServer,
+import {
+  canUseCodexModelBackedApprovalsReviewerForModel,
+  type CodexAppServerRuntimeOptions,
 } from "./config.js";
 
-export function resolveCodexAppServerForOpenClawToolPolicy(params: {
+export function resolveCodexAppServerForModelProvider(params: {
   appServer: CodexAppServerRuntimeOptions;
-  pluginConfig: CodexPluginConfig;
-  env: NodeJS.ProcessEnv;
-  shouldPromote: boolean;
-  canUseUntrustedApprovalPolicy: boolean;
-  execPolicy?: OpenClawExecPolicyForCodexAppServer;
+  provider?: string;
+  model?: string;
+  config?: Parameters<typeof canUseCodexModelBackedApprovalsReviewerForModel>[0]["config"];
+  env?: NodeJS.ProcessEnv;
+  agentDir?: string;
+  codexConfigToml?: string | null;
 }): CodexAppServerRuntimeOptions {
+  const explicitProvider = normalizeModelBackedReviewerProvider(params.provider);
   if (
-    !params.shouldPromote ||
-    !params.canUseUntrustedApprovalPolicy ||
-    params.appServer.approvalPolicy !== "never"
+    !isCodexModelBackedApprovalsReviewer(params.appServer.approvalsReviewer) ||
+    canUseCodexModelBackedApprovalsReviewerForModel({
+      modelProvider: explicitProvider,
+      model: params.model,
+      config: params.config,
+      // Reviewer trust follows the spawned process, not the gateway's ambient home or endpoint.
+      env: { ...(params.env ?? process.env), ...params.appServer.start.env },
+      agentDir: params.agentDir,
+      codexConfigToml: params.codexConfigToml,
+      homeScope: params.appServer.start.homeScope,
+      codexArgs: params.appServer.start.args,
+    })
   ) {
-    return params.appServer;
-  }
-  const explicitMode =
-    params.execPolicy?.mode === "full" ||
-    params.pluginConfig.appServer?.mode !== undefined ||
-    isCodexAppServerPolicyMode(params.env.OPENCLAW_CODEX_APP_SERVER_MODE);
-  const explicitApprovalPolicy =
-    params.pluginConfig.appServer?.approvalPolicy !== undefined ||
-    isCodexAppServerApprovalPolicy(params.env.OPENCLAW_CODEX_APP_SERVER_APPROVAL_POLICY) ||
-    params.appServer.approvalPolicySource === "requirements";
-  if (explicitMode || explicitApprovalPolicy) {
     return params.appServer;
   }
   return {
     ...params.appServer,
-    approvalPolicy: "untrusted",
+    approvalsReviewer: "user",
   };
 }
 
-function isCodexAppServerPolicyMode(value: unknown): boolean {
-  return value === "guardian" || value === "yolo";
+function isCodexModelBackedApprovalsReviewer(value: string): boolean {
+  return value === "auto_review" || value === "guardian_subagent";
 }
 
-function isCodexAppServerApprovalPolicy(value: unknown): boolean {
-  return (
-    value === "never" || value === "on-request" || value === "on-failure" || value === "untrusted"
-  );
+function normalizeModelBackedReviewerProvider(provider: string | undefined): string | undefined {
+  const normalized = provider?.trim().toLowerCase();
+  return normalized || undefined;
 }

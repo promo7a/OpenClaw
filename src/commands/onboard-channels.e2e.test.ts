@@ -1,25 +1,26 @@
+// Onboard channels e2e tests cover setup wizard adapters, plugin install hooks, and channel picker behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createExitThrowingRuntime, createWizardPrompter } from "../../test/helpers/auth-wizard.js";
 import type { ChannelPluginCatalogEntry } from "../channels/plugins/catalog.js";
+import { getChannelSetupPlugin } from "../channels/plugins/setup-registry.js";
+import type { ChannelSetupWizardAdapter } from "../channels/plugins/setup-wizard-types.js";
 import {
   ensureChannelSetupPluginInstalled,
   loadChannelSetupPluginRegistrySnapshotForChannel,
-  reloadChannelSetupPluginRegistry,
 } from "../commands/channel-setup/plugin-install.js";
-import { getChannelSetupWizardAdapter } from "../commands/channel-setup/registry.js";
-import type { ChannelSetupWizardAdapter } from "../commands/channel-setup/types.js";
+import { resolveChannelSetupWizardAdapterForPlugin } from "../commands/channel-setup/registry.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { createEmptyPluginRegistry } from "../plugins/registry.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
 import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
 import type { WizardPrompter } from "../wizard/prompts.js";
-import { createExitThrowingRuntime, createWizardPrompter } from "./test-wizard-helpers.js";
 
 const catalogMocks = vi.hoisted(() => ({
   listChannelPluginCatalogEntries: vi.fn(),
 }));
 
 const manifestRegistryMocks = vi.hoisted(() => ({
-  loadPluginManifestRegistry: vi.fn(() => ({ plugins: [], diagnostics: [] })),
+  loadPluginManifestRegistryCore: vi.fn(() => ({ plugins: [], diagnostics: [] })),
 }));
 
 function createPrompter(overrides: Partial<WizardPrompter>): WizardPrompter {
@@ -357,7 +358,7 @@ function mockMSTeamsRegistrySnapshot(params?: { includeSetupWizard?: boolean }) 
 }
 
 function patchTelegramAdapter(overrides: ChannelSetupWizardAdapterPatch) {
-  const adapter = getChannelSetupWizardAdapter("telegram");
+  const adapter = resolveChannelSetupWizardAdapterForPlugin(getChannelSetupPlugin("telegram"));
   if (!adapter) {
     throw new Error("missing setup adapter for telegram");
   }
@@ -493,15 +494,6 @@ vi.mock("../channels/plugins/catalog.js", async () => {
   const actual = await vi.importActual<typeof import("../channels/plugins/catalog.js")>(
     "../channels/plugins/catalog.js",
   );
-  const listChannelPluginCatalogEntries = (
-    ...args: Parameters<typeof actual.listChannelPluginCatalogEntries>
-  ) => {
-    const implementation = catalogMocks.listChannelPluginCatalogEntries.getMockImplementation();
-    if (implementation) {
-      return catalogMocks.listChannelPluginCatalogEntries(...args);
-    }
-    return actual.listChannelPluginCatalogEntries(...args);
-  };
   const listRawChannelPluginCatalogEntries = (
     ...args: Parameters<typeof actual.listRawChannelPluginCatalogEntries>
   ) => {
@@ -513,7 +505,6 @@ vi.mock("../channels/plugins/catalog.js", async () => {
   };
   return {
     ...actual,
-    listChannelPluginCatalogEntries,
     listRawChannelPluginCatalogEntries,
   };
 });
@@ -524,14 +515,9 @@ vi.mock("../plugins/manifest-registry.js", async () => {
   );
   return {
     ...actual,
-    loadPluginManifestRegistry: manifestRegistryMocks.loadPluginManifestRegistry,
+    loadPluginManifestRegistryCore: manifestRegistryMocks.loadPluginManifestRegistryCore,
   };
 });
-
-vi.mock("../plugin-sdk/matrix-deps.js", () => ({
-  ensureMatrixSdkInstalled: vi.fn(async () => {}),
-  isMatrixSdkAvailable: vi.fn(() => true),
-}));
 
 vi.mock("../channels/plugins/bundled.js", () => ({
   getBundledChannelSetupPlugin: (channel: string) =>
@@ -610,7 +596,6 @@ vi.mock("../commands/channel-setup/plugin-install.js", async () => {
     })),
     // Allow tests to simulate an empty plugin registry during setup.
     loadChannelSetupPluginRegistrySnapshotForChannel: vi.fn(() => createEmptyPluginRegistry()),
-    reloadChannelSetupPluginRegistry: vi.fn(() => {}),
   };
 });
 
@@ -620,8 +605,8 @@ describe("setupChannels", () => {
     setMinimalOnboardingRegistryForTests();
     catalogMocks.listChannelPluginCatalogEntries.mockReset();
     catalogMocks.listChannelPluginCatalogEntries.mockReturnValue([]);
-    manifestRegistryMocks.loadPluginManifestRegistry.mockReset();
-    manifestRegistryMocks.loadPluginManifestRegistry.mockReturnValue({
+    manifestRegistryMocks.loadPluginManifestRegistryCore.mockReset();
+    manifestRegistryMocks.loadPluginManifestRegistryCore.mockReturnValue({
       plugins: [],
       diagnostics: [],
     });
@@ -632,13 +617,12 @@ describe("setupChannels", () => {
       status: "installed",
     }));
     vi.mocked(loadChannelSetupPluginRegistrySnapshotForChannel).mockClear();
-    vi.mocked(reloadChannelSetupPluginRegistry).mockClear();
   });
   it("continues Telegram setup when the plugin registry is empty", async () => {
     // Simulate missing registry entries (the scenario reported in #25545).
     setActivePluginRegistry(createEmptyPluginRegistry());
     // Avoid accidental env-token configuration changing the prompt path.
-    process.env.TELEGRAM_BOT_TOKEN = "";
+    vi.stubEnv("TELEGRAM_BOT_TOKEN", "");
 
     const note = vi.fn(async (_message?: string, _title?: string) => {});
     const select = vi.fn(async ({ message }: { message: string }) => {
@@ -669,7 +653,6 @@ describe("setupChannels", () => {
     });
     expect(sawHardStop).toBe(false);
     expect(cfg.channels?.telegram?.botToken).toBe("123:token");
-    expect(reloadChannelSetupPluginRegistry).not.toHaveBeenCalled();
   });
 
   it("shows explicit dmScope config command in channel primer", async () => {
@@ -899,7 +882,7 @@ describe("setupChannels", () => {
             ...qaChannelBase,
             meta: {
               ...qaChannelBase.meta,
-              showInSetup: false,
+              exposure: { setup: false },
             },
           },
         },
@@ -1285,3 +1268,4 @@ describe("setupChannels", () => {
     }
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

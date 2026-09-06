@@ -1,20 +1,26 @@
+// Workspace bundled allowlist tests cover which bundled skills may sync into workspaces.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { captureEnv } from "../../test-utils/env.js";
+import { captureEnv, deleteTestEnvValue, setTestEnvValue } from "../../test-utils/env.js";
 import { writeSkill } from "../test-support/e2e-test-helpers.js";
-import { buildWorkspaceSkillsPrompt } from "./workspace.js";
+import { buildSkillSnapshot } from "./workspace-skill-prompt.js";
+
+const buildWorkspaceSkillsPrompt = (
+  workspaceDir: string,
+  opts?: Parameters<typeof buildSkillSnapshot>[1],
+): string => buildSkillSnapshot(workspaceDir, opts).prompt;
 
 describe("buildWorkspaceSkillsPrompt", () => {
   it("applies bundled allowlist without affecting workspace skills", async () => {
     const env = captureEnv(["HOME", "USERPROFILE", "OPENCLAW_HOME", "OPENCLAW_STATE_DIR"]);
     const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-"));
     try {
-      process.env.HOME = workspaceDir;
-      process.env.USERPROFILE = workspaceDir;
-      delete process.env.OPENCLAW_HOME;
-      delete process.env.OPENCLAW_STATE_DIR;
+      setTestEnvValue("HOME", workspaceDir);
+      setTestEnvValue("USERPROFILE", workspaceDir);
+      deleteTestEnvValue("OPENCLAW_HOME");
+      deleteTestEnvValue("OPENCLAW_STATE_DIR");
       const bundledDir = path.join(workspaceDir, ".bundled");
       const bundledSkillDir = path.join(bundledDir, "peekaboo");
       const workspaceSkillDir = path.join(workspaceDir, "skills", "demo-skill");

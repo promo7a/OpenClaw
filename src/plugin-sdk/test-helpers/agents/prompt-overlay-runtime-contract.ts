@@ -1,3 +1,6 @@
+/**
+ * Shared contract fixtures for agent prompt overlay runtime behavior.
+ */
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import type { ProviderSystemPromptContributionContext } from "../../../plugins/types.js";
 
@@ -21,16 +24,8 @@ export function openAiPluginPersonalityConfig(personality: "friendly" | "off"): 
   } satisfies OpenClawConfig;
 }
 
-export function sharedGpt5PersonalityConfig(personality: "friendly" | "off"): OpenClawConfig {
-  return {
-    agents: {
-      defaults: {
-        promptOverlays: {
-          gpt5: { personality },
-        },
-      },
-    },
-  } satisfies OpenClawConfig;
+export function sharedGpt5PersonalityConfig(_personality: "friendly" | "off"): OpenClawConfig {
+  return {};
 }
 
 export function codexPromptOverlayContext(params?: {

@@ -1,17 +1,28 @@
+/**
+ * Tests OAuth fallback to main-agent credentials.
+ * Ensures agent-local auth can recover from refresh failure by adopting a fresh
+ * main-store credential when identity checks allow it.
+ */
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetFileLockStateForTest } from "../../infra/file-lock.js";
-import { captureEnv } from "../../test-utils/env.js";
+import { closeOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-db.js";
+import { captureEnv, setTestEnvValue } from "../../test-utils/env.js";
 import { resolveApiKeyForProfile } from "./oauth.js";
-import { clearRuntimeAuthProfileStoreSnapshots, ensureAuthProfileStore } from "./store.js";
+import { loadPersistedAuthProfileStore } from "./persisted.js";
+import { clearRuntimeAuthProfileStoreSnapshots } from "./runtime-snapshots.js";
+import { ensureAuthProfileStore, saveAuthProfileStore } from "./store.js";
 import type { AuthProfileStore } from "./types.js";
-const { getOAuthApiKeyMock } = vi.hoisted(() => ({
-  getOAuthApiKeyMock: vi.fn(async () => {
-    throw new Error("invalid_grant");
-  }),
-}));
+const { getOAuthApiKeyMock } = vi.hoisted(() => {
+  vi.resetModules();
+  return {
+    getOAuthApiKeyMock: vi.fn(async () => {
+      throw new Error("invalid_grant");
+    }),
+  };
+});
 
 vi.mock("../../llm/oauth.js", () => ({
   getOAuthApiKey: getOAuthApiKeyMock,
@@ -19,7 +30,6 @@ vi.mock("../../llm/oauth.js", () => ({
 }));
 
 vi.mock("../cli-credentials.js", () => ({
-  readClaudeCliCredentialsCached: () => null,
   readCodexCliCredentialsCached: () => null,
   readMiniMaxCliCredentialsCached: () => null,
   resetCliCredentialCachesForTest: () => undefined,
@@ -29,10 +39,10 @@ vi.mock("../../plugins/provider-runtime.runtime.js", () => ({
   buildProviderAuthDoctorHintWithPlugin: async () => null,
   formatProviderAuthProfileApiKeyWithPlugin: async (params: { context?: { access?: string } }) =>
     params.context?.access,
-  refreshProviderOAuthCredentialWithPlugin: async () => null,
+  resolveProviderOAuthCredentialWithPlugin: async () => ({ status: "unhandled" }),
 }));
 
-vi.mock("../../plugins/provider-runtime.js", () => ({
+vi.mock("../../plugins/provider-external-auth.js", () => ({
   resolveExternalAuthProfilesWithPlugins: () => [],
 }));
 
@@ -40,7 +50,8 @@ afterAll(() => {
   vi.doUnmock("../../llm/oauth.js");
   vi.doUnmock("../cli-credentials.js");
   vi.doUnmock("../../plugins/provider-runtime.runtime.js");
-  vi.doUnmock("../../plugins/provider-runtime.js");
+  vi.doUnmock("../../plugins/provider-external-auth.js");
+  vi.resetModules();
 });
 
 function createUsableOAuthExpiry(): number {
@@ -66,8 +77,8 @@ describe("resolveApiKeyForProfile fallback to main agent", () => {
     await fs.mkdir(secondaryAgentDir, { recursive: true });
 
     // Set environment variables so the default agent dir resolves under tmpDir.
-    process.env.OPENCLAW_STATE_DIR = tmpDir;
-    process.env.OPENCLAW_AGENT_DIR = mainAgentDir;
+    setTestEnvValue("OPENCLAW_STATE_DIR", tmpDir);
+    setTestEnvValue("OPENCLAW_AGENT_DIR", mainAgentDir);
     clearRuntimeAuthProfileStoreSnapshots();
   });
 
@@ -107,7 +118,14 @@ describe("resolveApiKeyForProfile fallback to main agent", () => {
   }
 
   async function writeAuthProfilesStore(agentDir: string, store: AuthProfileStore) {
-    await fs.writeFile(path.join(agentDir, "auth-profiles.json"), JSON.stringify(store));
+    saveAuthProfileStore(store, agentDir, {
+      filterExternalAuthProfiles: false,
+      syncExternalCli: false,
+    });
+  }
+
+  function readAuthProfilesStore(agentDir: string): AuthProfileStore {
+    return loadPersistedAuthProfileStore(agentDir) ?? { version: 1, profiles: {} };
   }
 
   async function resolveFromSecondaryAgent(profileId: string) {
@@ -122,6 +140,7 @@ describe("resolveApiKeyForProfile fallback to main agent", () => {
   afterEach(async () => {
     resetFileLockStateForTest();
     clearRuntimeAuthProfileStoreSnapshots();
+    closeOpenClawAgentDatabasesForTest();
     vi.unstubAllGlobals();
 
     envSnapshot.restore();
@@ -163,7 +182,7 @@ describe("resolveApiKeyForProfile fallback to main agent", () => {
   }
 
   it("falls back to main agent credentials when secondary agent token is expired and refresh fails", async () => {
-    const profileId = "anthropic:claude-cli";
+    const profileId = "anthropic:default";
     const now = Date.now();
     const expiredTime = now - 60 * 60 * 1000; // 1 hour ago
     const freshTime = now + 60 * 60 * 1000; // 1 hour from now
@@ -202,9 +221,7 @@ describe("resolveApiKeyForProfile fallback to main agent", () => {
     expect(result.provider).toBe("anthropic");
 
     // The secondary store keeps its local credential; inherited OAuth is read-through.
-    const secondaryStore = JSON.parse(
-      await fs.readFile(path.join(secondaryAgentDir, "auth-profiles.json"), "utf8"),
-    ) as AuthProfileStore;
+    const secondaryStore = readAuthProfilesStore(secondaryAgentDir);
     expectOauthCredentialFields(secondaryStore, profileId, {
       access: "expired-access-token",
       expires: expiredTime,
@@ -212,7 +229,7 @@ describe("resolveApiKeyForProfile fallback to main agent", () => {
   });
 
   it("adopts newer OAuth token from main agent even when secondary token is still valid", async () => {
-    const profileId = "anthropic:claude-cli";
+    const profileId = "anthropic:default";
     const now = Date.now();
     const secondaryExpiry = now + 30 * 60 * 1000;
     const mainExpiry = now + 2 * 60 * 60 * 1000;
@@ -241,9 +258,7 @@ describe("resolveApiKeyForProfile fallback to main agent", () => {
 
     expect(result?.apiKey).toBe("main-newer-access-token");
 
-    const secondaryStore = JSON.parse(
-      await fs.readFile(path.join(secondaryAgentDir, "auth-profiles.json"), "utf8"),
-    ) as AuthProfileStore;
+    const secondaryStore = readAuthProfilesStore(secondaryAgentDir);
     expectOauthCredentialFields(secondaryStore, profileId, {
       access: "secondary-access-token",
       expires: secondaryExpiry,
@@ -251,7 +266,7 @@ describe("resolveApiKeyForProfile fallback to main agent", () => {
   });
 
   it("adopts main token when secondary expires is NaN/malformed", async () => {
-    const profileId = "anthropic:claude-cli";
+    const profileId = "anthropic:default";
     const now = Date.now();
     const mainExpiry = now + 2 * 60 * 60 * 1000;
 
@@ -325,7 +340,7 @@ describe("resolveApiKeyForProfile fallback to main agent", () => {
   });
 
   it("throws error when both secondary and main agent credentials are expired", async () => {
-    const profileId = "anthropic:claude-cli";
+    const profileId = "anthropic:default";
     const now = Date.now();
     const expiredTime = now - 60 * 60 * 1000; // 1 hour ago
 
@@ -346,7 +361,7 @@ describe("resolveApiKeyForProfile fallback to main agent", () => {
   });
 
   it("still falls back to main agent credentials when the refresh-token-reused retry throws", async () => {
-    const profileId = "anthropic:claude-cli";
+    const profileId = "anthropic:default";
     const now = Date.now();
     const expiredTime = now - 60 * 60 * 1000;
     const freshTime = now + 60 * 60 * 1000;

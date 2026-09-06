@@ -1,6 +1,8 @@
+// Matrix plugin module implements access state behavior.
 import {
   createChannelIngressResolver,
   defineStableChannelIngressIdentity,
+  type ChannelIngressContextBinding,
   type ResolvedChannelMessageIngress,
 } from "openclaw/plugin-sdk/channel-ingress-runtime";
 import { normalizeMatrixAllowList, resolveMatrixAllowListMatch } from "./allowlist.js";
@@ -12,6 +14,10 @@ type MatrixMonitorAccessState = {
   accountId: string;
   senderId: string;
   isRoom: boolean;
+  resolveMessageIngress: (
+    contextBinding: ChannelIngressContextBinding,
+    conversation?: { kind: "direct" | "channel"; id: string; threadId?: string },
+  ) => Promise<ResolvedChannelMessageIngress>;
 };
 
 function normalizeMatrixEntry(raw?: string | null): string | null {
@@ -61,6 +67,7 @@ export async function resolveMatrixMonitorAccessState(params: {
   isRoom: boolean;
   accountId?: string;
   eventKind?: "message" | "reaction";
+  conversationId?: string;
 }): Promise<MatrixMonitorAccessState> {
   const dmPolicy = params.dmPolicy ?? "pairing";
   const groupPolicy = params.groupPolicy ?? "open";
@@ -79,23 +86,29 @@ export async function resolveMatrixMonitorAccessState(params: {
     identity: matrixIngressIdentity,
     readStoreAllowFrom: async () => params.storeAllowFrom,
   });
-  const resolved = await ingress.message({
-    subject: { stableId: params.senderId },
-    conversation: {
-      kind: params.isRoom ? "group" : "direct",
-      id: params.isRoom ? "matrix-room" : "matrix-dm",
-    },
-    event: {
-      kind: eventKind,
-      authMode: "inbound" as const,
-      mayPair: params.isRoom ? false : eventKind === "message",
-    },
-    dmPolicy,
-    groupPolicy: params.isRoom ? groupIngress.groupPolicy : "disabled",
-    policy: { groupAllowFromFallbackToAllowFrom: false },
-    allowFrom: params.allowFrom,
-    ...(params.isRoom ? { groupAllowFrom: groupIngress.groupAllowFrom } : {}),
-  });
+  const resolveMessageIngress = async (
+    contextBinding?: ChannelIngressContextBinding,
+    conversation?: { kind: "direct" | "channel"; id: string; threadId?: string },
+  ) =>
+    await ingress.message({
+      subject: { stableId: params.senderId },
+      conversation: conversation ?? {
+        kind: params.isRoom ? "channel" : "direct",
+        id: params.conversationId ?? (params.isRoom ? "matrix-room" : "matrix-dm"),
+      },
+      ...(contextBinding ? { contextBinding } : {}),
+      event: {
+        kind: eventKind,
+        authMode: "inbound" as const,
+        mayPair: params.isRoom ? false : eventKind === "message",
+      },
+      dmPolicy,
+      groupPolicy: params.isRoom ? groupIngress.groupPolicy : "disabled",
+      policy: { groupAllowFromFallbackToAllowFrom: false },
+      allowFrom: params.allowFrom,
+      ...(params.isRoom ? { groupAllowFrom: groupIngress.groupAllowFrom } : {}),
+    });
+  const resolved = await resolveMessageIngress();
 
   return {
     effectiveGroupAllowFrom,
@@ -104,6 +117,7 @@ export async function resolveMatrixMonitorAccessState(params: {
     accountId,
     senderId: params.senderId,
     isRoom: params.isRoom,
+    resolveMessageIngress,
   };
 }
 

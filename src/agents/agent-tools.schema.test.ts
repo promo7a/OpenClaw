@@ -1,23 +1,155 @@
+import { normalizeToolParameterSchema } from "@openclaw/ai/internal/openai";
+import { expectDefined } from "@openclaw/normalization-core";
+/**
+ * Tests provider-compatible tool schema normalization.
+ * Protects caching, ref inlining, OpenAPI keyword cleanup, and no-parameter
+ * tool behavior used by model providers.
+ */
 import { runAgentLoop, type AgentEvent, type StreamFn } from "openclaw/plugin-sdk/agent-core";
 import { createAssistantMessageEventStream, validateToolArguments } from "openclaw/plugin-sdk/llm";
 import { Type, type TSchema } from "typebox";
 import { describe, expect, it, vi } from "vitest";
-import { wrapToolWithBeforeToolCallHook } from "./agent-tools.before-tool-call.js";
 import {
-  cleanToolSchemaForGemini,
-  normalizeToolParameterSchema,
-  normalizeToolParameters,
-} from "./agent-tools.schema.js";
+  isToolWrappedWithBeforeToolCallHook,
+  wrapToolWithBeforeToolCallHook,
+} from "./agent-tools.before-tool-call.js";
+import {
+  assertRequiredParams,
+  REQUIRED_PARAM_GROUPS,
+  getToolParamsRecord,
+  normalizeFileToolPathParam,
+  wrapToolParamValidation,
+} from "./agent-tools.params.js";
+import { normalizeToolParameters } from "./agent-tools.schema.js";
 import type { AnyAgentTool } from "./agent-tools.types.js";
+import { createProcessTool } from "./bash-tools.process.js";
+import { execSchema, processSchema } from "./bash-tools.schemas.js";
+import {
+  BEFORE_TOOL_CALL_HOOK_CONTEXT,
+  BEFORE_TOOL_CALL_SOURCE_TOOL,
+} from "./before-tool-call-metadata.js";
+import { createZeroUsageFixture } from "./test-helpers/usage-fixtures.js";
 
-const TEST_USAGE = {
-  input: 0,
-  output: 0,
-  cacheRead: 0,
-  cacheWrite: 0,
-  totalTokens: 0,
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+const beforeToolCallTesting = {
+  BEFORE_TOOL_CALL_HOOK_CONTEXT,
+  BEFORE_TOOL_CALL_SOURCE_TOOL,
 };
+
+const TEST_USAGE = createZeroUsageFixture();
+
+describe("direct exec tool schema", () => {
+  it("keeps model-facing descriptions compact without hiding runtime constraints", () => {
+    const fields = execSchema.properties as Record<string, { description?: string }>;
+    const describeField = (name: string) => fields[name]?.description ?? "";
+    const descriptions = Object.values(fields).map((field) => field.description ?? "");
+
+    expect(descriptions.join("").length).toBeLessThan(550);
+    expect(describeField("workdir")).toContain("empty string");
+    expect(describeField("workdir")).toContain("whitespace-only");
+    expect(describeField("yieldMs")).toContain("Milliseconds");
+    expect(describeField("timeoutSeconds")).toContain("seconds");
+    expect(describeField("pty")).toContain("PTY");
+    expect(describeField("elevated")).toContain("if allowed");
+    expect(describeField("ask")).toContain("tools.exec.mode");
+    expect(describeField("ask")).toContain("channel-origin");
+    expect(describeField("ask")).toContain("ask=off");
+  });
+});
+
+describe("direct process tool schema", () => {
+  it("keeps the action enum canonical at the agent-loop boundary", () => {
+    expect(processSchema.properties.action.type).toBe("string");
+    const actionEnum = processSchema.properties.action as Type.TString & { enum?: string[] };
+    expect(actionEnum.enum?.join("|")).toBe(
+      "list|poll|log|write|send-keys|submit|paste|kill|clear|remove",
+    );
+    expect(() =>
+      validateToolArguments(createProcessTool(), {
+        type: "toolCall",
+        id: "call-invalid-process-action",
+        name: "process",
+        arguments: { action: "delete" },
+      }),
+    ).toThrow('Validation failed for tool "process"');
+  });
+
+  it("rejects unknown process actions without starting execution", async () => {
+    const processTool = createProcessTool();
+    const execute = vi.spyOn(processTool, "execute");
+    const events: AgentEvent[] = [];
+    let streamCalls = 0;
+    const streamFn: StreamFn = () => {
+      const stream = createAssistantMessageEventStream();
+      queueMicrotask(() => {
+        streamCalls += 1;
+        const message =
+          streamCalls === 1
+            ? {
+                role: "assistant" as const,
+                content: [
+                  {
+                    type: "toolCall" as const,
+                    id: "call-unknown-process-action",
+                    name: "process",
+                    arguments: { action: "delete" },
+                  },
+                ],
+                api: "faux",
+                provider: "faux",
+                model: "faux-1",
+                usage: TEST_USAGE,
+                stopReason: "toolUse" as const,
+                timestamp: Date.now(),
+              }
+            : {
+                role: "assistant" as const,
+                content: [{ type: "text" as const, text: "done" }],
+                api: "faux",
+                provider: "faux",
+                model: "faux-1",
+                usage: TEST_USAGE,
+                stopReason: "stop" as const,
+                timestamp: Date.now(),
+              };
+        stream.push({ type: "done", reason: message.stopReason, message });
+      });
+      return stream;
+    };
+
+    const messages = await runAgentLoop(
+      [{ role: "user", content: "inspect processes", timestamp: Date.now() }],
+      { systemPrompt: "test", messages: [], tools: [processTool] },
+      {
+        model: {
+          id: "faux-1",
+          name: "Faux",
+          provider: "faux",
+          api: "faux",
+          baseUrl: "http://localhost:0",
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 128000,
+          maxTokens: 1024,
+        },
+        convertToLlm: (agentMessages) => agentMessages as never,
+      },
+      (event) => {
+        events.push(event);
+      },
+      undefined,
+      streamFn,
+    );
+
+    expect(execute).not.toHaveBeenCalled();
+    const toolResult = messages.find((message) => message.role === "toolResult");
+    expect(JSON.stringify(toolResult)).toContain('Validation failed for tool \\"process\\"');
+    expect(events.find((event) => event.type === "tool_execution_end")).toMatchObject({
+      executionStarted: false,
+      errorKind: "argument-validation",
+    });
+  });
+});
 
 describe("normalizeToolParameterSchema", () => {
   it("reuses normalized schemas for the same schema object and provider options", () => {
@@ -35,6 +167,121 @@ describe("normalizeToolParameterSchema", () => {
     expect(second).toBe(first);
     expect(providerSpecific).not.toBe(first);
     expect(providerSpecific).toEqual(first);
+  });
+
+  it("uses Gemini cleanup for OpenAI-compatible providers when the model id is Gemini", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        sessionKey: {
+          description: "Explicit session key, or null to clear it",
+          anyOf: [{ type: "string" }, { type: "null" }],
+        },
+      },
+    };
+
+    expect(
+      normalizeToolParameterSchema(schema, {
+        modelProvider: "jjcc",
+        modelId: "gemini-3.1-pro-preview",
+      }),
+    ).toEqual({
+      type: "object",
+      properties: {
+        sessionKey: {
+          type: "string",
+          description: "Explicit session key, or null to clear it",
+        },
+      },
+    });
+    expect(
+      normalizeToolParameterSchema(schema, {
+        modelProvider: "stepfun",
+        modelId: "step-router-v1",
+      }),
+    ).toEqual(schema);
+  });
+
+  it("keeps normalized tool-schema profile behavior aligned with the cache key", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        sessionKey: {
+          anyOf: [{ type: "string" }, { type: "null" }],
+        },
+      },
+    };
+
+    const defaultSchema = normalizeToolParameterSchema(schema, {
+      modelProvider: "openai-compatible",
+      modelId: "custom-model",
+    });
+    const mixedCaseGeminiProfileSchema = normalizeToolParameterSchema(schema, {
+      modelProvider: "openai-compatible",
+      modelId: "custom-model",
+      modelCompat: { toolSchemaProfile: "Gemini" },
+    });
+
+    expect(defaultSchema).toEqual(schema);
+    expect(mixedCaseGeminiProfileSchema).toEqual({
+      type: "object",
+      properties: {
+        sessionKey: { type: "string" },
+      },
+    });
+  });
+
+  it("applies llama.cpp cleaning only for the explicit tool-schema profile", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        declarationKey: { type: "string", pattern: "^\\S+$", maxLength: 200 },
+        safe: { type: "string", maxLength: 1999 },
+        boundary: { type: "string", maxLength: 2000 },
+        script: { type: "string", minLength: 1, maxLength: 65_536 },
+      },
+    };
+
+    expect(normalizeToolParameterSchema(schema, { modelProvider: "openai" })).toEqual(schema);
+    expect(
+      normalizeToolParameterSchema(schema, {
+        modelProvider: "openai-compatible",
+        modelCompat: { toolSchemaProfile: "llamacpp" },
+      }),
+    ).toEqual({
+      type: "object",
+      properties: {
+        declarationKey: { type: "string", maxLength: 200 },
+        safe: { type: "string", maxLength: 1999 },
+        boundary: { type: "string" },
+        script: { type: "string", minLength: 1 },
+      },
+    });
+  });
+
+  it("applies explicit unsupported keyword stripping after Gemini cleanup", () => {
+    expect(
+      normalizeToolParameterSchema(
+        {
+          type: "object",
+          properties: {
+            count: {
+              anyOf: [{ type: "integer", vendorOnly: true }, { type: "null" }],
+            },
+          },
+        },
+        {
+          modelProvider: "jjcc",
+          modelId: "gemini-3.1-pro-preview",
+          modelCompat: { unsupportedToolSchemaKeywords: ["vendorOnly"] },
+        },
+      ),
+    ).toEqual({
+      type: "object",
+      properties: {
+        count: { type: "integer" },
+      },
+    });
   });
 
   it("normalizes truly empty schemas to type:object with properties:{}", () => {
@@ -127,15 +374,18 @@ describe("normalizeToolParameterSchema", () => {
   });
 
   it("inlines local $ref before removing unsupported keywords", () => {
-    const cleaned = cleanToolSchemaForGemini({
-      type: "object",
-      properties: {
-        foo: { $ref: "#/$defs/Foo" },
+    const cleaned = normalizeToolParameterSchema(
+      {
+        type: "object",
+        properties: {
+          foo: { $ref: "#/$defs/Foo" },
+        },
+        $defs: {
+          Foo: { type: "string", enum: ["a", "b"] },
+        },
       },
-      $defs: {
-        Foo: { type: "string", enum: ["a", "b"] },
-      },
-    }) as {
+      { modelProvider: "gemini" },
+    ) as {
       $defs?: unknown;
       properties?: Record<string, unknown>;
     };
@@ -236,6 +486,62 @@ describe("normalizeToolParameterSchema", () => {
         legacyDatabaseId: { type: "string", description: "Database id" },
       },
     });
+  });
+
+  it("rejects noncanonical array indices in local $ref paths", () => {
+    const normalized = normalizeToolParameterSchema({
+      type: "object",
+      properties: {
+        canonicalZero: { $ref: "#/$defs/Choice/anyOf/0" },
+        canonicalOne: { $ref: "#/$defs/Choice/anyOf/1" },
+        hexadecimal: { $ref: "#/$defs/Choice/anyOf/0x1" },
+        exponent: { $ref: "#/$defs/Choice/anyOf/1e0" },
+        leadingZero: { $ref: "#/$defs/Choice/anyOf/01" },
+        plusZero: { $ref: "#/$defs/Choice/anyOf/+0" },
+        negativeZero: { $ref: "#/$defs/Choice/anyOf/-0" },
+        empty: { $ref: "#/$defs/Choice/anyOf/" },
+        whitespace: { $ref: "#/$defs/Choice/anyOf/ " },
+        escapedObjectKey: { $ref: "#/$defs/Escaped/properties/a~1b" },
+      },
+      $defs: {
+        Choice: {
+          anyOf: [{ type: "string" }, { type: "number" }],
+        },
+        Escaped: {
+          type: "object",
+          properties: {
+            "a/b": { type: "boolean" },
+          },
+        },
+      },
+    }) as {
+      properties?: Record<string, unknown>;
+    };
+
+    expect(normalized.properties?.canonicalZero).toEqual({ type: "string" });
+    expect(normalized.properties?.canonicalOne).toEqual({ type: "number" });
+    expect(normalized.properties?.hexadecimal).toEqual({
+      $ref: "#/$defs/Choice/anyOf/0x1",
+    });
+    expect(normalized.properties?.exponent).toEqual({
+      $ref: "#/$defs/Choice/anyOf/1e0",
+    });
+    expect(normalized.properties?.leadingZero).toEqual({
+      $ref: "#/$defs/Choice/anyOf/01",
+    });
+    expect(normalized.properties?.plusZero).toEqual({
+      $ref: "#/$defs/Choice/anyOf/+0",
+    });
+    expect(normalized.properties?.negativeZero).toEqual({
+      $ref: "#/$defs/Choice/anyOf/-0",
+    });
+    expect(normalized.properties?.empty).toEqual({
+      $ref: "#/$defs/Choice/anyOf/",
+    });
+    expect(normalized.properties?.whitespace).toEqual({
+      $ref: "#/$defs/Choice/anyOf/ ",
+    });
+    expect(normalized.properties?.escapedObjectKey).toEqual({ type: "boolean" });
   });
 
   it("inlines local refs in tuple array items", () => {
@@ -591,18 +897,21 @@ describe("normalizeToolParameterSchema", () => {
   });
 
   it("cleans tuple items schemas", () => {
-    const cleaned = cleanToolSchemaForGemini({
-      type: "object",
-      properties: {
-        tuples: {
-          type: "array",
-          items: [
-            { type: "string", format: "uuid" },
-            { type: "number", minimum: 1 },
-          ],
+    const cleaned = normalizeToolParameterSchema(
+      {
+        type: "object",
+        properties: {
+          tuples: {
+            type: "array",
+            items: [
+              { type: "string", format: "uuid" },
+              { type: "number", minimum: 1 },
+            ],
+          },
         },
       },
-    }) as {
+      { modelProvider: "gemini" },
+    ) as {
       properties?: Record<string, unknown>;
     };
 
@@ -616,13 +925,16 @@ describe("normalizeToolParameterSchema", () => {
   });
 
   it("drops null-only union variants without flattening other unions", () => {
-    const cleaned = cleanToolSchemaForGemini({
-      type: "object",
-      properties: {
-        parentId: { anyOf: [{ type: "string" }, { type: "null" }] },
-        count: { oneOf: [{ type: "string" }, { type: "number" }] },
+    const cleaned = normalizeToolParameterSchema(
+      {
+        type: "object",
+        properties: {
+          parentId: { anyOf: [{ type: "string" }, { type: "null" }] },
+          count: { oneOf: [{ type: "string" }, { type: "number" }] },
+        },
       },
-    }) as {
+      { modelProvider: "gemini" },
+    ) as {
       properties?: Record<string, unknown>;
     };
 
@@ -637,6 +949,58 @@ describe("normalizeToolParameterSchema", () => {
     expect(parentId?.anyOf).toBeUndefined();
     expect(count?.oneOf).toBeUndefined();
   });
+
+  // Regression for #128743: a root-level union whose branches carry their own
+  // properties must not replace the root properties. Root `required` entries
+  // (e.g. thread_id) must remain declared in `properties`, otherwise the schema
+  // becomes unsatisfiable when `additionalProperties` is false.
+  it.each(["anyOf", "oneOf"] as const)(
+    "preserves root properties and constraints when flattening root-level %s (#128743)",
+    (unionKey) => {
+      const schema = {
+        type: "object",
+        title: "MessagesReplyInput",
+        additionalProperties: false,
+        required: ["thread_id"],
+        properties: {
+          thread_id: { type: "string", minLength: 1, maxLength: 128 },
+          body: { anyOf: [{ type: "string" }, { type: "null" }], default: null },
+          body_file: { anyOf: [{ type: "string" }, { type: "null" }], default: null },
+          task_id: { anyOf: [{ type: "string" }, { type: "null" }], default: null },
+          turn_grant_id: { anyOf: [{ type: "string" }, { type: "null" }], default: null },
+        },
+        [unionKey]: [
+          { required: ["body"], properties: { body: { type: "string" } } },
+          { required: ["body_file"], properties: { body_file: { type: "string" } } },
+        ],
+      } as Record<string, unknown>;
+
+      const normalized = normalizeToolParameterSchema(schema) as Record<string, unknown>;
+      const properties = (normalized.properties as Record<string, unknown>) ?? {};
+      const required = (normalized.required as string[] | undefined) ?? [];
+
+      // The root composition keyword is flattened for portability, but the root
+      // declared properties must survive the merge.
+      expect(Object.keys(properties)).toEqual(
+        expect.arrayContaining(["thread_id", "body", "body_file", "task_id", "turn_grant_id"]),
+      );
+      expect(normalized.additionalProperties).toBe(false);
+      // Every required field must be a declared property, otherwise the schema is
+      // unsatisfiable by construction (required + additionalProperties:false).
+      for (const field of required) {
+        expect(Object.hasOwn(properties, field)).toBe(true);
+      }
+      expect(properties.thread_id).toEqual({ type: "string", minLength: 1, maxLength: 128 });
+      expect(properties.body).toEqual({
+        anyOf: [{ type: "string" }, { type: "null" }],
+        default: null,
+      });
+      expect(properties.body_file).toEqual({
+        anyOf: [{ type: "string" }, { type: "null" }],
+        default: null,
+      });
+    },
+  );
 });
 
 function makeTool(parameters: TSchema): AnyAgentTool {
@@ -650,6 +1014,19 @@ function makeTool(parameters: TSchema): AnyAgentTool {
 }
 
 describe("normalizeToolParameters", () => {
+  it("preserves before_tool_call wrapper metadata", () => {
+    const source = makeTool(Type.Object({ value: Type.String() }));
+    const hookContext = { agentId: "main", sessionId: "session-before-normalize" };
+    const wrapped = wrapToolWithBeforeToolCallHook(source, hookContext);
+
+    const normalized = normalizeToolParameters(wrapped);
+    const tagged = normalized as unknown as Record<symbol, unknown>;
+
+    expect(isToolWrappedWithBeforeToolCallHook(normalized)).toBe(true);
+    expect(tagged[beforeToolCallTesting.BEFORE_TOOL_CALL_SOURCE_TOOL]).toBe(source);
+    expect(tagged[beforeToolCallTesting.BEFORE_TOOL_CALL_HOOK_CONTEXT]).toBe(hookContext);
+  });
+
   it("normalizes truly empty schemas to type:object with properties:{} (MCP parameter-free tools)", () => {
     const tool: AnyAgentTool = {
       name: "get_flux_instance",
@@ -970,13 +1347,16 @@ describe("normalizeToolParameters", () => {
       required?: string[];
       properties?: Record<string, Record<string, unknown>>;
     };
+    const properties = expectDefined(parameters.properties, "normalized schema properties");
+    const count = expectDefined(properties.count, "normalized count property");
+    const query = expectDefined(properties.query, "normalized query property");
 
     expect(parameters.required).toEqual(["count"]);
-    expect(parameters.properties?.count.minimum).toBeUndefined();
-    expect(parameters.properties?.count.maximum).toBeUndefined();
-    expect(parameters.properties?.count.type).toBe("integer");
-    expect(parameters.properties?.query.minLength).toBeUndefined();
-    expect(parameters.properties?.query.type).toBe("string");
+    expect(count.minimum).toBeUndefined();
+    expect(count.maximum).toBeUndefined();
+    expect(count.type).toBe("integer");
+    expect(query.minLength).toBeUndefined();
+    expect(query.type).toBe("string");
   });
 
   it("omits empty array items when model compat requires it", () => {
@@ -1145,5 +1525,293 @@ describe("normalizeToolParameters", () => {
 
     const params = result.parameters as { required?: string[] };
     expect(params.required).toEqual(["name"]);
+  });
+});
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
+
+describe("assertRequiredParams", () => {
+  it("returns object params unchanged", () => {
+    const params = { path: "test.txt" };
+    expect(getToolParamsRecord(params)).toBe(params);
+  });
+
+  it("strips only the malformed terminal XML arg-value suffix", () => {
+    expect(normalizeFileToolPathParam("echo test</arg_value>>")).toBe("echo test");
+    expect(normalizeFileToolPathParam("echo test</arg_value>>>>>")).toBe("echo test");
+    expect(normalizeFileToolPathParam("echo test</arg_value>")).toBe("echo test</arg_value>");
+    expect(normalizeFileToolPathParam("echo </arg_value>> test")).toBe("echo </arg_value>> test");
+  });
+
+  it("normalizes known hallucinated Office/codex path extensions", () => {
+    expect(normalizeFileToolPathParam("reports/final.docodex")).toBe("reports/final.docx");
+    expect(normalizeFileToolPathParam("slides/plan.pptxodex")).toBe("slides/plan.pptx");
+    expect(normalizeFileToolPathParam("sheets/budget.XLSCODEX")).toBe("sheets/budget.xlsx");
+    expect(normalizeFileToolPathParam("notes/codex-report.txt")).toBe("notes/codex-report.txt");
+    expect(normalizeFileToolPathParam("archive.docodex/notes.txt")).toBe(
+      "archive.docodex/notes.txt",
+    );
+  });
+
+  it("normalizes file-tool paths after malformed XML suffix cleanup", () => {
+    expect(normalizeFileToolPathParam("reports/final.docodex</arg_value>>")).toBe(
+      "reports/final.docx",
+    );
+  });
+
+  it("strips malformed path suffixes without touching payload text", async () => {
+    const execute = vi.fn(async (_id, args) => args);
+    const tool = wrapToolParamValidation(
+      {
+        name: "write",
+        label: "write",
+        description: "write a file",
+        parameters: {},
+        execute,
+      },
+      REQUIRED_PARAM_GROUPS.write,
+    );
+
+    await tool.execute("id", {
+      path: "notes.txt</arg_value>>",
+      content: "keep literal payload</arg_value>>",
+    });
+
+    expect(execute).toHaveBeenCalledWith(
+      "id",
+      {
+        path: "notes.txt",
+        content: "keep literal payload</arg_value>>",
+      },
+      undefined,
+      undefined,
+    );
+  });
+
+  it("normalizes Office/codex path extensions without touching payload text", async () => {
+    const execute = vi.fn(async (_id, args) => args);
+    const tool = wrapToolParamValidation(
+      {
+        name: "write",
+        label: "write",
+        description: "write a file",
+        parameters: {},
+        execute,
+      },
+      REQUIRED_PARAM_GROUPS.write,
+    );
+
+    await tool.execute("id", {
+      path: "reports/final.docodex",
+      content: "keep literal payload.docodex",
+    });
+
+    expect(execute).toHaveBeenCalledWith(
+      "id",
+      {
+        path: "reports/final.docx",
+        content: "keep literal payload.docodex",
+      },
+      undefined,
+      undefined,
+    );
+  });
+
+  it("rejects paths that become empty after malformed XML arg-value suffix stripping", async () => {
+    const execute = vi.fn();
+    const tool = wrapToolParamValidation(
+      {
+        name: "write",
+        label: "write",
+        description: "write a file",
+        parameters: {},
+        execute,
+      },
+      REQUIRED_PARAM_GROUPS.write,
+    );
+
+    await expect(tool.execute("id", { path: "</arg_value>>", content: "x" })).rejects.toThrow(
+      /Missing required parameter: path/,
+    );
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("preserves edit replacement payloads while cleaning the path", async () => {
+    const execute = vi.fn(async (_id, args) => args);
+    const tool = wrapToolParamValidation(
+      {
+        name: "edit",
+        label: "edit",
+        description: "edit a file",
+        parameters: {},
+        execute,
+      },
+      REQUIRED_PARAM_GROUPS.edit,
+    );
+
+    const edits = [
+      {
+        oldText: "literal old</arg_value>>",
+        newText: "literal new</arg_value>>",
+      },
+    ];
+    await tool.execute("id", { path: "notes.docxodex</arg_value>>>", edits });
+
+    expect(execute).toHaveBeenCalledWith("id", { path: "notes.docx", edits }, undefined, undefined);
+  });
+
+  it("includes received keys in error when some params are present but content is missing", () => {
+    expect(() =>
+      assertRequiredParams(
+        { path: "test.txt" },
+        [
+          { keys: ["path"], label: "path" },
+          { keys: ["content"], label: "content" },
+        ],
+        "write",
+      ),
+    ).toThrow(/\(received: path\)/);
+  });
+
+  it("does not normalize legacy aliases during validation", async () => {
+    const tool = wrapToolParamValidation(
+      {
+        name: "write",
+        label: "write",
+        description: "write a file",
+        parameters: {},
+        execute: vi.fn(),
+      },
+      REQUIRED_PARAM_GROUPS.write,
+    );
+    await expect(
+      tool.execute("id", { file_path: "test.txt" }, new AbortController().signal, vi.fn()),
+    ).rejects.toThrow(/\(received: file_path\)/);
+  });
+
+  it("enforces canonical path/content at runtime", async () => {
+    const execute = vi.fn(async (_id, args) => args);
+    const tool = wrapToolParamValidation(
+      {
+        name: "write",
+        label: "write",
+        description: "test",
+        parameters: {},
+        execute,
+      },
+      REQUIRED_PARAM_GROUPS.write,
+    );
+
+    await tool.execute("tool-1", { path: "foo.txt", content: "x" });
+    expect(execute).toHaveBeenCalledWith(
+      "tool-1",
+      { path: "foo.txt", content: "x" },
+      undefined,
+      undefined,
+    );
+
+    await expect(tool.execute("tool-2", { content: "x" })).rejects.toThrow(
+      /Missing required parameter/,
+    );
+    await expect(tool.execute("tool-2", { content: "x" })).rejects.toThrow(
+      /Supply correct parameters before retrying\./,
+    );
+    await expect(tool.execute("tool-3", { path: "   ", content: "x" })).rejects.toThrow(
+      /Missing required parameter/,
+    );
+    await expect(tool.execute("tool-3", { path: "   ", content: "x" })).rejects.toThrow(
+      /Supply correct parameters before retrying\./,
+    );
+    await expect(tool.execute("tool-4", {})).rejects.toThrow(
+      /Missing required parameters: path, content/,
+    );
+    await expect(tool.execute("tool-4", {})).rejects.toThrow(
+      /Supply correct parameters before retrying\./,
+    );
+  });
+
+  it("excludes null and undefined values from received hint", () => {
+    expect(() =>
+      assertRequiredParams(
+        { path: "test.txt", content: null },
+        [
+          { keys: ["path"], label: "path" },
+          { keys: ["content"], label: "content" },
+        ],
+        "write",
+      ),
+    ).toThrow(/\(received: path\)[^,]/);
+  });
+
+  it("shows empty-string values for present params that still fail validation", () => {
+    expect(() =>
+      assertRequiredParams(
+        { path: "/tmp/a.txt", content: "   " },
+        [
+          { keys: ["path"], label: "path" },
+          { keys: ["content"], label: "content" },
+        ],
+        "write",
+      ),
+    ).toThrow(/\(received: path, content=<empty-string>\)/);
+  });
+
+  it("shows wrong-type values for present params that still fail validation", async () => {
+    const tool = wrapToolParamValidation(
+      {
+        name: "write",
+        label: "write",
+        description: "write a file",
+        parameters: {},
+        execute: vi.fn(),
+      },
+      REQUIRED_PARAM_GROUPS.write,
+    );
+    await expect(
+      tool.execute(
+        "id",
+        { path: "test.txt", content: { unexpected: true } },
+        new AbortController().signal,
+        vi.fn(),
+      ),
+    ).rejects.toThrow(/\(received: (?:path, content=<object>|content=<object>, path)\)/);
+  });
+
+  it("includes multiple received keys when several params are present", () => {
+    expect(() =>
+      assertRequiredParams(
+        { path: "/tmp/a.txt", extra: "yes" },
+        [
+          { keys: ["path"], label: "path" },
+          { keys: ["content"], label: "content" },
+        ],
+        "write",
+      ),
+    ).toThrow(/\(received: path, extra\)/);
+  });
+
+  it("omits received hint when the record is empty", () => {
+    const err = (() => {
+      try {
+        assertRequiredParams({}, [{ keys: ["content"], label: "content" }], "write");
+      } catch (e) {
+        return e instanceof Error ? e.message : "";
+      }
+      return "";
+    })();
+    expect(err).not.toMatch(/received:/);
+    expect(err).toMatch(/Missing required parameter: content/);
+  });
+
+  it("returns undefined when all required params are present", () => {
+    expect(
+      assertRequiredParams(
+        { path: "a.txt", content: "hello" },
+        [
+          { keys: ["path"], label: "path" },
+          { keys: ["content"], label: "content" },
+        ],
+        "write",
+      ),
+    ).toBeUndefined();
   });
 });

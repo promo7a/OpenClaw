@@ -1,3 +1,4 @@
+// ACP Core module implements errors behavior.
 import { redactSensitiveText, stringifyNonErrorCause } from "../error-format.js";
 
 export const ACP_ERROR_CODES = [
@@ -16,12 +17,23 @@ const ACP_ERROR_CODE_SET = new Set<AcpRuntimeErrorCode>(ACP_ERROR_CODES);
 /** Error type used at ACP runtime boundaries so callers can preserve structured failure codes. */
 export class AcpRuntimeError extends Error {
   readonly code: AcpRuntimeErrorCode;
+  /**
+   * Backend-specific structured failure code (e.g. acpx "SESSION_RESUME_REQUIRED"),
+   * preserved so recovery decisions key on the failure kind rather than parsing
+   * the human-readable message.
+   */
+  readonly detailCode?: string;
   override readonly cause?: unknown;
 
-  constructor(code: AcpRuntimeErrorCode, message: string, options?: { cause?: unknown }) {
+  constructor(
+    code: AcpRuntimeErrorCode,
+    message: string,
+    options?: { cause?: unknown; detailCode?: string },
+  ) {
     super(message);
     this.name = "AcpRuntimeError";
     this.code = code;
+    this.detailCode = options?.detailCode;
     this.cause = options?.cause;
   }
 }
@@ -116,12 +128,12 @@ export function formatAcpErrorChain(error: unknown): string {
     return redactSensitiveText(String(error));
   }
   const segments: string[] = [renderSingleError(error)];
-  let current: unknown = (error as unknown as { cause?: unknown }).cause;
+  let current: unknown = error.cause;
   let depth = 0;
   while (current !== undefined && current !== null && depth < 8) {
     if (current instanceof Error) {
       segments.push(renderSingleError(current));
-      current = (current as unknown as { cause?: unknown }).cause;
+      current = current.cause;
     } else {
       segments.push(stringifyNonErrorCause(current));
       current = undefined;
@@ -132,7 +144,7 @@ export function formatAcpErrorChain(error: unknown): string {
 }
 
 function renderSingleError(error: Error): string {
-  const codeValue = (error as unknown as { code?: unknown }).code;
+  const codeValue = "code" in error ? error.code : undefined;
   const codeSuffix =
     typeof codeValue === "string" || typeof codeValue === "number" ? ` [${codeValue}]` : "";
   return `${error.name}${codeSuffix}: ${error.message}`;

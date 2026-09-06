@@ -1,9 +1,16 @@
-import { listRunningSessions } from "./bash-process-registry.js";
+/**
+ * Compact references for active background bash sessions.
+ * These references are surfaced in agent context so follow-up turns can
+ * reconnect to prior long-running work.
+ */
+import { truncateUtf16Safe, truncateWithMarker } from "@openclaw/normalization-core/utf16-slice";
+import { compareProcessSessionStartOrder, listRunningSessions } from "./bash-process-registry.js";
 import { deriveSessionName } from "./bash-tools.shared.js";
 
 const DEFAULT_ACTIVE_PROCESS_LIMIT = 8;
 const MAX_COMMAND_LABEL_CHARS = 140;
 
+/** Agent-facing summary of a reconnectable background process session. */
 export type ActiveProcessSessionReference = {
   sessionId: string;
   status: "running";
@@ -22,11 +29,12 @@ function truncate(value: string, maxChars: number): string {
     return value;
   }
   if (maxChars <= 1) {
-    return value.slice(0, maxChars);
+    return truncateUtf16Safe(value, maxChars);
   }
-  return `${value.slice(0, Math.max(0, maxChars - 3))}...`;
+  return truncateWithMarker(value, maxChars, { marker: "...", reserve: 3, trimEnd: false });
 }
 
+/** List active background process sessions for one scope key, newest first. */
 export function listActiveProcessSessionReferences(params: {
   scopeKey?: string;
   now?: number;
@@ -42,14 +50,13 @@ export function listActiveProcessSessionReferences(params: {
       ? Math.floor(params.limit)
       : DEFAULT_ACTIVE_PROCESS_LIMIT;
   return listRunningSessions()
-    .filter((session) => session.backgrounded)
     .filter((session) => session.scopeKey === scopeKey)
-    .toSorted((left, right) => right.startedAt - left.startedAt)
+    .toSorted(compareProcessSessionStartOrder)
     .slice(0, limit)
     .map((session) => ({
       sessionId: session.id,
       status: "running" as const,
-      pid: session.pid ?? session.child?.pid,
+      pid: session.pid,
       startedAt: session.startedAt,
       runtimeMs: Math.max(0, now - session.startedAt),
       cwd: session.cwd,

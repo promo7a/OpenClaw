@@ -1,9 +1,10 @@
+// Webhooks helper module supports config behavior.
 import { z } from "zod";
 import { normalizeWebhookPath } from "../runtime-api.js";
 
 const secretRefSchema = z
   .object({
-    source: z.enum(["env", "file", "exec"]),
+    source: z.enum(["env", "file", "exec", "store"]),
     provider: z.string().trim().min(1),
     id: z.string().trim().min(1),
   })

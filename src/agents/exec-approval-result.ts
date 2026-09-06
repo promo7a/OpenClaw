@@ -1,3 +1,6 @@
+/**
+ * Parses exec approval tool output and formats denial messages for users.
+ */
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 
 type ExecApprovalResult =
@@ -16,6 +19,18 @@ type ExecApprovalResult =
   | {
       kind: "completed";
       raw: string;
+      body: string;
+    }
+  | {
+      kind: "outcome-unknown";
+      raw: string;
+      metadata: string;
+      body: string;
+    }
+  | {
+      kind: "not-dispatched";
+      raw: string;
+      metadata: string;
       body: string;
     }
   | {
@@ -115,6 +130,34 @@ export function parseExecApprovalResultText(resultText: string): ExecApprovalRes
       raw,
       metadata: finishedResult.metadata,
       body: finishedResult.body,
+    };
+  }
+
+  const outcomeUnknownResult = parseExecApprovalResultWithMetadata(
+    raw,
+    "Exec outcome unknown (",
+    "\n",
+  );
+  if (outcomeUnknownResult) {
+    return {
+      kind: "outcome-unknown",
+      raw,
+      metadata: outcomeUnknownResult.metadata,
+      body: outcomeUnknownResult.body,
+    };
+  }
+
+  const notDispatchedResult = parseExecApprovalResultWithMetadata(
+    raw,
+    "Exec not dispatched (",
+    "\n",
+  );
+  if (notDispatchedResult) {
+    return {
+      kind: "not-dispatched",
+      raw,
+      metadata: notDispatchedResult.metadata,
+      body: notDispatchedResult.body,
     };
   }
 

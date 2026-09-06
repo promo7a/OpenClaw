@@ -1,39 +1,23 @@
+// Channel setup plugin install tests cover install decisions, registry reloads, scoped snapshots, and trust boundaries.
+import fs from "node:fs";
 import path from "node:path";
-import { bundledPluginRoot, bundledPluginRootAt } from "openclaw/plugin-sdk/test-fixtures";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { createRequireRecord, bundledPluginRoot } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
-vi.mock("node:fs", async () => {
-  const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
-  const existsSync = vi.fn();
-  const realpathSync = vi.fn(actual.realpathSync);
-  const statSync = vi.fn(actual.statSync);
-  return {
-    ...actual,
-    existsSync,
-    realpathSync,
-    statSync,
-    default: {
-      ...actual,
-      existsSync,
-      realpathSync,
-      statSync,
-    },
-  };
-});
-
-const execFileSync = vi.fn();
-vi.mock("node:child_process", async () => {
-  const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
-  return {
-    ...actual,
-    execFileSync: (...args: unknown[]) => execFileSync(...args),
-  };
-});
+import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { createColdPluginFixture } from "../../plugins/test-helpers/cold-plugin-fixtures.js";
+import { invokePluginArtifactInstallMock } from "../../plugins/test-helpers/install-fixtures.js";
 
 const installPluginFromNpmSpec = vi.fn();
+const resolveNpmSpecMetadata = vi.hoisted(() => vi.fn());
+vi.mock("../../infra/install-source-utils.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../infra/install-source-utils.js")>()),
+  resolveNpmSpecMetadata,
+}));
 const applyPluginAutoEnable = vi.fn();
 vi.mock("../../plugins/install.js", () => ({
-  installPluginFromNpmSpec: (...args: unknown[]) => installPluginFromNpmSpec(...args),
+  installPluginFromNpmSpec: (params: Parameters<typeof invokePluginArtifactInstallMock>[1]) =>
+    invokePluginArtifactInstallMock(installPluginFromNpmSpec, params),
 }));
 
 vi.mock("../../config/plugin-auto-enable.js", () => ({
@@ -46,17 +30,25 @@ const listChannelPluginCatalogEntries = vi.fn((..._args: unknown[]) => []);
 vi.mock("../../channels/plugins/catalog.js", () => {
   return {
     getChannelPluginCatalogEntry: (...args: unknown[]) => getChannelPluginCatalogEntry(...args),
-    listChannelPluginCatalogEntries: (...args: unknown[]) =>
-      listChannelPluginCatalogEntries(...args),
     listRawChannelPluginCatalogEntries: (...args: unknown[]) =>
       listChannelPluginCatalogEntries(...args),
   };
 });
 
-const loadPluginManifestRegistry = vi.fn();
-vi.mock("../../plugins/manifest-registry.js", () => ({
-  loadPluginManifestRegistry: (...args: unknown[]) => loadPluginManifestRegistry(...args),
-}));
+const loadPluginManifestRegistryCore = vi.fn();
+vi.mock("../../plugins/manifest-registry.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../plugins/manifest-registry.js")>();
+  return {
+    ...actual,
+    loadPluginManifestRegistryCore: (
+      params: Parameters<typeof actual.loadPluginManifestRegistryCore>[0],
+    ) =>
+      // Artifact consent reads real fixtures; setup inventory remains independently mocked.
+      params?.discovery
+        ? actual.loadPluginManifestRegistryCore(params)
+        : loadPluginManifestRegistryCore(params),
+  };
+});
 
 vi.mock("../../plugins/bundled-sources.js", () => ({
   findBundledPluginSourceInMap: ({
@@ -83,35 +75,34 @@ vi.mock("../../plugins/bundled-sources.js", () => ({
   resolveBundledPluginSources: (...args: unknown[]) => resolveBundledPluginSources(...args),
 }));
 
-vi.mock("../../plugins/loader.js", () => ({
-  loadOpenClawPlugins: vi.fn(),
-}));
+vi.mock("../../plugins/loader.js", () => {
+  const load = vi.fn();
+  return { loadOpenClawPlugins: load, loadPluginRegistryHandle: load };
+});
 
-const discoverOpenClawPlugins = vi.fn((_args?: unknown) => ({ candidates: [], diagnostics: [] }));
-vi.mock("../../plugins/discovery.js", () => ({
+const discoverOpenClawPlugins = vi.fn((_args?: unknown) => ({
+  candidates: [] as PluginCandidate[],
+  diagnostics: [],
+}));
+vi.mock("../../plugins/discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../plugins/discovery.js")>()),
   discoverOpenClawPlugins: (args: unknown) => discoverOpenClawPlugins(args),
 }));
 
-import fs from "node:fs";
 import type { ChannelPluginCatalogEntry } from "../../channels/plugins/catalog.js";
 import type { OpenClawConfig } from "../../config/config.js";
+import type { PluginCandidate } from "../../plugins/discovery.js";
+import { PLUGIN_INSTALL_ERROR_CODE } from "../../plugins/install-types.js";
 import { loadOpenClawPlugins } from "../../plugins/loader.js";
 import type { PluginManifestRecord } from "../../plugins/manifest-registry.js";
 import { clearPluginMetadataLifecycleCaches } from "../../plugins/plugin-metadata-lifecycle.js";
 import { createEmptyPluginRegistry } from "../../plugins/registry.js";
-import {
-  pinActivePluginChannelRegistry,
-  releasePinnedPluginChannelRegistry,
-  setActivePluginRegistry,
-} from "../../plugins/runtime.js";
-import { createPluginRecord } from "../../plugins/status.test-helpers.js";
+import { setActivePluginRegistry } from "../../plugins/runtime.js";
 import type { WizardPrompter } from "../../wizard/prompts.js";
 import { makePrompter, makeRuntime } from "../setup/__tests__/test-utils.js";
 import {
   ensureChannelSetupPluginInstalled,
   loadChannelSetupPluginRegistrySnapshotForChannel,
-  reloadChannelSetupPluginRegistry,
-  reloadChannelSetupPluginRegistryForChannel,
 } from "./plugin-install.js";
 
 const bundledChatNpmSpec = "@openclaw/bundled-chat@1.2.3";
@@ -119,6 +110,7 @@ const bundledChatIntegrity = "sha512-bundled-chat";
 const bundledChatForkNpmSpec = "@vendor/bundled-chat-fork@1.2.3";
 const bundledChatForkIntegrity = "sha512-vendor-bundled-chat-fork";
 const ORIGINAL_OPENCLAW_STATE_DIR = process.env.OPENCLAW_STATE_DIR;
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 const baseEntry: ChannelPluginCatalogEntry = {
   id: "bundled-chat",
@@ -139,31 +131,34 @@ const baseEntry: ChannelPluginCatalogEntry = {
 };
 
 function mockBundledChatSource() {
+  const { localPath } = createLocalPluginFixture();
   resolveBundledPluginSources.mockReturnValue(
     new Map([
       [
         "bundled-chat",
         {
           pluginId: "bundled-chat",
-          localPath: bundledPluginRootAt("/opt/openclaw", "bundled-chat"),
+          localPath,
           npmSpec: bundledChatNpmSpec,
         },
       ],
     ]),
   );
+  return localPath;
 }
 
-function makeSkipInstallPrompter() {
+function makeSkipInstallPrompter(acceptCapabilities = false) {
   const select = vi.fn((async <T extends string>() => "skip" as T) as WizardPrompter["select"]);
-  const prompter = makePrompter({ select: select as unknown as WizardPrompter["select"] });
-  return { prompter, select };
+  const confirm = vi.fn(async () => acceptCapabilities);
+  const prompter = makePrompter({ select: select as WizardPrompter["select"], confirm });
+  return { prompter, select, confirm };
 }
 
 function mockActivationOnlyPlugin(plugin: {
   id: string;
   origin?: "bundled" | "global" | "workspace";
 }) {
-  loadPluginManifestRegistry.mockReturnValue({
+  loadPluginManifestRegistryCore.mockReturnValue({
     plugins: [
       createManifestRecord({
         id: plugin.id,
@@ -215,11 +210,9 @@ function expectSetupSnapshotDoesNotScopeToPlugin(params: {
 }
 
 beforeEach(() => {
+  resolveNpmSpecMetadata.mockReset().mockRejectedValue(new Error("Unseeded npm metadata query"));
   clearPluginMetadataLifecycleCaches();
   vi.clearAllMocks();
-  execFileSync.mockImplementation(() => {
-    throw new Error("not a git worktree");
-  });
   applyPluginAutoEnable.mockImplementation((params: { config: unknown }) => ({
     config: params.config,
     changes: [],
@@ -229,7 +222,7 @@ beforeEach(() => {
   discoverOpenClawPlugins.mockReturnValue({ candidates: [], diagnostics: [] });
   getChannelPluginCatalogEntry.mockReturnValue(undefined);
   listChannelPluginCatalogEntries.mockReturnValue([]);
-  loadPluginManifestRegistry.mockReturnValue({ plugins: [], diagnostics: [] });
+  loadPluginManifestRegistryCore.mockReturnValue({ plugins: [], diagnostics: [] });
   setActivePluginRegistry(createEmptyPluginRegistry());
 });
 
@@ -242,50 +235,16 @@ afterEach(() => {
   }
 });
 
-function mockRepoLocalPathExists() {
-  execFileSync.mockImplementation((command: string, args: string[]) => {
-    expect(command).toBe("git");
-    expect(args[1]).toBe(process.cwd());
-    expect(args[2]).toBe("rev-parse");
-    const request = args.slice(3).join(" ");
-    if (request === "--is-inside-work-tree") {
-      return "true\n";
-    }
-    if (request === "--path-format=absolute --show-toplevel") {
-      return `${process.cwd()}\n`;
-    }
-    if (request === "--path-format=absolute --git-common-dir") {
-      return `${process.cwd()}\n`;
-    }
-    throw new Error(`unexpected git args: ${request}`);
+function createLocalPluginFixture(pluginId = "bundled-chat") {
+  const workspaceDir = tempDirs.make("openclaw-channel-plugin-");
+  const localPath = path.join(workspaceDir, bundledPluginRoot("bundled-chat"));
+  fs.mkdirSync(path.join(workspaceDir, ".git"));
+  fs.mkdirSync(localPath, { recursive: true });
+  const fixture = createColdPluginFixture({
+    rootDir: localPath,
+    pluginId,
   });
-  vi.mocked(fs.realpathSync).mockImplementation(((value: fs.PathLike) => {
-    const raw = String(value);
-    if (raw.endsWith(`${path.sep}extensions${path.sep}bundled-chat`)) {
-      return path.resolve(process.cwd(), bundledPluginRoot("bundled-chat"));
-    }
-    return raw;
-  }) as typeof fs.realpathSync);
-  vi.mocked(fs.statSync).mockImplementation(((value: fs.PathLike) => {
-    const raw = String(value);
-    if (raw.endsWith(`${path.sep}extensions${path.sep}bundled-chat`)) {
-      return {
-        isDirectory: () => true,
-      } as ReturnType<typeof fs.statSync>;
-    }
-    return {
-      isDirectory: () => true,
-    } as ReturnType<typeof fs.statSync>;
-  }) as typeof fs.statSync);
-  vi.mocked(fs.existsSync).mockImplementation((value) => {
-    const raw = String(value);
-    return (
-      raw.endsWith(`${path.sep}.git${path.sep}HEAD`) ||
-      raw.endsWith(`${path.sep}.git${path.sep}objects`) ||
-      raw.endsWith(`${path.sep}.git${path.sep}refs`) ||
-      raw.endsWith(`${path.sep}extensions${path.sep}bundled-chat`)
-    );
-  });
+  return { workspaceDir, localPath, runtimeMarker: fixture.runtimeMarker };
 }
 
 async function runInitialValueForChannel(channel: "dev" | "beta") {
@@ -293,13 +252,14 @@ async function runInitialValueForChannel(channel: "dev" | "beta") {
   const select = vi.fn((async <T extends string>() => "skip" as T) as WizardPrompter["select"]);
   const prompter = makePrompter({ select: select as unknown as WizardPrompter["select"] });
   const cfg: OpenClawConfig = { update: { channel } };
-  mockRepoLocalPathExists();
+  const { workspaceDir } = createLocalPluginFixture();
 
   await ensureChannelSetupPluginInstalled({
     cfg,
     entry: baseEntry,
     prompter,
     runtime,
+    workspaceDir,
   });
 
   return requireMockCallArg(select, 0).initialValue;
@@ -307,22 +267,13 @@ async function runInitialValueForChannel(channel: "dev" | "beta") {
 
 function expectPluginLoadedFromLocalPath(
   result: Awaited<ReturnType<typeof ensureChannelSetupPluginInstalled>>,
+  expectedPath: string,
 ) {
-  const expectedPath = path.resolve(process.cwd(), bundledPluginRoot("bundled-chat"));
   expect(result.installed).toBe(true);
   expect(result.cfg.plugins?.load?.paths).toContain(expectedPath);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!isRecord(value)) {
-    throw new Error(`expected ${label} to be an object`);
-  }
-  return value;
-}
+const requireRecord = createRequireRecord("record", "expected-label-object");
 
 function requireArray(value: unknown, label: string): unknown[] {
   if (!Array.isArray(value)) {
@@ -368,9 +319,9 @@ describe("ensureChannelSetupPluginInstalled", () => {
     const runtime = makeRuntime();
     const prompter = makePrompter({
       select: vi.fn(async () => "npm") as WizardPrompter["select"],
+      confirm: vi.fn(async () => true),
     });
     const cfg: OpenClawConfig = { plugins: { allow: ["bundled-chat"] } };
-    vi.mocked(fs.existsSync).mockReturnValue(false);
     installPluginFromNpmSpec.mockResolvedValue({
       ok: true,
       pluginId: "bundled-chat",
@@ -403,10 +354,10 @@ describe("ensureChannelSetupPluginInstalled", () => {
     const runtime = makeRuntime();
     const prompter = makePrompter({
       select: vi.fn(async () => "npm") as WizardPrompter["select"],
+      confirm: vi.fn(async () => true),
     });
-    const profileStateDir = "/tmp/openclaw-ledger-channel";
+    const profileStateDir = tempDirs.make("openclaw-ledger-channel-");
     process.env.OPENCLAW_STATE_DIR = profileStateDir;
-    vi.mocked(fs.existsSync).mockReturnValue(false);
     installPluginFromNpmSpec.mockResolvedValue({
       ok: true,
       pluginId: "bundled-chat",
@@ -431,28 +382,33 @@ describe("ensureChannelSetupPluginInstalled", () => {
     const runtime = makeRuntime();
     const prompter = makePrompter({
       select: vi.fn(async () => "local") as WizardPrompter["select"],
+      confirm: vi.fn(async () => true),
     });
     const cfg: OpenClawConfig = {};
-    mockRepoLocalPathExists();
+    const { workspaceDir, localPath, runtimeMarker } = createLocalPluginFixture();
 
     const result = await ensureChannelSetupPluginInstalled({
       cfg,
       entry: baseEntry,
       prompter,
       runtime,
+      workspaceDir,
     });
 
-    expectPluginLoadedFromLocalPath(result);
+    expectPluginLoadedFromLocalPath(result, localPath);
     expect(result.cfg.plugins?.entries?.["bundled-chat"]?.enabled).toBe(true);
+    expect(result.cfg.plugins?.installs?.["bundled-chat"]?.acceptedSurface).toBeDefined();
+    expect(fs.existsSync(runtimeMarker)).toBe(false);
   });
 
   it("uses the catalog plugin id for local-path installs", async () => {
     const runtime = makeRuntime();
     const prompter = makePrompter({
       select: vi.fn(async () => "local") as WizardPrompter["select"],
+      confirm: vi.fn(async () => true),
     });
     const cfg: OpenClawConfig = {};
-    mockRepoLocalPathExists();
+    const { workspaceDir } = createLocalPluginFixture("@vendor/external-chat-plugin");
 
     const result = await ensureChannelSetupPluginInstalled({
       cfg,
@@ -463,6 +419,7 @@ describe("ensureChannelSetupPluginInstalled", () => {
       },
       prompter,
       runtime,
+      workspaceDir,
     });
 
     expect(result.installed).toBe(true);
@@ -478,58 +435,69 @@ describe("ensureChannelSetupPluginInstalled", () => {
     expect(await runInitialValueForChannel("beta")).toBe("npm");
   });
 
-  it("installs npm beta on the beta channel without persisting the beta tag", async () => {
-    const runtime = makeRuntime();
-    const { prompter, select } = makeSkipInstallPrompter();
-    const cfg: OpenClawConfig = { update: { channel: "beta" } };
-    vi.mocked(fs.existsSync).mockReturnValue(false);
-    installPluginFromNpmSpec.mockResolvedValue({
-      ok: true,
-      pluginId: "wecom-openclaw-plugin",
-      targetDir: "/tmp/wecom-openclaw-plugin",
-      version: "2026.5.4-beta.1",
-      npmResolution: {
-        name: "@openclaw/wecom",
-        version: "2026.5.4-beta.1",
-        resolvedSpec: "@openclaw/wecom@2026.5.4-beta.1",
-      },
-    });
-
-    const result = await ensureChannelSetupPluginInstalled({
-      cfg,
-      entry: {
-        id: "wecom",
+  it.each([
+    { beta: "2026.5.4-beta.1", latest: "2026.5.4", selected: "2026.5.4" },
+    { beta: "2026.5.5-beta.1", latest: "2026.5.4", selected: "2026.5.5-beta.1" },
+  ])(
+    "installs $selected on beta while preserving npm intent",
+    async ({ beta, latest, selected }) => {
+      const runtime = makeRuntime();
+      const { prompter, select } = makeSkipInstallPrompter(true);
+      const cfg: OpenClawConfig = { update: { channel: "beta" } };
+      resolveNpmSpecMetadata.mockImplementation(async ({ spec }: { spec: string }) => {
+        const version = spec === "@openclaw/wecom@beta" ? beta : latest;
+        expect(["@openclaw/wecom@beta", "@openclaw/wecom@latest"]).toContain(spec);
+        const name = "@openclaw/wecom";
+        const metadata = { name, version, resolvedSpec: `${name}@${version}` };
+        return { ok: true, metadata };
+      });
+      installPluginFromNpmSpec.mockResolvedValue({
+        ok: true,
         pluginId: "wecom-openclaw-plugin",
-        meta: {
-          id: "wecom",
-          label: "WeCom",
-          selectionLabel: "WeCom",
-          docsPath: "/channels/wecom",
-          blurb: "WeCom channel",
+        targetDir: "/tmp/wecom-openclaw-plugin",
+        version: selected,
+        npmResolution: {
+          name: "@openclaw/wecom",
+          version: selected,
+          resolvedSpec: `@openclaw/wecom@${selected}`,
         },
-        install: {
-          npmSpec: "@openclaw/wecom",
-        },
-      },
-      prompter,
-      runtime,
-      promptInstall: false,
-    });
+      });
 
-    expect(select).not.toHaveBeenCalled();
-    expectRecordFields(requireMockCallArg(installPluginFromNpmSpec, 0), "npm install args", {
-      spec: "@openclaw/wecom@beta",
-      expectedPluginId: "wecom-openclaw-plugin",
-    });
-    expect(result.cfg.plugins?.installs?.["wecom-openclaw-plugin"]?.spec).toBe("@openclaw/wecom");
-  });
+      const result = await ensureChannelSetupPluginInstalled({
+        cfg,
+        entry: {
+          id: "wecom",
+          pluginId: "wecom-openclaw-plugin",
+          meta: {
+            id: "wecom",
+            label: "WeCom",
+            selectionLabel: "WeCom",
+            docsPath: "/channels/wecom",
+            blurb: "WeCom channel",
+          },
+          install: {
+            npmSpec: "@openclaw/wecom",
+          },
+        },
+        prompter,
+        runtime,
+        promptInstall: false,
+      });
+
+      expect(select).not.toHaveBeenCalled();
+      expectRecordFields(requireMockCallArg(installPluginFromNpmSpec, 0), "npm install args", {
+        spec: `@openclaw/wecom@${selected}`,
+        expectedPluginId: "wecom-openclaw-plugin",
+      });
+      expect(result.cfg.plugins?.installs?.["wecom-openclaw-plugin"]?.spec).toBe("@openclaw/wecom");
+    },
+  );
 
   it("defaults to bundled local path on beta channel when available", async () => {
     const runtime = makeRuntime();
     const { prompter, select } = makeSkipInstallPrompter();
     const cfg: OpenClawConfig = { update: { channel: "beta" } };
-    vi.mocked(fs.existsSync).mockReturnValue(false);
-    mockBundledChatSource();
+    const localPath = mockBundledChatSource();
 
     await ensureChannelSetupPluginInstalled({
       cfg,
@@ -545,7 +513,7 @@ describe("ensureChannelSetupPluginInstalled", () => {
       "local option",
       {
         value: "local",
-        hint: bundledPluginRootAt("/opt/openclaw", "bundled-chat"),
+        hint: localPath,
       },
     );
   });
@@ -575,7 +543,6 @@ describe("ensureChannelSetupPluginInstalled", () => {
     const runtime = makeRuntime();
     const { prompter, select } = makeSkipInstallPrompter();
     const cfg: OpenClawConfig = { update: { channel: "beta" } };
-    vi.mocked(fs.existsSync).mockReturnValue(false);
     mockBundledChatSource();
 
     await ensureChannelSetupPluginInstalled({
@@ -615,7 +582,6 @@ describe("ensureChannelSetupPluginInstalled", () => {
     const runtime = makeRuntime();
     const { prompter, select } = makeSkipInstallPrompter();
     const cfg: OpenClawConfig = { update: { channel: "beta" } };
-    vi.mocked(fs.existsSync).mockReturnValue(false);
     resolveBundledPluginSources.mockReturnValue(new Map());
 
     await ensureChannelSetupPluginInstalled({
@@ -652,7 +618,32 @@ describe("ensureChannelSetupPluginInstalled", () => {
     });
   });
 
-  it("falls back to local path after npm install failure", async () => {
+  it.each([
+    {
+      scenario: "falls back to local path when the npm target is not published",
+      code: PLUGIN_INSTALL_ERROR_CODE.NPM_PACKAGE_NOT_FOUND,
+      error: "Package not found on npm: @openclaw/bundled-chat@1.2.3",
+      fallback: true,
+    },
+    {
+      scenario: "refuses local fallback for an untyped npm error mentioning E404",
+      code: undefined,
+      error: "E404 while installing a dependency",
+      fallback: false,
+    },
+    {
+      scenario: "refuses local fallback after an npm integrity failure",
+      code: undefined,
+      error: "aborted: npm package integrity drift",
+      fallback: false,
+    },
+    {
+      scenario: "refuses local fallback after an npm policy failure",
+      code: PLUGIN_INSTALL_ERROR_CODE.SECURITY_SCAN_BLOCKED,
+      error: "Plugin install blocked by policy",
+      fallback: false,
+    },
+  ])("$scenario", async ({ code, error, fallback }) => {
     const runtime = makeRuntime();
     const note = vi.fn(async () => {});
     const confirm = vi.fn(async () => true);
@@ -662,10 +653,11 @@ describe("ensureChannelSetupPluginInstalled", () => {
       confirm,
     });
     const cfg: OpenClawConfig = {};
-    mockRepoLocalPathExists();
+    const { workspaceDir, localPath } = createLocalPluginFixture();
     installPluginFromNpmSpec.mockResolvedValue({
       ok: false,
-      error: "nope",
+      code,
+      error,
     });
 
     const result = await ensureChannelSetupPluginInstalled({
@@ -673,74 +665,70 @@ describe("ensureChannelSetupPluginInstalled", () => {
       entry: baseEntry,
       prompter,
       runtime,
+      workspaceDir,
     });
 
-    expectPluginLoadedFromLocalPath(result);
     expect(note).toHaveBeenCalled();
-    expect(runtime.error).not.toHaveBeenCalled();
+    expect(installPluginFromNpmSpec).toHaveBeenCalledOnce();
+    if (fallback) {
+      expectPluginLoadedFromLocalPath(result, localPath);
+      expect(result.cfg.plugins?.installs?.["bundled-chat"]?.acceptedSurface).toBeDefined();
+      expect(runtime.error).not.toHaveBeenCalled();
+    } else {
+      expect(result).toEqual({ cfg, installed: false, pluginId: "bundled-chat", status: "failed" });
+      expect(confirm).not.toHaveBeenCalled();
+      expect(runtime.error).toHaveBeenCalledWith(`Plugin install failed: ${error}`);
+    }
   });
 
-  it("skips the install prompt when autoConfirmSingleSource is set and only npm is available", async () => {
-    const runtime = makeRuntime();
-    const { prompter, select } = makeSkipInstallPrompter();
-    const cfg: OpenClawConfig = {};
-    // npm-only entry (no local path)
-    const npmOnlyEntry: ChannelPluginCatalogEntry = {
-      id: "wecom",
-      pluginId: "wecom-openclaw-plugin",
-      meta: {
+  it.each([true, false])(
+    "auto-selects the only npm source but requires capability consent, accepted=%s",
+    async (acceptCapabilities) => {
+      const runtime = makeRuntime();
+      const { prompter, select, confirm } = makeSkipInstallPrompter(acceptCapabilities);
+      const cfg: OpenClawConfig = {};
+      // npm-only entry (no local path)
+      const npmOnlyEntry: ChannelPluginCatalogEntry = {
         id: "wecom",
-        label: "WeCom",
-        selectionLabel: "WeCom",
-        docsPath: "/channels/wecom",
-        blurb: "WeCom channel",
-      },
-      install: {
-        npmSpec: "@openclaw/wecom@2026.4.23",
-      },
-    };
-    installPluginFromNpmSpec.mockResolvedValue({
-      ok: true,
-      pluginId: "wecom-openclaw-plugin",
-      installPath: "/tmp/wecom-openclaw-plugin",
-    });
-    vi.mocked(fs.existsSync).mockReturnValue(false);
-    resolveBundledPluginSources.mockReturnValue(new Map());
+        pluginId: "wecom-openclaw-plugin",
+        meta: {
+          id: "wecom",
+          label: "WeCom",
+          selectionLabel: "WeCom",
+          docsPath: "/channels/wecom",
+          blurb: "WeCom channel",
+        },
+        install: {
+          npmSpec: "@openclaw/wecom@2026.4.23",
+        },
+      };
+      installPluginFromNpmSpec.mockResolvedValue({
+        ok: true,
+        pluginId: "wecom-openclaw-plugin",
+        targetDir: "/tmp/wecom-openclaw-plugin",
+      });
+      resolveBundledPluginSources.mockReturnValue(new Map());
 
-    const result = await ensureChannelSetupPluginInstalled({
-      cfg,
-      entry: npmOnlyEntry,
-      prompter,
-      runtime,
-      autoConfirmSingleSource: true,
-    });
+      const result = await ensureChannelSetupPluginInstalled({
+        cfg,
+        entry: npmOnlyEntry,
+        prompter,
+        runtime,
+        autoConfirmSingleSource: true,
+      });
 
-    expect(select).not.toHaveBeenCalled();
-    expect(result.installed).toBe(true);
-    expect(result.pluginId).toBe("wecom-openclaw-plugin");
-  });
+      expect(select).not.toHaveBeenCalled();
+      expect(confirm).toHaveBeenCalledOnce();
+      expect(result.installed).toBe(acceptCapabilities);
+      expect(result.pluginId).toBe("wecom-openclaw-plugin");
+      if (!acceptCapabilities) {
+        expect(result.cfg).toBe(cfg);
+        expect(runtime.error).toHaveBeenCalledWith(expect.stringMatching(/capabilit/i));
+      }
+    },
+  );
 
-  it("reloads the setup plugin registry without using plugin registry cache", () => {
-    const runtime = makeRuntime();
-    const cfg: OpenClawConfig = {};
-
-    reloadChannelSetupPluginRegistry({
-      cfg,
-      runtime,
-      workspaceDir: "/tmp/openclaw-workspace",
-    });
-
-    expectLoadOpenClawPluginFields({
-      config: cfg,
-      activationSourceConfig: cfg,
-      autoEnabledReasons: {},
-      workspaceDir: "/tmp/openclaw-workspace",
-      cache: false,
-      includeSetupOnlyChannelPlugins: true,
-    });
-  });
-
-  it("loads the setup plugin registry from the auto-enabled config snapshot", () => {
+  it("loads setup snapshots from the auto-enabled config snapshot", () => {
     const runtime = makeRuntime();
     const cfg: OpenClawConfig = {
       plugins: {},
@@ -760,9 +748,10 @@ describe("ensureChannelSetupPluginInstalled", () => {
       autoEnabledReasons: {},
     });
 
-    reloadChannelSetupPluginRegistry({
+    loadChannelSetupPluginRegistrySnapshotForChannel({
       cfg,
       runtime,
+      channel: "external-chat",
       workspaceDir: "/tmp/openclaw-workspace",
     });
 
@@ -774,94 +763,6 @@ describe("ensureChannelSetupPluginInstalled", () => {
       config: autoEnabledConfig,
       activationSourceConfig: cfg,
       autoEnabledReasons: {},
-    });
-  });
-
-  it("scopes channel reloads when setup starts from an empty registry", () => {
-    const runtime = makeRuntime();
-    const cfg: OpenClawConfig = {};
-    getChannelPluginCatalogEntry.mockReturnValue({ pluginId: "@vendor/external-chat-plugin" });
-
-    reloadChannelSetupPluginRegistryForChannel({
-      cfg,
-      runtime,
-      channel: "external-chat",
-      workspaceDir: "/tmp/openclaw-workspace",
-    });
-
-    expectLoadOpenClawPluginFields({
-      config: cfg,
-      activationSourceConfig: cfg,
-      autoEnabledReasons: {},
-      workspaceDir: "/tmp/openclaw-workspace",
-      cache: false,
-      onlyPluginIds: ["@vendor/external-chat-plugin"],
-      includeSetupOnlyChannelPlugins: true,
-    });
-    expect(getChannelPluginCatalogEntry).toHaveBeenCalledWith("external-chat", {
-      workspaceDir: "/tmp/openclaw-workspace",
-    });
-  });
-
-  it("does not widen channel reloads when the active plugin registry is already populated", () => {
-    const runtime = makeRuntime();
-    const cfg: OpenClawConfig = {};
-    const registry = createEmptyPluginRegistry();
-    registry.plugins.push(
-      createPluginRecord({
-        id: "loaded",
-        name: "loaded",
-        source: "/tmp/loaded.cjs",
-        origin: "bundled",
-        configSchema: true,
-      }),
-    );
-    setActivePluginRegistry(registry);
-
-    reloadChannelSetupPluginRegistryForChannel({
-      cfg,
-      runtime,
-      channel: "external-chat",
-      workspaceDir: "/tmp/openclaw-workspace",
-    });
-
-    expectLoadOpenClawPluginFields({
-      onlyPluginIds: [],
-    });
-  });
-
-  it("scopes channel reloads when the global registry is populated but the pinned channel registry is empty", () => {
-    const runtime = makeRuntime();
-    const cfg: OpenClawConfig = {};
-    getChannelPluginCatalogEntry.mockReturnValue({ pluginId: "@vendor/external-chat-plugin" });
-    const activeRegistry = createEmptyPluginRegistry();
-    activeRegistry.plugins.push(
-      createPluginRecord({
-        id: "loaded-tools",
-        name: "loaded-tools",
-        source: "/tmp/loaded-tools.cjs",
-        origin: "bundled",
-      }),
-    );
-    setActivePluginRegistry(activeRegistry);
-    const pinnedChannelRegistry = createEmptyPluginRegistry();
-    pinActivePluginChannelRegistry(pinnedChannelRegistry);
-
-    try {
-      reloadChannelSetupPluginRegistryForChannel({
-        cfg,
-        runtime,
-        channel: "external-chat",
-        workspaceDir: "/tmp/openclaw-workspace",
-      });
-    } finally {
-      releasePinnedPluginChannelRegistry(pinnedChannelRegistry);
-    }
-
-    expectLoadOpenClawPluginFields({
-      activationSourceConfig: cfg,
-      autoEnabledReasons: {},
-      onlyPluginIds: ["@vendor/external-chat-plugin"],
     });
   });
 
@@ -885,7 +786,7 @@ describe("ensureChannelSetupPluginInstalled", () => {
       cache: false,
       onlyPluginIds: ["@vendor/external-chat-plugin"],
       includeSetupOnlyChannelPlugins: true,
-      activate: false,
+      channelPluginLoadIntent: "setup",
     });
     expect(getChannelPluginCatalogEntry).toHaveBeenCalledWith("external-chat", {
       workspaceDir: "/tmp/openclaw-workspace",
@@ -914,7 +815,8 @@ describe("ensureChannelSetupPluginInstalled", () => {
     });
     expect(getChannelPluginCatalogEntry).toHaveBeenNthCalledWith(2, "external-chat", {
       workspaceDir: "/tmp/openclaw-workspace",
-      excludeWorkspace: true,
+      env: undefined,
+      excludePluginRefs: [{ pluginId: "evil-external-chat-shadow", origin: "workspace" }],
     });
   });
 
@@ -963,7 +865,7 @@ describe("ensureChannelSetupPluginInstalled", () => {
   it("scopes snapshots by a unique discovered manifest match when catalog mapping is missing", () => {
     const runtime = makeRuntime();
     const cfg: OpenClawConfig = {};
-    loadPluginManifestRegistry.mockReturnValue({
+    loadPluginManifestRegistryCore.mockReturnValue({
       plugins: [
         createManifestRecord({
           id: "custom-external-chat-plugin",
@@ -988,7 +890,7 @@ describe("ensureChannelSetupPluginInstalled", () => {
       cache: false,
       onlyPluginIds: ["custom-external-chat-plugin"],
       includeSetupOnlyChannelPlugins: true,
-      activate: false,
+      channelPluginLoadIntent: "setup",
     });
   });
 
@@ -996,7 +898,18 @@ describe("ensureChannelSetupPluginInstalled", () => {
     const runtime = makeRuntime();
     const cfg: OpenClawConfig = {};
     let sawTrustedCandidate = false;
-    loadPluginManifestRegistry.mockImplementation((args: unknown) => {
+    discoverOpenClawPlugins.mockReturnValue({
+      candidates: [
+        {
+          idHint: "custom-external-chat-plugin",
+          source: "/tmp/openclaw-test/custom-external-chat-plugin/index.ts",
+          rootDir: "/tmp/openclaw-test/custom-external-chat-plugin",
+          origin: "bundled",
+        },
+      ],
+      diagnostics: [],
+    });
+    loadPluginManifestRegistryCore.mockImplementation((args: unknown) => {
       if (
         isRecord(args) &&
         args.config === cfg &&
@@ -1046,9 +959,9 @@ describe("ensureChannelSetupPluginInstalled", () => {
       workspaceDir: "/tmp/openclaw-workspace",
     });
 
-    expect(loadPluginManifestRegistry).toHaveBeenCalled();
+    expect(loadPluginManifestRegistryCore).toHaveBeenCalled();
     expect(
-      loadPluginManifestRegistry.mock.calls.every(
+      loadPluginManifestRegistryCore.mock.calls.every(
         ([params]) => !Object.hasOwn(params ?? {}, "cache"),
       ),
     ).toBe(true);
@@ -1186,7 +1099,7 @@ describe("ensureChannelSetupPluginInstalled", () => {
       cache: false,
       onlyPluginIds: ["@vendor/external-chat-plugin"],
       includeSetupOnlyChannelPlugins: true,
-      activate: false,
+      channelPluginLoadIntent: "setup",
     });
   });
 });

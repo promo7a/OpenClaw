@@ -1,3 +1,4 @@
+/** Tests ACP translator replay ledger recording and load-session replay behavior. */
 import type {
   LoadSessionRequest,
   NewSessionRequest,
@@ -114,6 +115,15 @@ describe("ACP translator event ledger replay", () => {
 
     const promptPromise = firstAgent.prompt(createPromptRequest(created.sessionId, "Question"));
     await waitForChatSend(firstRequestMock);
+    await vi.waitFor(async () => {
+      const replay = await eventLedger.readReplay({
+        sessionId: created.sessionId,
+        sessionKey: firstSession.sessionKey,
+      });
+      expect(
+        replay.events.some((event) => event.update.sessionUpdate === "user_message_chunk"),
+      ).toBe(true);
+    });
     const runId = firstSessionStore.getSession(created.sessionId)?.activeRunId;
     if (!runId) {
       throw new Error("Expected active ACP run");
@@ -267,8 +277,6 @@ describe("ACP translator event ledger replay", () => {
     await expect(
       eventLedger.readReplayBySessionId({ sessionId: firstSession.sessionKey }),
     ).resolves.toEqual({ complete: false, events: [] });
-
-    firstSessionStore.clearAllSessionsForTest();
   });
 
   it("does not replay prompts that Gateway rejected before accepting the send", async () => {

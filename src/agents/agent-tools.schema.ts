@@ -1,12 +1,14 @@
-import { copyPluginToolMeta } from "../plugins/tools.js";
 import {
   normalizeToolParameterSchema,
   type ToolParameterSchemaOptions,
-} from "./agent-tools-parameter-schema.js";
+} from "@openclaw/ai/internal/openai";
+/**
+ * Tool schema normalization wrappers.
+ * Applies provider-compatible parameter schema cleanup while preserving
+ * identity-backed metadata on normalized tools.
+ */
+import { copyAgentToolMetadata } from "./agent-tool-metadata.js";
 import type { AnyAgentTool } from "./agent-tools.types.js";
-import { copyChannelAgentToolMeta } from "./channel-tools.js";
-
-export { normalizeToolParameterSchema };
 
 function isObjectSchemaWithNoRequiredParams(schema: unknown): boolean {
   if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
@@ -46,28 +48,11 @@ function schemaHasRequiredParams(schema: Record<string, unknown>): boolean {
   return false;
 }
 
-function addEmptyObjectArgumentPreparation(tool: AnyAgentTool, parameters: unknown): AnyAgentTool {
-  if (!isObjectSchemaWithNoRequiredParams(parameters)) {
-    return tool;
-  }
-  return {
-    ...tool,
-    prepareArguments: (args: unknown) => {
-      const prepared = tool.prepareArguments ? tool.prepareArguments(args) : args;
-      return prepared === null || prepared === undefined ? {} : prepared;
-    },
-  };
-}
-
+/** Normalize a tool's parameter schema for the selected provider/model. */
 export function normalizeToolParameters(
   tool: AnyAgentTool,
   options?: ToolParameterSchemaOptions,
 ): AnyAgentTool {
-  function preserveToolMeta(target: AnyAgentTool): AnyAgentTool {
-    copyPluginToolMeta(tool, target);
-    copyChannelAgentToolMeta(tool as never, target as never);
-    return target;
-  }
   const schema =
     tool.parameters && typeof tool.parameters === "object"
       ? (tool.parameters as Record<string, unknown>)
@@ -76,17 +61,12 @@ export function normalizeToolParameters(
     return tool;
   }
   const parameters = normalizeToolParameterSchema(schema, options);
-  return preserveToolMeta({
-    ...tool,
-    ...addEmptyObjectArgumentPreparation(tool, parameters),
-    parameters,
-  });
-}
-
-/**
- * @deprecated Use normalizeToolParameters with modelProvider instead.
- * This function should only be used for Gemini providers.
- */
-export function cleanToolSchemaForGemini(schema: Record<string, unknown>): unknown {
-  return normalizeToolParameterSchema(schema, { modelProvider: "gemini" });
+  const normalized = { ...tool, parameters };
+  if (isObjectSchemaWithNoRequiredParams(parameters)) {
+    normalized.prepareArguments = (args: unknown) => {
+      const prepared = tool.prepareArguments ? tool.prepareArguments(args) : args;
+      return prepared === null || prepared === undefined ? {} : prepared;
+    };
+  }
+  return copyAgentToolMetadata(tool, normalized);
 }

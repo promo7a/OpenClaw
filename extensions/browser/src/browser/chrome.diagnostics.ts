@@ -1,6 +1,13 @@
+import { readProviderJsonResponse } from "openclaw/plugin-sdk/provider-http";
+/**
+ * Chrome CDP diagnostics.
+ *
+ * Probes /json/version and WebSocket health, redacts sensitive endpoint data,
+ * and formats status output for browser doctor/status flows.
+ */
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { rawDataToString } from "openclaw/plugin-sdk/webhook-ingress";
 import type { SsrFPolicy } from "../infra/net/ssrf.js";
-import { rawDataToString } from "../infra/ws.js";
 import { redactSensitiveText } from "../logging/redact.js";
 import { CHROME_REACHABILITY_TIMEOUT_MS, CHROME_WS_READY_TIMEOUT_MS } from "./cdp-timeouts.js";
 import {
@@ -12,11 +19,15 @@ import {
   normalizeCdpHttpBaseForJsonEndpoints,
   openCdpWebSocket,
   redactCdpUrl,
+  scopeCdpPolicyToConfiguredEndpoint,
 } from "./cdp.helpers.js";
 import { normalizeCdpWsUrl } from "./cdp.js";
 import { BrowserCdpEndpointBlockedError } from "./errors.js";
 
-export type ChromeCdpDiagnosticCode =
+type ChromeCdpEndpointPin = NonNullable<Awaited<ReturnType<typeof assertCdpEndpointAllowed>>>;
+
+/** Machine-readable failure codes for Chrome CDP diagnostics. */
+type ChromeCdpDiagnosticCode =
   | "ssrf_blocked"
   | "http_unreachable"
   | "http_status_failed"
@@ -27,6 +38,7 @@ export type ChromeCdpDiagnosticCode =
   | "websocket_health_command_failed"
   | "websocket_health_command_timeout";
 
+/** Result of a Chrome CDP reachability and WebSocket health probe. */
 export type ChromeCdpDiagnostic =
   | {
       ok: true;
@@ -45,6 +57,7 @@ export type ChromeCdpDiagnostic =
       elapsedMs: number;
     };
 
+/** Subset of Chrome /json/version used by browser diagnostics. */
 export type ChromeVersion = {
   webSocketDebuggerUrl?: string;
   Browser?: string;
@@ -55,6 +68,7 @@ function elapsedSince(startedAt: number): number {
   return Math.max(0, Date.now() - startedAt);
 }
 
+/** Convert an error and optional cause to redacted diagnostic text. */
 export function safeChromeCdpErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   const cause = error instanceof Error ? error.cause : undefined;
@@ -83,15 +97,17 @@ function failureDiagnostic(params: {
   };
 }
 
-export async function readChromeVersion(
+/** Read and validate Chrome's /json/version endpoint. */
+async function readChromeVersion(
   cdpUrl: string,
   timeoutMs = CHROME_REACHABILITY_TIMEOUT_MS,
   ssrfPolicy?: SsrFPolicy,
+  versionPath = "/json/version",
 ): Promise<ChromeVersion> {
   const ctrl = new AbortController();
   const t = setTimeout(ctrl.abort.bind(ctrl), timeoutMs);
   try {
-    const versionUrl = appendCdpPath(cdpUrl, "/json/version");
+    const versionUrl = appendCdpPath(cdpUrl, versionPath);
     const { response, release } = await fetchCdpChecked(
       versionUrl,
       timeoutMs,
@@ -99,7 +115,7 @@ export async function readChromeVersion(
       ssrfPolicy,
     );
     try {
-      const data = (await response.json()) as ChromeVersion;
+      const data = await readProviderJsonResponse<ChromeVersion>(response, "cdp-version");
       if (!data || typeof data !== "object") {
         throw new Error("CDP /json/version returned non-object JSON");
       }
@@ -112,8 +128,33 @@ export async function readChromeVersion(
   }
 }
 
+/** Preserve providers that expose only Playwright's trailing-slash route. */
+export async function readChromeVersionWithCredentialFallback(
+  cdpUrl: string,
+  timeoutMs = CHROME_REACHABILITY_TIMEOUT_MS,
+  ssrfPolicy?: SsrFPolicy,
+): Promise<ChromeVersion> {
+  try {
+    const primaryVersion = await readChromeVersion(cdpUrl, timeoutMs, ssrfPolicy);
+    if (normalizeOptionalString(primaryVersion.webSocketDebuggerUrl)) {
+      return primaryVersion;
+    }
+    try {
+      return await readChromeVersion(cdpUrl, timeoutMs, ssrfPolicy, "/json/version/");
+    } catch {
+      return primaryVersion;
+    }
+  } catch (primaryError) {
+    try {
+      return await readChromeVersion(cdpUrl, timeoutMs, ssrfPolicy, "/json/version/");
+    } catch {
+      throw primaryError;
+    }
+  }
+}
+
 type CdpHealthDiagnostic =
-  | { ok: true }
+  | { ok: true; version?: ChromeVersion }
   | {
       ok: false;
       code:
@@ -123,13 +164,34 @@ type CdpHealthDiagnostic =
       message: string;
     };
 
+function readObjectString(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  return normalizeOptionalString((value as Record<string, unknown>)[key]);
+}
+
+function chromeVersionFromCdpResult(result: unknown): ChromeVersion | undefined {
+  const browser = readObjectString(result, "Browser") ?? readObjectString(result, "product");
+  const userAgent = readObjectString(result, "User-Agent") ?? readObjectString(result, "userAgent");
+  if (!browser && !userAgent) {
+    return undefined;
+  }
+  return {
+    Browser: browser,
+    "User-Agent": userAgent,
+  };
+}
+
 async function diagnoseCdpHealthCommand(
   wsUrl: string,
   timeoutMs = CHROME_WS_READY_TIMEOUT_MS,
+  lookup?: ChromeCdpEndpointPin["lookup"],
 ): Promise<CdpHealthDiagnostic> {
   return await new Promise<CdpHealthDiagnostic>((resolve) => {
     const ws = openCdpWebSocket(wsUrl, {
       handshakeTimeoutMs: timeoutMs,
+      lookup,
     });
     let settled = false;
     let opened = false;
@@ -147,7 +209,7 @@ async function diagnoseCdpHealthCommand(
         return;
       }
       if (parsed.result && typeof parsed.result === "object") {
-        finish({ ok: true });
+        finish({ ok: true, version: chromeVersionFromCdpResult(parsed.result) });
         return;
       }
       finish({
@@ -164,20 +226,12 @@ async function diagnoseCdpHealthCommand(
       settled = true;
       clearTimeout(timer);
       ws.off("message", onMessage);
-      try {
-        ws.close();
-      } catch {
-        // ignore
-      }
+      ws.close();
       resolve(value);
     };
     const timer = setTimeout(
       () => {
-        try {
-          ws.terminate();
-        } catch {
-          // ignore
-        }
+        ws.terminate();
         finish({
           ok: false,
           code: opened ? "websocket_health_command_timeout" : "websocket_handshake_failed",
@@ -239,12 +293,17 @@ function classifyChromeVersionError(error: unknown): {
   if (/^HTTP \d+/.test(message)) {
     return { code: "http_status_failed", message };
   }
-  if (error instanceof SyntaxError || message.includes("non-object JSON")) {
+  if (
+    error instanceof SyntaxError ||
+    message.includes("cdp-version: malformed JSON response") ||
+    message.includes("non-object JSON")
+  ) {
     return { code: "invalid_json", message };
   }
   return { code: "http_unreachable", message };
 }
 
+/** Format a Chrome CDP diagnostic result for status and doctor output. */
 export function formatChromeCdpDiagnostic(diagnostic: ChromeCdpDiagnostic): string {
   const redactedCdpUrl = redactCdpUrl(diagnostic.cdpUrl) ?? diagnostic.cdpUrl;
   const redactedWsUrl = redactCdpUrl(diagnostic.wsUrl) ?? diagnostic.wsUrl;
@@ -255,13 +314,25 @@ export function formatChromeCdpDiagnostic(diagnostic: ChromeCdpDiagnostic): stri
   const websocket = redactedWsUrl ? `; websocket=${redactedWsUrl}` : "";
   const wslPortproxyHint =
     diagnostic.code === "http_unreachable" && isLikelyEmptyHttpReply(diagnostic.message)
-      ? " In WSL2-to-Windows Chrome setups, this can be a stale netsh portproxy self-loop where svchost/iphlpsvc owns the CDP port instead of chrome.exe; verify with tasklist /svc and curl /json/version, then remove any 127.0.0.1:9222 -> 127.0.0.1:9222 portproxy rule."
+      ? WSL_EMPTY_REPLY_PORTPROXY_HINT
       : "";
   return `CDP diagnostic: ${diagnostic.code} after ${diagnostic.elapsedMs}ms; cdp=${redactedCdpUrl}${websocket}; ${diagnostic.message}.${wslPortproxyHint}`;
 }
 
+// The WSL-side error cannot identify which Windows loopback Chrome owns.
+// Send operators to the host listeners before they change the proxy family.
+const WSL_EMPTY_REPLY_PORTPROXY_HINT =
+  " In WSL2-to-Windows Chrome setups, an empty CDP reply can mean netsh is forwarding to the" +
+  " wrong loopback address. On Windows, inspect `netstat -ano | findstr :9222` and" +
+  " `netsh interface portproxy show all`, then curl both 127.0.0.1 and [::1]. Chromium prefers" +
+  " 127.0.0.1 and falls back to [::1] only when the IPv4 bind fails. If svchost/iphlpsvc owns" +
+  " 127.0.0.1:9222, remove the 127.0.0.1:9222 -> 127.0.0.1:9222 self-loop; if chrome.exe" +
+  " listens only on [::1], use v4tov6 with connectaddress=::1 for the WSL2-reachable listener.";
+
 function isLikelyEmptyHttpReply(message: string): boolean {
-  return /empty reply|other side closed|socket closed|terminated before response/i.test(message);
+  return /empty reply|other side closed|socket closed|connection reset|econnreset|terminated before response/i.test(
+    message,
+  );
 }
 
 async function diagnoseCdpWebSocketEndpoint(params: {
@@ -269,9 +340,14 @@ async function diagnoseCdpWebSocketEndpoint(params: {
   wsUrl: string;
   startedAt: number;
   handshakeTimeoutMs: number;
+  lookup?: ChromeCdpEndpointPin["lookup"];
   version?: ChromeVersion;
 }): Promise<ChromeCdpDiagnostic> {
-  const health = await diagnoseCdpHealthCommand(params.wsUrl, params.handshakeTimeoutMs);
+  const health = await diagnoseCdpHealthCommand(
+    params.wsUrl,
+    params.handshakeTimeoutMs,
+    params.lookup,
+  );
   if (!health.ok) {
     return failureDiagnostic({
       cdpUrl: params.cdpUrl,
@@ -281,24 +357,17 @@ async function diagnoseCdpWebSocketEndpoint(params: {
       startedAt: params.startedAt,
     });
   }
-  if (params.version) {
-    return {
-      ok: true,
-      cdpUrl: params.cdpUrl,
-      wsUrl: params.wsUrl,
-      browser: params.version.Browser,
-      userAgent: params.version["User-Agent"],
-      elapsedMs: elapsedSince(params.startedAt),
-    };
-  }
   return {
     ok: true,
     cdpUrl: params.cdpUrl,
     wsUrl: params.wsUrl,
+    browser: params.version?.Browser ?? health.version?.Browser,
+    userAgent: params.version?.["User-Agent"] ?? health.version?.["User-Agent"],
     elapsedMs: elapsedSince(params.startedAt),
   };
 }
 
+/** Run HTTP and WebSocket health diagnostics for a Chrome CDP endpoint. */
 export async function diagnoseChromeCdp(
   cdpUrl: string,
   timeoutMs = CHROME_REACHABILITY_TIMEOUT_MS,
@@ -306,8 +375,9 @@ export async function diagnoseChromeCdp(
   ssrfPolicy?: SsrFPolicy,
 ): Promise<ChromeCdpDiagnostic> {
   const startedAt = Date.now();
+  let configuredPin: ChromeCdpEndpointPin | undefined;
   try {
-    await assertCdpEndpointAllowed(cdpUrl, ssrfPolicy);
+    configuredPin = await assertCdpEndpointAllowed(cdpUrl, ssrfPolicy);
   } catch (err) {
     return failureDiagnostic({
       cdpUrl,
@@ -316,6 +386,7 @@ export async function diagnoseChromeCdp(
       startedAt,
     });
   }
+  const cdpControlPolicy = scopeCdpPolicyToConfiguredEndpoint(cdpUrl, ssrfPolicy);
 
   if (isDirectCdpWebSocketEndpoint(cdpUrl)) {
     return await diagnoseCdpWebSocketEndpoint({
@@ -323,6 +394,7 @@ export async function diagnoseChromeCdp(
       wsUrl: cdpUrl,
       startedAt,
       handshakeTimeoutMs,
+      lookup: configuredPin?.lookup,
     });
   }
 
@@ -331,7 +403,11 @@ export async function diagnoseChromeCdp(
     : cdpUrl;
   let version: ChromeVersion;
   try {
-    version = await readChromeVersion(discoveryUrl, timeoutMs, ssrfPolicy);
+    version = await readChromeVersionWithCredentialFallback(
+      discoveryUrl,
+      timeoutMs,
+      cdpControlPolicy,
+    );
   } catch (err) {
     if (isWebSocketUrl(cdpUrl)) {
       return await diagnoseCdpWebSocketEndpoint({
@@ -339,6 +415,7 @@ export async function diagnoseChromeCdp(
         wsUrl: cdpUrl,
         startedAt,
         handshakeTimeoutMs,
+        lookup: configuredPin?.lookup,
       });
     }
     const classified = classifyChromeVersionError(err);
@@ -358,6 +435,7 @@ export async function diagnoseChromeCdp(
         wsUrl: cdpUrl,
         startedAt,
         handshakeTimeoutMs,
+        lookup: configuredPin?.lookup,
         version,
       });
     }
@@ -369,8 +447,12 @@ export async function diagnoseChromeCdp(
     });
   }
   const wsUrl = normalizeCdpWsUrl(wsUrlRaw, discoveryUrl);
+  let discoveredPin: ChromeCdpEndpointPin | undefined;
   try {
-    await assertCdpEndpointAllowed(wsUrl, ssrfPolicy);
+    discoveredPin = await assertCdpEndpointAllowed(wsUrl, cdpControlPolicy, {
+      source: "discovered",
+      configuredUrl: cdpUrl,
+    });
   } catch (err) {
     return failureDiagnostic({
       cdpUrl,
@@ -381,10 +463,14 @@ export async function diagnoseChromeCdp(
     });
   }
 
-  const health = await diagnoseCdpHealthCommand(wsUrl, handshakeTimeoutMs);
+  const health = await diagnoseCdpHealthCommand(wsUrl, handshakeTimeoutMs, discoveredPin?.lookup);
   if (!health.ok) {
     if (isWebSocketUrl(cdpUrl) && wsUrl !== cdpUrl) {
-      const directHealth = await diagnoseCdpHealthCommand(cdpUrl, handshakeTimeoutMs);
+      const directHealth = await diagnoseCdpHealthCommand(
+        cdpUrl,
+        handshakeTimeoutMs,
+        configuredPin?.lookup,
+      );
       if (directHealth.ok) {
         return {
           ok: true,

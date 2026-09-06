@@ -1,9 +1,14 @@
+/**
+ * Resolves ACPX plugin config from raw user configuration. It locates the
+ * plugin root, injects optional MCP bridge servers, and applies runtime defaults.
+ */
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatPluginConfigIssue } from "openclaw/plugin-sdk/extension-shared";
 import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { splitCommandParts } from "./command-line.js";
 import { AcpxPluginConfigSchema, DEFAULT_ACPX_TIMEOUT_SECONDS } from "./config-schema.js";
 import type {
   AcpxPluginConfig,
@@ -80,6 +85,7 @@ function resolveAcpxPluginRootFromOpenClawLayout(moduleUrl: string): string | nu
   }
   return null;
 }
+/** Resolve the ACPX plugin root across source, dist, and dist-runtime layouts. */
 export function resolveAcpxPluginRoot(moduleUrl: string = import.meta.url): string {
   const resolvedRoot = resolveNearestAcpxPluginRoot(moduleUrl);
   // In a live repo checkout, dist/ can be rebuilt out from under the running gateway.
@@ -96,8 +102,6 @@ export function resolveAcpxPluginRoot(moduleUrl: string = import.meta.url): stri
 
 const DEFAULT_PERMISSION_MODE: AcpxPermissionMode = "approve-reads";
 const DEFAULT_NON_INTERACTIVE_POLICY: AcpxNonInteractivePermissionPolicy = "fail";
-const DEFAULT_QUEUE_OWNER_TTL_SECONDS = 0.1;
-const DEFAULT_STRICT_WINDOWS_CMD_WRAPPER = true;
 
 type ParseResult =
   | { ok: true; value: AcpxPluginConfig | undefined }
@@ -137,13 +141,6 @@ function resolveTsxImportSpecifier(): string {
   } catch {
     return "tsx";
   }
-}
-
-function shellQuoteCommandArg(arg: string): string {
-  if (!/[\s'"\\$|&;<>{}()*?[\]~`]/.test(arg)) {
-    return arg;
-  }
-  return `'${arg.replace(/'/g, "'\"'\"'")}'`;
 }
 
 function resolvePluginToolsMcpServerConfig(moduleUrl: string = import.meta.url): McpServerConfig {
@@ -210,6 +207,7 @@ function resolveConfiguredMcpServers(params: {
   return resolved;
 }
 
+/** Convert OpenClaw MCP server config into ACPX runtime MCP server entries. */
 export function toAcpMcpServers(mcpServers: Record<string, McpServerConfig>): AcpxMcpServer[] {
   return Object.entries(mcpServers).map(([name, server]) => ({
     name,
@@ -222,6 +220,7 @@ export function toAcpMcpServers(mcpServers: Record<string, McpServerConfig>): Ac
   }));
 }
 
+/** Validate and normalize raw ACPX plugin config for runtime startup. */
 export function resolveAcpxPluginConfig(params: {
   rawConfig: unknown;
   workspaceDir?: string;
@@ -247,36 +246,23 @@ export function resolveAcpxPluginConfig(params: {
   const agents = Object.fromEntries(
     Object.entries(normalized.agents ?? {}).map(([name, entry]) => {
       const cmd = entry.command.trim();
-      const cmdArgs = entry.args ?? [];
-      const fullCommand =
-        cmdArgs.length > 0 ? `${cmd} ${cmdArgs.map(shellQuoteCommandArg).join(" ")}` : cmd;
-      return [normalizeLowercaseStringOrEmpty(name), fullCommand];
+      // Only explicit absolute paths bypass parsing; workspace files must not
+      // reinterpret a configured command prefix as a different executable.
+      const command = path.isAbsolute(cmd) && fs.existsSync(cmd) ? [cmd] : splitCommandParts(cmd);
+      return [normalizeLowercaseStringOrEmpty(name), [...command, ...(entry.args ?? [])]];
     }),
   );
-
-  // Lowercase probeAgent so lookups match the registry keys built above, which
-  // also go through normalizeLowercaseStringOrEmpty. Without this, a user who
-  // writes `probeAgent: "OpenCode"` would silently miss the stored "opencode"
-  // key.
-  const probeAgent = normalizeLowercaseStringOrEmpty(normalized.probeAgent) || undefined;
 
   return {
     cwd,
     stateDir,
-    probeAgent,
+    probeAgent: normalized.probeAgent,
     permissionMode: normalized.permissionMode ?? DEFAULT_PERMISSION_MODE,
     nonInteractivePermissions:
       normalized.nonInteractivePermissions ?? DEFAULT_NON_INTERACTIVE_POLICY,
     pluginToolsMcpBridge,
     openClawToolsMcpBridge,
-    strictWindowsCmdWrapper:
-      normalized.strictWindowsCmdWrapper ?? DEFAULT_STRICT_WINDOWS_CMD_WRAPPER,
     timeoutSeconds: normalized.timeoutSeconds ?? DEFAULT_ACPX_TIMEOUT_SECONDS,
-    queueOwnerTtlSeconds: normalized.queueOwnerTtlSeconds ?? DEFAULT_QUEUE_OWNER_TTL_SECONDS,
-    legacyCompatibilityConfig: {
-      strictWindowsCmdWrapper: normalized.strictWindowsCmdWrapper,
-      queueOwnerTtlSeconds: normalized.queueOwnerTtlSeconds,
-    },
     mcpServers,
     agents,
   };

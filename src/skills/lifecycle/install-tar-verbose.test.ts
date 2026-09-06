@@ -1,3 +1,4 @@
+// Verbose tar install tests cover archive extraction diagnostics formatting.
 import { describe, expect, it } from "vitest";
 import { parseTarVerboseMetadata } from "./install-tar-verbose.js";
 
@@ -18,5 +19,8 @@ describe("parseTarVerboseMetadata", () => {
     expect(() =>
       parseTarVerboseMetadata("-rw-r--r-- user/group 9007199254740993 2026-05-28 00:00 SKILL.md"),
     ).toThrow(/unable to parse tar entry size/u);
+    expect(() =>
+      parseTarVerboseMetadata("?rw-r--r-- user/group 1 2026-05-28 00:00 SKILL.md"),
+    ).toThrow(/unable to parse tar entry type/u);
   });
 });

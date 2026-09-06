@@ -1,5 +1,6 @@
+// Frontmatter helpers parse skill metadata from SKILL.md files.
 import { readStringValue } from "@openclaw/normalization-core/string-coerce";
-import { parseFrontmatterBlock } from "../../../packages/markdown-core/src/frontmatter.js";
+import { parseFrontmatterBlockResult } from "../../../packages/markdown-core/src/frontmatter.js";
 import { validateRegistryNpmSpec } from "../../infra/npm-registry-spec.js";
 import {
   applyOpenClawManifestInstallCommonFields,
@@ -21,8 +22,15 @@ import type {
 } from "../types.js";
 import type { Skill } from "./skill-contract.js";
 
-export function parseFrontmatter(content: string): ParsedSkillFrontmatter {
-  return parseFrontmatterBlock(content);
+export function parseSkillFrontmatter(content: string): ParsedSkillFrontmatter {
+  const parsed = parseFrontmatterBlockResult(content);
+  const issue = parsed.issues[0];
+  if (issue) {
+    throw new Error(`invalid frontmatter: ${issue.code}: ${issue.message}`);
+  }
+  // Cached metadata must not retain the discarded SKILL.md through parser slices.
+  // The normalized record contains only strings; copy its keys and values together.
+  return structuredClone(parsed.frontmatter);
 }
 
 const BREW_FORMULA_PATTERN = /^[A-Za-z0-9][A-Za-z0-9@+._/-]*$/;
@@ -152,6 +160,16 @@ function parseInstallSpec(input: unknown): SkillInstallSpec | undefined {
   if (downloadUrl) {
     spec.url = downloadUrl;
   }
+  if (spec.kind === "download" && raw.sha256 !== undefined) {
+    if (typeof raw.sha256 !== "string") {
+      return undefined;
+    }
+    const sha256 = raw.sha256.trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/u.test(sha256)) {
+      return undefined;
+    }
+    spec.sha256 = sha256;
+  }
   if (typeof raw.archive === "string") {
     spec.archive = raw.archive;
   }
@@ -184,7 +202,7 @@ function parseInstallSpec(input: unknown): SkillInstallSpec | undefined {
   return spec;
 }
 
-export function resolveOpenClawMetadata(
+export function resolveSkillManifestMetadata(
   frontmatter: ParsedSkillFrontmatter,
 ): OpenClawSkillMetadata | undefined {
   const metadataObj = resolveOpenClawManifestBlock({ frontmatter });

@@ -1,3 +1,4 @@
+// Security CLI for local/deep audits and safe remediation.
 import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
@@ -8,7 +9,7 @@ import { isRich, theme } from "../../packages/terminal-core/src/theme.js";
 import { getRuntimeConfig } from "../config/config.js";
 import type { GatewayAuthMode } from "../config/types.gateway.js";
 import { defaultRuntime } from "../runtime.js";
-import { runSecurityAudit } from "../security/audit.js";
+import { runSecurityAuditCore } from "../security/audit.js";
 import { fixSecurityFootguns } from "../security/fix.js";
 import { shortenHomeInString, shortenHomePath } from "../utils.js";
 import { formatCliCommand } from "./command-format.js";
@@ -43,6 +44,7 @@ function buildAuditGatewayAuthOverride(params: {
   token?: string;
   password?: string;
 }) {
+  // Explicit runtime auth overrides must include the matching credential.
   if (!params.mode) {
     return undefined;
   }
@@ -131,7 +133,7 @@ export function registerSecurityCli(program: Command) {
           targetIds: getSecurityAuditCommandSecretTargetIds(),
           mode: "read_only_status",
         });
-      const report = await runSecurityAudit({
+      const report = await runSecurityAuditCore({
         config: cfg,
         sourceConfig,
         deep: Boolean(opts.deep),

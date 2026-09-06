@@ -29,8 +29,9 @@ const beforeToolCallMocks = vi.hoisted(() => ({
       this.reason = reason;
     }
   },
-  consumeAdjustedParamsForToolCall: vi.fn((_: string): unknown => undefined),
+  consumeAdjustedParamsForToolCall: vi.fn((_toolCallId: string): unknown => undefined),
   recordAdjustedParamsForToolCall: vi.fn(),
+  recordStructuredReplayTrustForToolCall: vi.fn(),
   isToolWrappedWithBeforeToolCallHook: vi.fn(() => false),
   runBeforeToolCallHook: vi.fn(async ({ params }: { params: unknown }) => ({
     blocked: false,
@@ -92,10 +93,19 @@ async function loadFreshAfterToolCallModulesForTest() {
   vi.doMock("../plugins/hook-runner-global.js", () => ({
     getGlobalHookRunner: () => hookMocks.runner,
   }));
-  vi.doMock("../infra/agent-events.js", () => ({
+  vi.doMock("../infra/agent-events.js", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../infra/agent-events.js")>()),
     emitAgentCommandOutputEvent: vi.fn(),
     emitAgentEvent: vi.fn(),
     emitAgentItemEvent: vi.fn(),
+  }));
+  vi.doMock("./agent-tools.before-tool-call.state.js", () => ({
+    consumeAdjustedParamsForToolCall: beforeToolCallMocks.consumeAdjustedParamsForToolCall,
+    consumePreExecutionBlockedToolCall: vi.fn(() => false),
+    consumeTrackedToolExecutionStarted: vi.fn(() => undefined),
+    consumeStructuredReplaySafeToolCall: vi.fn(() => false),
+    peekAdjustedParamsForToolCall: vi.fn(() => undefined),
+    peekPreExecutionBlockedToolCall: vi.fn(() => false),
   }));
   vi.doMock("./agent-tools.before-tool-call.js", () => ({
     BeforeToolCallBlockedError: beforeToolCallMocks.BeforeToolCallBlockedError,
@@ -104,7 +114,10 @@ async function loadFreshAfterToolCallModulesForTest() {
       details: { status: "blocked", deniedReason: "plugin-before-tool-call", reason },
     }),
     consumeAdjustedParamsForToolCall: beforeToolCallMocks.consumeAdjustedParamsForToolCall,
+    consumePreExecutionBlockedToolCall: vi.fn(() => false),
     recordAdjustedParamsForToolCall: beforeToolCallMocks.recordAdjustedParamsForToolCall,
+    recordStructuredReplayTrustForToolCall:
+      beforeToolCallMocks.recordStructuredReplayTrustForToolCall,
     isBeforeToolCallBlockedError: (error: unknown) =>
       error instanceof beforeToolCallMocks.BeforeToolCallBlockedError,
     isToolWrappedWithBeforeToolCallHook: beforeToolCallMocks.isToolWrappedWithBeforeToolCallHook,

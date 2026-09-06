@@ -1,7 +1,7 @@
-import { timestampMsToIsoString } from "openclaw/plugin-sdk/number-runtime";
-
 export function resolveMemoryWikiTimestamp(nowMs?: number): string {
   return (
-    timestampMsToIsoString(nowMs) ?? timestampMsToIsoString(Date.now()) ?? new Date().toISOString()
+    new Date(nowMs ?? Date.now()).toJSON() ??
+    new Date(Date.now()).toJSON() ??
+    new Date().toISOString()
   );
 }

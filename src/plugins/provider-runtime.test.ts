@@ -1,12 +1,18 @@
-import type { AgentMessage } from "openclaw/plugin-sdk/agent-core";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import type { AgentMessage, StreamFn } from "openclaw/plugin-sdk/agent-core";
+/** Exercises provider runtime loading, ordering, and manifest-backed discovery paths. */
+import { createRequireRecord, createZeroUsageFixture } from "openclaw/plugin-sdk/test-fixtures";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { createPluginMetadataSnapshot } from "../config/plugin-auto-enable.test-helpers.js";
 import type { ModelProviderConfig, OpenClawConfig } from "../config/types.js";
+import { captureEnv, deleteTestEnvValue, setTestEnvValue } from "../test-utils/env.js";
 import type { ProviderRuntimeModel } from "./provider-runtime-model.types.js";
 import {
   expectAugmentedCodexCatalog,
   expectCodexMissingAuthHint,
-  expectedAugmentedOpenaiCodexCatalogEntries,
 } from "./provider-runtime.test-support.js";
+import { withPluginRuntimeRegistryScope } from "./runtime/gateway-request-scope.js";
+import { withPluginRuntimeGenerationScope } from "./runtime/generation-scope.js";
 import type {
   AnyAgentTool,
   ProviderExternalAuthProfile,
@@ -16,64 +22,69 @@ import type {
   ProviderValidateReplayTurnsContext,
 } from "./types.js";
 
-type ResolvePluginProviders = typeof import("./providers.runtime.js").resolvePluginProviders;
+type ResolvePluginProviders = typeof import("./providers.runtime.js").resolvePluginProvidersCore;
 type IsPluginProvidersLoadInFlight =
   typeof import("./providers.runtime.js").isPluginProvidersLoadInFlight;
 type ResolveCatalogHookProviderPluginIds =
   typeof import("./providers.js").resolveCatalogHookProviderPluginIds;
-type ResolveExternalAuthProfileCompatFallbackPluginIds =
-  typeof import("./providers.js").resolveExternalAuthProfileCompatFallbackPluginIds;
+type ResolveUsageHookProviderPluginContracts =
+  typeof import("./providers.js").resolveUsageHookProviderPluginContracts;
 type ResolveExternalAuthProfileProviderPluginIds =
   typeof import("./providers.js").resolveExternalAuthProfileProviderPluginIds;
 type ResolveOwningPluginIdsForProvider =
   typeof import("./providers.js").resolveOwningPluginIdsForProvider;
 type ResolveBundledProviderPolicySurface =
   typeof import("./provider-public-artifacts.js").resolveBundledProviderPolicySurface;
+type ResolveProviderPolicySurface =
+  typeof import("./provider-public-artifacts.js").resolveProviderPolicySurface;
 
-const resolvePluginProvidersMock = vi.fn<ResolvePluginProviders>((_) => [] as ProviderPlugin[]);
-const isPluginProvidersLoadInFlightMock = vi.fn<IsPluginProvidersLoadInFlight>((_) => false);
-const resolveCatalogHookProviderPluginIdsMock = vi.fn<ResolveCatalogHookProviderPluginIds>(
-  (_) => [] as string[],
+const resolvePluginProvidersMock = vi.fn<ResolvePluginProviders>(
+  (_params) => [] as ProviderPlugin[],
 );
-const resolveExternalAuthProfileCompatFallbackPluginIdsMock =
-  vi.fn<ResolveExternalAuthProfileCompatFallbackPluginIds>((_) => [] as string[]);
+const isPluginProvidersLoadInFlightMock = vi.fn<IsPluginProvidersLoadInFlight>((_params) => false);
+const resolveCatalogHookProviderPluginIdsMock = vi.fn<ResolveCatalogHookProviderPluginIds>(
+  (_params) => [] as string[],
+);
+const resolveUsageHookProviderPluginContractsMock = vi.fn<ResolveUsageHookProviderPluginContracts>(
+  (_params) => [],
+);
 const resolveExternalAuthProfileProviderPluginIdsMock =
-  vi.fn<ResolveExternalAuthProfileProviderPluginIds>((_) => [] as string[]);
+  vi.fn<ResolveExternalAuthProfileProviderPluginIds>((_params) => [] as string[]);
 const resolveOwningPluginIdsForProviderMock = vi.fn<ResolveOwningPluginIdsForProvider>(
-  (_) => undefined,
+  (_params) => undefined,
 );
 const resolveBundledProviderPolicySurfaceMock = vi.fn<ResolveBundledProviderPolicySurface>(
-  (_) => null,
+  (_providerId) => null,
 );
+const resolveProviderPolicySurfaceMock = vi.fn<ResolveProviderPolicySurface>((_providerId) => null);
 const providerRuntimeWarnMock = vi.fn();
 
+let getAiTransportHost: typeof import("@openclaw/ai").getAiTransportHost;
+let attachModelProviderRuntimePluginHandle: typeof import("./provider-hook-runtime.js").attachModelProviderRuntimePluginHandle;
+let resolveProviderPluginsForHooks: typeof import("./provider-hook-runtime.js").resolveProviderPluginsForHooks;
+let resolveLoadedProviderPluginsForHooks: typeof import("./provider-hook-runtime.js").resolveLoadedProviderPluginsForHooks;
 let augmentModelCatalogWithProviderPlugins: typeof import("./provider-runtime.js").augmentModelCatalogWithProviderPlugins;
 let buildProviderAuthDoctorHintWithPlugin: typeof import("./provider-runtime.js").buildProviderAuthDoctorHintWithPlugin;
 let buildProviderMissingAuthMessageWithPlugin: typeof import("./provider-runtime.js").buildProviderMissingAuthMessageWithPlugin;
 let buildProviderUnknownModelHintWithPlugin: typeof import("./provider-runtime.js").buildProviderUnknownModelHintWithPlugin;
-let applyProviderNativeStreamingUsageCompatWithPlugin: typeof import("./provider-runtime.js").applyProviderNativeStreamingUsageCompatWithPlugin;
-let applyProviderConfigDefaultsWithPlugin: typeof import("./provider-runtime.js").applyProviderConfigDefaultsWithPlugin;
 let formatProviderAuthProfileApiKeyWithPlugin: typeof import("./provider-runtime.js").formatProviderAuthProfileApiKeyWithPlugin;
-let classifyProviderFailoverReasonWithPlugin: typeof import("./provider-runtime.js").classifyProviderFailoverReasonWithPlugin;
-let matchesProviderContextOverflowWithPlugin: typeof import("./provider-runtime.js").matchesProviderContextOverflowWithPlugin;
+let loginProviderOAuthWithPlugin: typeof import("./provider-runtime.js").loginProviderOAuthWithPlugin;
+let classifyProviderFailoverSignalWithPlugin: typeof import("./provider-runtime.js").classifyProviderFailoverSignalWithPlugin;
 let normalizeProviderConfigWithPlugin: typeof import("./provider-runtime.js").normalizeProviderConfigWithPlugin;
 let normalizeProviderModelIdWithPlugin: typeof import("./provider-runtime.js").normalizeProviderModelIdWithPlugin;
 let applyProviderResolvedTransportWithPlugin: typeof import("./provider-runtime.js").applyProviderResolvedTransportWithPlugin;
 let normalizeProviderTransportWithPlugin: typeof import("./provider-runtime.js").normalizeProviderTransportWithPlugin;
-let prepareProviderExtraParams: typeof import("./provider-runtime.js").prepareProviderExtraParams;
+let resolvePreparedExtraParams: typeof import("../agents/embedded-agent-runner/extra-params.js").resolvePreparedExtraParams;
+let applyExtraParamsToAgent: typeof import("../agents/embedded-agent-runner/extra-params.js").applyExtraParamsToAgent;
 let resolveProviderAuthProfileId: typeof import("./provider-runtime.js").resolveProviderAuthProfileId;
 let resolveProviderConfigApiKeyWithPlugin: typeof import("./provider-runtime.js").resolveProviderConfigApiKeyWithPlugin;
-let resolveProviderExtraParamsForTransport: typeof import("./provider-runtime.js").resolveProviderExtraParamsForTransport;
 let resolveProviderFollowupFallbackRoute: typeof import("./provider-runtime.js").resolveProviderFollowupFallbackRoute;
 let resolveProviderStreamFn: typeof import("./provider-runtime.js").resolveProviderStreamFn;
+let resolveProviderTransportTurnStateWithPlugin: typeof import("./provider-runtime.js").resolveProviderTransportTurnStateWithPlugin;
 let resolveProviderCacheTtlEligibility: typeof import("./provider-runtime.js").resolveProviderCacheTtlEligibility;
-let resolveProviderBinaryThinking: typeof import("./provider-runtime.js").resolveProviderBinaryThinking;
-let createProviderEmbeddingProvider: typeof import("./provider-runtime.js").createProviderEmbeddingProvider;
-let resolveProviderThinkingProfile: typeof import("./provider-runtime.js").resolveProviderThinkingProfile;
-let resolveProviderDefaultThinkingLevel: typeof import("./provider-runtime.js").resolveProviderDefaultThinkingLevel;
 let resolveProviderModernModelRef: typeof import("./provider-runtime.js").resolveProviderModernModelRef;
+let resolveProviderDeprecatedAuthProfileIds: typeof import("./provider-runtime.js").resolveProviderDeprecatedAuthProfileIds;
 let resolveProviderReasoningOutputModeWithPlugin: typeof import("./provider-runtime.js").resolveProviderReasoningOutputModeWithPlugin;
-let resolveProviderReplayPolicyWithPlugin: typeof import("./provider-runtime.js").resolveProviderReplayPolicyWithPlugin;
 let resolveProviderSystemPromptContribution: typeof import("./provider-runtime.js").resolveProviderSystemPromptContribution;
 let resolveExternalAuthProfilesWithPlugins: typeof import("./provider-runtime.js").resolveExternalAuthProfilesWithPlugins;
 let resolveProviderSyntheticAuthWithPlugin: typeof import("./provider-runtime.js").resolveProviderSyntheticAuthWithPlugin;
@@ -81,19 +92,19 @@ let shouldDeferProviderSyntheticProfileAuthWithPlugin: typeof import("./provider
 let sanitizeProviderReplayHistoryWithPlugin: typeof import("./provider-runtime.js").sanitizeProviderReplayHistoryWithPlugin;
 let resolveProviderUsageSnapshotWithPlugin: typeof import("./provider-runtime.js").resolveProviderUsageSnapshotWithPlugin;
 let resolveProviderUsageAuthWithPlugin: typeof import("./provider-runtime.js").resolveProviderUsageAuthWithPlugin;
-let resolveProviderXHighThinking: typeof import("./provider-runtime.js").resolveProviderXHighThinking;
 let normalizeProviderToolSchemasWithPlugin: typeof import("./provider-runtime.js").normalizeProviderToolSchemasWithPlugin;
 let inspectProviderToolSchemasWithPlugin: typeof import("./provider-runtime.js").inspectProviderToolSchemasWithPlugin;
+let listProviderUsagePluginDescriptors: typeof import("./provider-runtime.js").listProviderUsagePluginDescriptors;
 let normalizeProviderResolvedModelWithPlugin: typeof import("./provider-runtime.js").normalizeProviderResolvedModelWithPlugin;
 let prepareProviderDynamicModel: typeof import("./provider-runtime.js").prepareProviderDynamicModel;
 let prepareProviderRuntimeAuth: typeof import("./provider-runtime.js").prepareProviderRuntimeAuth;
 let refreshProviderOAuthCredentialWithPlugin: typeof import("./provider-runtime.js").refreshProviderOAuthCredentialWithPlugin;
+let resolveProviderOAuthCredentialWithPlugin: typeof import("./provider-runtime.js").resolveProviderOAuthCredentialWithPlugin;
 let resolveProviderRuntimePlugin: typeof import("./provider-runtime.js").resolveProviderRuntimePlugin;
-let providerRuntimeTesting: typeof import("./provider-runtime.js").testing;
 let runProviderDynamicModel: typeof import("./provider-runtime.js").runProviderDynamicModel;
 let validateProviderReplayTurnsWithPlugin: typeof import("./provider-runtime.js").validateProviderReplayTurnsWithPlugin;
-let wrapProviderStreamFn: typeof import("./provider-runtime.js").wrapProviderStreamFn;
-let createEmptyPluginRegistry: typeof import("./registry.js").createEmptyPluginRegistry;
+let wrapProviderSimpleCompletionStreamFn: typeof import("./provider-runtime.js").wrapProviderSimpleCompletionStreamFn;
+let createEmptyPluginRegistry: typeof import("./registry-empty.js").createEmptyPluginRegistry;
 let resetPluginRuntimeStateForTest: typeof import("./runtime.js").resetPluginRuntimeStateForTest;
 let setActivePluginRegistry: typeof import("./runtime.js").setActivePluginRegistry;
 
@@ -118,14 +129,7 @@ const DEMO_SANITIZED_MESSAGE: AgentMessage = {
   api: MODEL.api,
   provider: MODEL.provider,
   model: MODEL.id,
-  usage: {
-    input: 0,
-    output: 0,
-    cacheRead: 0,
-    cacheWrite: 0,
-    totalTokens: 0,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-  },
+  usage: createZeroUsageFixture(),
   stopReason: "stop",
   timestamp: 2,
 };
@@ -154,27 +158,10 @@ function createOpenAiCatalogProviderPlugin(
   };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!isRecord(value)) {
-    throw new Error(`Expected ${label} to be an object`);
-  }
-  return value;
-}
+const requireRecord = createRequireRecord("record", "expected-label-object-capitalized");
 
 function firstMockArg(mock: { mock: { calls: unknown[][] } }): unknown {
   return mock.mock.calls[0]?.[0];
-}
-
-function firstMockStringArg(mock: { mock: { calls: unknown[][] } }, label: string): string {
-  const value = firstMockArg(mock);
-  if (typeof value !== "string") {
-    throw new Error(`Expected ${label} to be a string`);
-  }
-  return value;
 }
 
 function expectRecordFields(record: Record<string, unknown>, fields: Record<string, unknown>) {
@@ -202,7 +189,6 @@ function expectProviderRuntimePluginLoad(params: { provider: string; expectedPlu
   expect(plugin?.id).toBe(params.expectedPluginId);
   expectRecordFields(getLastResolvePluginProvidersParams(), {
     providerRefs: [params.provider],
-    bundledProviderVitestCompat: true,
   });
 }
 
@@ -238,6 +224,16 @@ function expectCalledOnce(...mocks: Array<{ mock: { calls: unknown[] } }>) {
   for (const mockFn of mocks) {
     expect(mockFn).toHaveBeenCalledTimes(1);
   }
+}
+
+function registerLoadedProviders(providers: ProviderPlugin[]) {
+  const registry = createEmptyPluginRegistry();
+  registry.providers = providers.map((provider) => ({
+    pluginId: provider.id,
+    provider,
+    source: "test",
+  }));
+  setActivePluginRegistry(registry);
 }
 
 function expectResolvedValues(
@@ -281,23 +277,30 @@ describe("provider-runtime", () => {
   beforeAll(async () => {
     vi.resetModules();
     vi.doMock("./provider-public-artifacts.js", () => ({
-      resolveBundledProviderPolicySurface: (provider: string) =>
-        resolveBundledProviderPolicySurfaceMock(provider),
+      resolveBundledProviderPolicySurface: (
+        ...args: Parameters<ResolveBundledProviderPolicySurface>
+      ) => resolveBundledProviderPolicySurfaceMock(...args),
+      resolveProviderPolicySurface: (...args: Parameters<ResolveProviderPolicySurface>) =>
+        resolveProviderPolicySurfaceMock(...args),
     }));
     vi.doMock("./providers.js", () => ({
       resolveCatalogHookProviderPluginIds: (params: unknown) =>
         resolveCatalogHookProviderPluginIdsMock(params as never),
-      resolveExternalAuthProfileCompatFallbackPluginIds: (params: unknown) =>
-        resolveExternalAuthProfileCompatFallbackPluginIdsMock(params as never),
+      resolveUsageHookProviderPluginContracts: (params: unknown) =>
+        resolveUsageHookProviderPluginContractsMock(params as never),
       resolveExternalAuthProfileProviderPluginIds: (params: unknown) =>
         resolveExternalAuthProfileProviderPluginIdsMock(params as never),
       resolveOwningPluginIdsForProvider: (params: unknown) =>
         resolveOwningPluginIdsForProviderMock(params as never),
       resolveOwningPluginIdsForProviderRef: (params: unknown) =>
         resolveOwningPluginIdsForProviderMock(params as never),
+      resolveProviderRefOwnership: (params: unknown) => {
+        const pluginIds = resolveOwningPluginIdsForProviderMock(params as never);
+        return pluginIds?.length ? { status: "owned", pluginIds } : { status: "unowned" };
+      },
     }));
     vi.doMock("./providers.runtime.js", () => ({
-      resolvePluginProviders: (params: unknown) => resolvePluginProvidersMock(params as never),
+      resolvePluginProvidersCore: (params: unknown) => resolvePluginProvidersMock(params as never),
       isPluginProvidersLoadInFlight: (params: unknown) =>
         isPluginProvidersLoadInFlightMock(params as never),
     }));
@@ -314,29 +317,22 @@ describe("provider-runtime", () => {
       buildProviderAuthDoctorHintWithPlugin,
       buildProviderMissingAuthMessageWithPlugin,
       buildProviderUnknownModelHintWithPlugin,
-      applyProviderNativeStreamingUsageCompatWithPlugin,
-      applyProviderConfigDefaultsWithPlugin,
       applyProviderResolvedTransportWithPlugin,
-      classifyProviderFailoverReasonWithPlugin,
+      classifyProviderFailoverSignalWithPlugin,
       formatProviderAuthProfileApiKeyWithPlugin,
-      matchesProviderContextOverflowWithPlugin,
+      loginProviderOAuthWithPlugin,
       normalizeProviderConfigWithPlugin,
       normalizeProviderModelIdWithPlugin,
       normalizeProviderTransportWithPlugin,
-      prepareProviderExtraParams,
       resolveProviderAuthProfileId,
       resolveProviderConfigApiKeyWithPlugin,
-      resolveProviderExtraParamsForTransport,
       resolveProviderFollowupFallbackRoute,
       resolveProviderStreamFn,
+      resolveProviderTransportTurnStateWithPlugin,
       resolveProviderCacheTtlEligibility,
-      resolveProviderBinaryThinking,
-      createProviderEmbeddingProvider,
-      resolveProviderThinkingProfile,
-      resolveProviderDefaultThinkingLevel,
       resolveProviderModernModelRef,
+      resolveProviderDeprecatedAuthProfileIds,
       resolveProviderReasoningOutputModeWithPlugin,
-      resolveProviderReplayPolicyWithPlugin,
       resolveProviderSystemPromptContribution,
       resolveExternalAuthProfilesWithPlugins,
       resolveProviderSyntheticAuthWithPlugin,
@@ -344,41 +340,50 @@ describe("provider-runtime", () => {
       sanitizeProviderReplayHistoryWithPlugin,
       resolveProviderUsageSnapshotWithPlugin,
       resolveProviderUsageAuthWithPlugin,
-      resolveProviderXHighThinking,
       normalizeProviderToolSchemasWithPlugin,
       inspectProviderToolSchemasWithPlugin,
+      listProviderUsagePluginDescriptors,
       normalizeProviderResolvedModelWithPlugin,
       prepareProviderDynamicModel,
       prepareProviderRuntimeAuth,
       refreshProviderOAuthCredentialWithPlugin,
+      resolveProviderOAuthCredentialWithPlugin,
       resolveProviderRuntimePlugin,
-      testing: providerRuntimeTesting,
       runProviderDynamicModel,
       validateProviderReplayTurnsWithPlugin,
-      wrapProviderStreamFn,
+      wrapProviderSimpleCompletionStreamFn,
     } = await import("./provider-runtime.js"));
-    ({ createEmptyPluginRegistry } = await import("./registry.js"));
+    ({ resolvePreparedExtraParams, applyExtraParamsToAgent } =
+      await import("../agents/embedded-agent-runner/extra-params.js"));
+    ({
+      attachModelProviderRuntimePluginHandle,
+      resolveProviderPluginsForHooks,
+      resolveLoadedProviderPluginsForHooks,
+    } = await import("./provider-hook-runtime.js"));
+    await import("../agents/ai-transport-runtime-host.js");
+    ({ getAiTransportHost } = await import("@openclaw/ai"));
+    ({ createEmptyPluginRegistry } = await import("./registry-empty.js"));
     ({ resetPluginRuntimeStateForTest, setActivePluginRegistry } = await import("./runtime.js"));
   });
 
   beforeEach(() => {
     resetPluginRuntimeStateForTest();
-    providerRuntimeTesting.clearProviderRuntimePluginCacheForTest();
-    providerRuntimeTesting.resetExternalAuthFallbackWarningCacheForTest();
     resolvePluginProvidersMock.mockReset();
     resolvePluginProvidersMock.mockReturnValue([]);
     isPluginProvidersLoadInFlightMock.mockReset();
     isPluginProvidersLoadInFlightMock.mockReturnValue(false);
     resolveCatalogHookProviderPluginIdsMock.mockReset();
     resolveCatalogHookProviderPluginIdsMock.mockReturnValue([]);
-    resolveExternalAuthProfileCompatFallbackPluginIdsMock.mockReset();
-    resolveExternalAuthProfileCompatFallbackPluginIdsMock.mockReturnValue([]);
+    resolveUsageHookProviderPluginContractsMock.mockReset();
+    resolveUsageHookProviderPluginContractsMock.mockReturnValue([]);
     resolveExternalAuthProfileProviderPluginIdsMock.mockReset();
     resolveExternalAuthProfileProviderPluginIdsMock.mockReturnValue([]);
     resolveOwningPluginIdsForProviderMock.mockReset();
     resolveOwningPluginIdsForProviderMock.mockReturnValue(undefined);
     resolveBundledProviderPolicySurfaceMock.mockReset();
     resolveBundledProviderPolicySurfaceMock.mockReturnValue(null);
+    resolveProviderPolicySurfaceMock.mockReset();
+    resolveProviderPolicySurfaceMock.mockReturnValue(null);
     providerRuntimeWarnMock.mockReset();
   });
 
@@ -396,6 +401,108 @@ describe("provider-runtime", () => {
       provider: "Open Router",
       expectedPluginId: "openrouter",
     });
+  });
+
+  it("dispatches session OAuth operations to the owning provider", async () => {
+    const loginOAuth = vi.fn(async () => ({
+      access: "login-access",
+      refresh: "login-refresh",
+      expires: 123,
+    }));
+    const refreshOAuth = vi.fn(async (credential) => ({
+      ...credential,
+      access: "refreshed-access",
+    }));
+    resolvePluginProvidersMock.mockReturnValue([
+      {
+        id: "plugin-oauth",
+        label: "Plugin OAuth",
+        auth: [],
+        loginOAuth,
+        refreshOAuth,
+        formatApiKey: (credential) =>
+          credential.type === "oauth" ? `formatted:${credential.access}` : "",
+      },
+    ]);
+
+    await expect(
+      loginProviderOAuthWithPlugin({
+        provider: "plugin-oauth",
+        context: { onAuth: vi.fn(), onPrompt: vi.fn(async () => "") },
+      }),
+    ).resolves.toMatchObject({
+      status: "available",
+      credentials: { access: "login-access", refresh: "login-refresh" },
+    });
+    await expect(
+      resolveProviderOAuthCredentialWithPlugin({
+        provider: "plugin-oauth",
+        credential: {
+          type: "oauth",
+          provider: "plugin-oauth",
+          access: "old-access",
+          refresh: "refresh",
+          expires: 1,
+        },
+        refresh: true,
+      }),
+    ).resolves.toMatchObject({
+      status: "available",
+      apiKey: "formatted:refreshed-access",
+      credential: { access: "refreshed-access" },
+    });
+    expect(loginOAuth).toHaveBeenCalledOnce();
+    expect(refreshOAuth).toHaveBeenCalledOnce();
+  });
+
+  it("distinguishes an owned but unavailable OAuth provider", async () => {
+    resolveOwningPluginIdsForProviderMock.mockReturnValue(["plugin-oauth"]);
+    resolvePluginProvidersMock.mockReturnValue([]);
+
+    await expect(
+      loginProviderOAuthWithPlugin({
+        provider: "plugin-oauth",
+        context: { onAuth: vi.fn(), onPrompt: vi.fn(async () => "") },
+      }),
+    ).resolves.toEqual({ status: "configured-unavailable" });
+    await expect(
+      resolveProviderOAuthCredentialWithPlugin({
+        provider: "plugin-oauth",
+        credential: {
+          type: "oauth",
+          provider: "plugin-oauth",
+          access: "old-access",
+          refresh: "refresh",
+          expires: 1,
+        },
+        refresh: true,
+      }),
+    ).resolves.toEqual({ status: "configured-unavailable" });
+  });
+
+  it("auto-discovers only usage providers declared by their owning plugin", () => {
+    resolveUsageHookProviderPluginContractsMock.mockReturnValue([
+      { pluginId: "multi-provider", providerIds: ["declared"] },
+    ]);
+    const usageHooks = {
+      auth: [],
+      resolveUsageAuth: vi.fn(async () => ({ token: "usage-token" })),
+      fetchUsageSnapshot: vi.fn(async () => ({
+        provider: "declared",
+        displayName: "Declared",
+        windows: [],
+      })),
+    };
+    resolvePluginProvidersMock.mockReturnValue([
+      { ...usageHooks, id: "declared", label: "Declared" },
+      { ...usageHooks, id: "undeclared", label: "Undeclared" },
+    ]);
+
+    expect(listProviderUsagePluginDescriptors({ env: process.env })).toEqual([
+      { provider: "declared", displayName: "declared" },
+    ]);
+    // Manifest contracts answer discovery; descriptor listing must not load plugin runtime.
+    expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
   });
 
   it("matches providers by hook alias for runtime hook lookup", () => {
@@ -505,6 +612,7 @@ describe("provider-runtime", () => {
       id: DEMO_PROVIDER_ID,
       label: "Demo",
       auth: [],
+      classifyFailoverReason: () => "billing",
       prepareExtraParams: ({ extraParams }) => ({
         ...extraParams,
         fromActiveRegistry: true,
@@ -519,16 +627,95 @@ describe("provider-runtime", () => {
     setActivePluginRegistry(registry, "startup-registry", "gateway-bindable", "/tmp/workspace");
 
     expect(
-      prepareProviderExtraParams({
+      resolvePreparedExtraParams({
+        cfg: undefined,
         provider: DEMO_PROVIDER_ID,
+        modelId: MODEL.id,
         workspaceDir: "/tmp/workspace",
-        context: createDemoRuntimeContext({
-          extraParams: {},
-        }),
       }),
     ).toEqual({
       fromActiveRegistry: true,
     });
+    expect(
+      classifyProviderFailoverSignalWithPlugin({
+        provider: DEMO_PROVIDER_ID,
+        workspaceDir: "/tmp/workspace",
+        context: { provider: DEMO_PROVIDER_ID, status: 403, errorMessage: "fixture refusal" },
+      }),
+    ).toBe("billing");
+    expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
+  });
+
+  it("does not activate provider runtime to inspect retired auth profiles", () => {
+    resolvePluginProvidersMock.mockReturnValue([
+      {
+        id: DEMO_PROVIDER_ID,
+        label: "Demo",
+        auth: [],
+        deprecatedProfileIds: ["demo:retired"],
+      },
+    ]);
+
+    expect(resolveProviderDeprecatedAuthProfileIds({ provider: DEMO_PROVIDER_ID })).toEqual([]);
+    expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
+  });
+
+  it("honors retired auth profiles declared by an active provider", () => {
+    const provider: ProviderPlugin = {
+      id: DEMO_PROVIDER_ID,
+      label: "Demo",
+      auth: [],
+      deprecatedProfileIds: ["demo:retired"],
+    };
+    const registry = createEmptyPluginRegistry();
+    registry.providers.push({ pluginId: DEMO_PROVIDER_ID, provider, source: "test" });
+    setActivePluginRegistry(registry, "startup-registry", "gateway-bindable", "/tmp/workspace");
+
+    expect(
+      resolveProviderDeprecatedAuthProfileIds({
+        provider: DEMO_PROVIDER_ID,
+        workspaceDir: "/tmp/workspace",
+      }),
+    ).toEqual(["demo:retired"]);
+    expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
+  });
+
+  it("uses the prepared run registry without repeating provider discovery", () => {
+    const provider: ProviderPlugin = {
+      id: DEMO_PROVIDER_ID,
+      pluginId: "embedded-owner",
+      label: "Prepared demo",
+      auth: [],
+      classifyFailoverReason: () => "overloaded",
+    };
+    const registry = createEmptyPluginRegistry();
+    registry.providers.push({
+      pluginId: "registered-owner",
+      provider,
+      source: "test",
+    });
+
+    const resolved = withPluginRuntimeRegistryScope(registry, () =>
+      resolveProviderRuntimePlugin({
+        provider: DEMO_PROVIDER_ID,
+        workspaceDir: "/tmp/prepared-workspace",
+      }),
+    );
+
+    expect(
+      withPluginRuntimeRegistryScope(registry, () =>
+        classifyProviderFailoverSignalWithPlugin({
+          provider: DEMO_PROVIDER_ID,
+          workspaceDir: "/tmp/prepared-workspace",
+          context: { provider: DEMO_PROVIDER_ID, status: 403, errorMessage: "fixture refusal" },
+        }),
+      ),
+    ).toBe("overloaded");
+    expect(resolved?.id).toBe(DEMO_PROVIDER_ID);
+    expect(resolved?.pluginId).toBe("registered-owner");
+    expect(resolved).not.toBe(provider);
+    expect(resolved?.auth).toBe(provider.auth);
+    expect(resolved?.classifyFailoverReason).toBe(provider.classifyFailoverReason);
     expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
   });
 
@@ -596,12 +783,188 @@ describe("provider-runtime", () => {
     expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
   });
 
+  it("installs provider stream hooks into the AI transport host", () => {
+    const streamFn = vi.fn();
+    const createStreamFn = vi.fn(() => streamFn);
+    const provider: ProviderPlugin = {
+      id: DEMO_PROVIDER_ID,
+      label: "Demo",
+      auth: [],
+      createStreamFn,
+    };
+    const registry = createEmptyPluginRegistry();
+    registry.providers.push({
+      pluginId: DEMO_PROVIDER_ID,
+      provider,
+      source: "test",
+    });
+    setActivePluginRegistry(registry, "startup-registry", "gateway-bindable", "/tmp/workspace");
+
+    expect(
+      getAiTransportHost().plugin.resolveProviderStream({
+        provider: DEMO_PROVIDER_ID,
+        workspaceDir: "/tmp/workspace",
+        allowRuntimePluginLoad: false,
+        context: createDemoResolvedModelContext({}),
+      }),
+    ).toBe(streamFn);
+    expect(createStreamFn).toHaveBeenCalledOnce();
+    expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
+  });
+
   it("does not load runtime plugins for stream hooks when loading is disabled", () => {
     expect(
       resolveProviderStreamFn({
         provider: DEMO_PROVIDER_ID,
         allowRuntimePluginLoad: false,
         context: createDemoResolvedModelContext({}),
+      }),
+    ).toBeUndefined();
+    expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
+  });
+
+  it("adapts loaded legacy websocket policy without loading runtime plugins", () => {
+    const resolveTransportTurnState = vi.fn(() => ({
+      headers: { "x-demo-turn": "turn-1" },
+      websocket: { degradeCooldownMs: 5_000 },
+    }));
+    const resolveWebSocketSessionPolicy = vi.fn(() => ({
+      headers: { "x-demo-session": "session-1" },
+      degradeCooldownMs: 60_000,
+    }));
+    const provider: ProviderPlugin = {
+      id: DEMO_PROVIDER_ID,
+      label: "Demo",
+      auth: [],
+      resolveTransportTurnState,
+      resolveWebSocketSessionPolicy,
+    };
+    const registry = createEmptyPluginRegistry();
+    registry.providers.push({
+      pluginId: DEMO_PROVIDER_ID,
+      provider,
+      source: "test",
+    });
+    setActivePluginRegistry(registry, "startup-registry", "gateway-bindable", "/tmp/workspace");
+
+    expect(
+      resolveProviderTransportTurnStateWithPlugin({
+        provider: DEMO_PROVIDER_ID,
+        workspaceDir: "/tmp/workspace",
+        allowRuntimePluginLoad: false,
+        context: {
+          provider: DEMO_PROVIDER_ID,
+          modelId: MODEL.id,
+          model: MODEL,
+          sessionId: "session-1",
+          turnId: "turn-1",
+          attempt: 1,
+          transport: "websocket",
+        },
+      }),
+    ).toEqual({
+      headers: { "x-demo-turn": "turn-1" },
+      websocket: {
+        headers: { "x-demo-session": "session-1" },
+        degradeCooldownMs: 5_000,
+      },
+    });
+    expect(resolveTransportTurnState).toHaveBeenCalledOnce();
+    expect(resolveWebSocketSessionPolicy).toHaveBeenCalledOnce();
+    expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
+  });
+
+  it("reuses the attempt-prepared provider handle at the model transport boundary", () => {
+    const streamFn = vi.fn();
+    const createStreamFn = vi.fn(() => streamFn);
+    const wrapSimpleCompletionStreamFn = vi.fn(() => streamFn);
+    const resolveTransportTurnState = vi.fn(() => ({
+      headers: { "x-demo-turn": "turn-1" },
+    }));
+    const provider: ProviderPlugin = {
+      id: DEMO_PROVIDER_ID,
+      label: "Demo",
+      auth: [],
+      resolveTransportTurnState,
+      createStreamFn,
+      wrapSimpleCompletionStreamFn,
+    };
+    const model = attachModelProviderRuntimePluginHandle(MODEL, {
+      provider: DEMO_PROVIDER_ID,
+      modelId: MODEL.id,
+      workspaceDir: "/tmp/workspace",
+      plugin: provider,
+    });
+
+    expect(
+      getAiTransportHost().plugin.resolveTransportTurnState({
+        provider: DEMO_PROVIDER_ID,
+        modelId: MODEL.id,
+        allowRuntimePluginLoad: true,
+        context: {
+          provider: DEMO_PROVIDER_ID,
+          modelId: MODEL.id,
+          model,
+          sessionId: "session-1",
+          turnId: "turn-1",
+          attempt: 1,
+          transport: "stream",
+        },
+      }),
+    ).toEqual({ headers: { "x-demo-turn": "turn-1" } });
+    expect(resolveTransportTurnState).toHaveBeenCalledOnce();
+    expect(
+      getAiTransportHost().plugin.resolveProviderStream({
+        provider: DEMO_PROVIDER_ID,
+        allowRuntimePluginLoad: true,
+        context: createDemoResolvedModelContext({ model }),
+      }),
+    ).toBe(streamFn);
+    expect(
+      getAiTransportHost().plugin.wrapSimpleCompletionStream({
+        provider: DEMO_PROVIDER_ID,
+        context: createDemoResolvedModelContext({ model, streamFn }),
+      }),
+    ).toBe(streamFn);
+    expect(createStreamFn).toHaveBeenCalledOnce();
+    expect(wrapSimpleCompletionStreamFn).toHaveBeenCalledOnce();
+    expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
+    expect(isPluginProvidersLoadInFlightMock).not.toHaveBeenCalled();
+  });
+
+  it("honors an explicit transport fallback owner over the model's attached handle", () => {
+    const streamFn = vi.fn();
+    registerLoadedProviders([
+      { id: "fallback", label: "Fallback", auth: [], createStreamFn: () => streamFn },
+    ]);
+    const model = attachModelProviderRuntimePluginHandle(MODEL, {
+      provider: DEMO_PROVIDER_ID,
+      modelId: MODEL.id,
+      plugin: { id: DEMO_PROVIDER_ID, label: "Demo", auth: [] },
+    });
+    expect(
+      getAiTransportHost().plugin.resolveProviderStream({
+        provider: "fallback",
+        allowRuntimePluginLoad: false,
+        context: createDemoResolvedModelContext({ model }),
+      }),
+    ).toBe(streamFn);
+    expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
+  });
+
+  it("does not load runtime plugins for transport turn-state hooks when loading is disabled", () => {
+    expect(
+      resolveProviderTransportTurnStateWithPlugin({
+        provider: DEMO_PROVIDER_ID,
+        allowRuntimePluginLoad: false,
+        context: {
+          provider: DEMO_PROVIDER_ID,
+          modelId: MODEL.id,
+          model: MODEL,
+          turnId: "turn-1",
+          attempt: 1,
+          transport: "stream",
+        },
       }),
     ).toBeUndefined();
     expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
@@ -660,7 +1023,7 @@ describe("provider-runtime", () => {
       plugins: {
         entries: {
           demo: { enabled: true, config: { endpoint: "https://demo.example" } },
-          "active-memory": { enabled: true, config: { qmd: { searchMode: "fast" } } },
+          "active-memory": { enabled: true, config: { queryMode: "recent" } },
         },
       },
     } as OpenClawConfig;
@@ -675,6 +1038,89 @@ describe("provider-runtime", () => {
     expect(resolvePluginProvidersMock).toHaveBeenCalledTimes(2);
   });
 
+  it.each(["config", "default"] as const)(
+    "uses refreshed same-id metadata after %s runtime invalidation",
+    async (cacheOwner) => {
+      const config: OpenClawConfig | undefined = cacheOwner === "config" ? {} : undefined;
+      setActivePluginRegistry(
+        createEmptyPluginRegistry(),
+        "metadata-owner",
+        "default",
+        "/tmp/work",
+      );
+      const metadata = (source: string) =>
+        createPluginMetadataSnapshot({
+          config,
+          manifestRegistry: {
+            plugins: [
+              {
+                id: "same-provider-owner",
+                providers: [DEMO_PROVIDER_ID],
+                channels: [],
+                cliBackends: [],
+                skills: [],
+                hooks: [],
+                origin: "config",
+                rootDir: `/plugins/${source}`,
+                source: `/plugins/${source}/index.js`,
+                manifestPath: `/plugins/${source}/openclaw.plugin.json`,
+              },
+            ],
+            diagnostics: [],
+          },
+        });
+      const firstMetadata = metadata("first");
+      const currentMetadata = metadata("current");
+      const provider = (owner: string): ProviderPlugin => ({
+        id: DEMO_PROVIDER_ID,
+        label: owner,
+        auth: [],
+        resolveAuthProfileId: (context) => `${owner}/${context.preferredProfileId}`,
+      });
+      const firstProvider = provider("first");
+      const currentProvider = provider("current");
+      resolvePluginProvidersMock.mockImplementation((params) =>
+        params.pluginMetadataSnapshot === firstMetadata ? [firstProvider] : [currentProvider],
+      );
+      const context = {
+        provider: DEMO_PROVIDER_ID,
+        modelId: MODEL.id,
+        preferredProfileId: "first-profile",
+        profileOrder: [],
+        authStore: { version: 1 as const, profiles: {} },
+      };
+      const first = resolveProviderRuntimePlugin({
+        provider: DEMO_PROVIDER_ID,
+        config,
+        pluginMetadataSnapshot: firstMetadata,
+      });
+      expect(first?.resolveAuthProfileId?.(context)).toBe("first/first-profile");
+      const { invalidatePluginRuntimeDiscoveryAfterConfigMutation } =
+        await import("./registry-refresh.js");
+      const warnings: string[] = [];
+      await invalidatePluginRuntimeDiscoveryAfterConfigMutation({
+        logger: { warn: (message) => warnings.push(message) },
+      });
+      expect(warnings).toEqual([]);
+      const current = resolveProviderRuntimePlugin({
+        provider: DEMO_PROVIDER_ID,
+        config,
+        pluginMetadataSnapshot: currentMetadata,
+      });
+      expect(
+        current?.resolveAuthProfileId?.({ ...context, preferredProfileId: "current-profile" }),
+      ).toBe("current/current-profile");
+      // The already-prepared handle owns its selected plugin, while credential inputs stay per-call.
+      expect(
+        resolveProviderAuthProfileId({
+          provider: DEMO_PROVIDER_ID,
+          runtimeHandle: { provider: DEMO_PROVIDER_ID, plugin: first },
+          context: { ...context, preferredProfileId: "current-profile" },
+        }),
+      ).toBe("first/current-profile");
+    },
+  );
+
   it("does not reuse runtime provider cache entries across env-resolved plugin roots", () => {
     const firstProvider: ProviderPlugin = {
       id: DEMO_PROVIDER_ID,
@@ -687,32 +1133,22 @@ describe("provider-runtime", () => {
       auth: [],
     };
     const config = {} as OpenClawConfig;
-    const originalHome = process.env.HOME;
-    const originalOpenClawHome = process.env.OPENCLAW_HOME;
+    const envSnapshot = captureEnv(["HOME", "OPENCLAW_HOME"]);
     try {
-      process.env.HOME = "/home/one";
-      delete process.env.OPENCLAW_HOME;
+      setTestEnvValue("HOME", "/home/one");
+      deleteTestEnvValue("OPENCLAW_HOME");
       resolvePluginProvidersMock.mockReturnValueOnce([firstProvider]);
       expect(resolveProviderRuntimePlugin({ provider: DEMO_PROVIDER_ID, config })).toBe(
         firstProvider,
       );
 
-      process.env.HOME = "/home/two";
+      setTestEnvValue("HOME", "/home/two");
       resolvePluginProvidersMock.mockReturnValueOnce([secondProvider]);
       expect(resolveProviderRuntimePlugin({ provider: DEMO_PROVIDER_ID, config })).toBe(
         secondProvider,
       );
     } finally {
-      if (originalHome === undefined) {
-        delete process.env.HOME;
-      } else {
-        process.env.HOME = originalHome;
-      }
-      if (originalOpenClawHome === undefined) {
-        delete process.env.OPENCLAW_HOME;
-      } else {
-        process.env.OPENCLAW_HOME = originalOpenClawHome;
-      }
+      envSnapshot.restore();
     }
 
     expect(resolvePluginProvidersMock).toHaveBeenCalledTimes(2);
@@ -758,6 +1194,87 @@ describe("provider-runtime", () => {
 
     expect(resolvePluginProvidersMock).toHaveBeenCalledTimes(2);
   });
+
+  it("serves hook plugin lists from the active loaded registry without a scoped load", () => {
+    const provider: ProviderPlugin = {
+      id: DEMO_PROVIDER_ID,
+      pluginId: "embedded-owner",
+      aliases: ["demo-alias"],
+      label: "Demo",
+      auth: [],
+    };
+    const registry = createEmptyPluginRegistry();
+    registry.plugins.push({ id: "demo-plugin", status: "loaded" } as never);
+    registry.providers.push(
+      { pluginId: "other-plugin", provider, source: "other-plugin/index.js" },
+      { pluginId: "demo-plugin", provider, source: "demo-plugin/index.js" },
+    );
+    setActivePluginRegistry(registry, "workspace-one", "default", "/tmp/work");
+
+    const plugins = resolveProviderPluginsForHooks({
+      onlyPluginIds: ["demo-plugin"],
+      providerRefs: ["demo-alias"],
+    });
+
+    expect(plugins.map((plugin) => plugin.id)).toEqual([DEMO_PROVIDER_ID]);
+    expect(plugins[0]?.pluginId).toBe("demo-plugin");
+    expect(plugins[0]).not.toBe(provider);
+    expect(plugins[0]?.auth).toBe(provider.auth);
+    expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["matching", "filtered", "missing-owner"] as const)(
+    "uses the correct hook owner with a %s request registry",
+    (scope) => {
+      const active = createEmptyPluginRegistry();
+      const scoped = createEmptyPluginRegistry();
+      for (const [registry, label] of [
+        [active, "active"],
+        [scoped, "scoped"],
+      ] as const) {
+        registry.plugins.push({
+          id: "demo-plugin",
+          status: scope === "missing-owner" && registry === scoped ? "disabled" : "loaded",
+        } as never);
+        registry.providers.push({
+          pluginId: "demo-plugin",
+          source: "demo/index.js",
+          provider: {
+            id: scope === "filtered" && registry === scoped ? "other" : "demo",
+            label,
+            auth: [],
+          },
+        });
+      }
+      setActivePluginRegistry(active, "active", "default", "/tmp/work");
+      const plugins = withPluginRuntimeRegistryScope(scoped, () =>
+        resolveProviderPluginsForHooks({
+          onlyPluginIds: ["demo-plugin"],
+          providerRefs: ["demo"],
+        }),
+      );
+      expect(plugins.map((plugin) => plugin.label)).toEqual([
+        scope === "matching" ? "scoped" : "active",
+      ]);
+      expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([{ onlyPluginIds: [] }, { onlyPluginIds: [" demo-plugin "] }])(
+    "keeps the raw loaded owner scope $onlyPluginIds",
+    ({ onlyPluginIds }) => {
+      const registry = createEmptyPluginRegistry();
+      registry.plugins.push({ id: "demo-plugin", status: "loaded" } as never);
+      registry.providers.push({
+        pluginId: "demo-plugin",
+        source: "demo/index.js",
+        provider: { id: "demo", label: "Demo", auth: [] },
+      });
+      setActivePluginRegistry(registry, "active", "default", "/tmp/work");
+      expect(resolveLoadedProviderPluginsForHooks({ onlyPluginIds })).toBeUndefined();
+      expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
+    },
+  );
 
   it("does not cache default runtime provider misses without active registry invalidation", () => {
     const provider: ProviderPlugin = {
@@ -812,9 +1329,7 @@ describe("provider-runtime", () => {
       }),
     };
     resolvePluginProvidersMock.mockImplementation((params) =>
-      params.applyAutoEnable === false && params.bundledProviderVitestCompat === false
-        ? []
-        : [runtimeProvider],
+      params.applyAutoEnable === false ? [] : [runtimeProvider],
     );
 
     expect(resolveProviderRuntimePlugin({ provider: DEMO_PROVIDER_ID })).toBe(runtimeProvider);
@@ -846,47 +1361,6 @@ describe("provider-runtime", () => {
       }),
     ).toStrictEqual([]);
     expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
-  });
-
-  it("keeps the deprecated external OAuth fallback at the plugin boundary", () => {
-    const unsafePluginId = "legacy-provider\nWARN forged";
-    resolveExternalAuthProfileCompatFallbackPluginIdsMock.mockReturnValue([unsafePluginId]);
-    resolvePluginProvidersMock.mockReturnValue([
-      {
-        id: "legacy-provider",
-        pluginId: unsafePluginId,
-        label: "Legacy Provider",
-        auth: [],
-        resolveExternalOAuthProfiles: () => [
-          {
-            profileId: "legacy-provider:external",
-            credential: {
-              type: "oauth",
-              provider: "legacy-provider",
-              access: "access",
-              refresh: "refresh",
-              expires: Date.now() + 60_000,
-            },
-          },
-        ],
-      },
-    ]);
-
-    for (let i = 0; i < 2; i += 1) {
-      const [profile] = resolveExternalAuthProfilesWithPlugins({
-        env: process.env,
-        context: {
-          env: process.env,
-          store: { version: 1, profiles: {} },
-        },
-      });
-      expect(profile?.profileId).toBe("legacy-provider:external");
-    }
-
-    expect(providerRuntimeWarnMock).toHaveBeenCalledTimes(1);
-    const warning = firstMockStringArg(providerRuntimeWarnMock, "provider warning");
-    expect(warning).toContain('Provider plugin "legacy-providerWARN forged"');
-    expect(warning).not.toContain("\n");
   });
 
   it("resolves declared external auth plugins with different provider ids", () => {
@@ -947,11 +1421,17 @@ describe("provider-runtime", () => {
       ...baseConfig,
       agents: { defaults: { model: "anthropic/claude-sonnet-4-5" } },
     } as OpenClawConfig;
+    const metadataSnapshot = {
+      index: {},
+      manifestRegistry: {},
+      workspaceDir: "/tmp/snapshot-workspace",
+    } as never;
 
     expect(
       await augmentModelCatalogWithProviderPlugins({
         config: firstConfig,
         env: process.env,
+        metadataSnapshot,
         context: { config: firstConfig, env: process.env, entries: [] },
       }),
     ).toEqual([{ provider: "demo", id: "demo-model", name: "Demo Model" }]);
@@ -959,11 +1439,24 @@ describe("provider-runtime", () => {
       await augmentModelCatalogWithProviderPlugins({
         config: secondConfig,
         env: process.env,
+        metadataSnapshot,
         context: { config: secondConfig, env: process.env, entries: [] },
       }),
     ).toEqual([{ provider: "demo", id: "demo-model", name: "Demo Model" }]);
 
     expect(resolvePluginProvidersMock).toHaveBeenCalledTimes(2);
+    expect(resolveCatalogHookProviderPluginIdsMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        metadataSnapshot,
+        workspaceDir: "/tmp/snapshot-workspace",
+      }),
+    );
+    expect(resolvePluginProvidersMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        pluginMetadataSnapshot: metadataSnapshot,
+        workspaceDir: "/tmp/snapshot-workspace",
+      }),
+    );
   });
 
   it("resolves catalog hook provider loads when unrelated plugin config changes", async () => {
@@ -988,7 +1481,7 @@ describe("provider-runtime", () => {
       plugins: {
         entries: {
           demo: { enabled: true, config: { endpoint: "https://demo.example" } },
-          "active-memory": { enabled: true, config: { qmd: { searchMode: "fast" } } },
+          "active-memory": { enabled: true, config: { queryMode: "recent" } },
         },
       },
     } as OpenClawConfig;
@@ -1049,6 +1542,52 @@ describe("provider-runtime", () => {
     });
   });
 
+  it("unwraps secret sentinels only after finding the provider auth hook", async () => {
+    const { mintSecretSentinel } = await import("../secrets/sentinel.js");
+    const sourceToken = "provider-source-token";
+    const sourceSentinel = mintSecretSentinel(sourceToken, { label: "provider-runtime-test" });
+    const prepareRuntimeAuth = vi.fn(async () => ({ apiKey: "runtime-token" }));
+    resolvePluginProvidersMock.mockReturnValue([
+      {
+        id: DEMO_PROVIDER_ID,
+        label: "Demo",
+        auth: [],
+        prepareRuntimeAuth,
+      },
+    ]);
+
+    await prepareProviderRuntimeAuth({
+      provider: DEMO_PROVIDER_ID,
+      context: {
+        env: process.env,
+        provider: DEMO_PROVIDER_ID,
+        modelId: MODEL.id,
+        model: MODEL,
+        apiKey: sourceSentinel,
+        authMode: "token",
+      },
+    });
+
+    expect(prepareRuntimeAuth).toHaveBeenCalledWith(
+      expect.objectContaining({ apiKey: sourceToken }),
+    );
+
+    resolvePluginProvidersMock.mockReturnValue([]);
+    await expect(
+      prepareProviderRuntimeAuth({
+        provider: "provider-without-hook",
+        context: {
+          env: process.env,
+          provider: "provider-without-hook",
+          modelId: MODEL.id,
+          model: { ...MODEL, provider: "provider-without-hook" },
+          apiKey: "oc-sent-v2.unknown.end",
+          authMode: "token",
+        },
+      }),
+    ).resolves.toBeUndefined();
+  });
+
   it("returns no runtime plugin when the provider has no owning plugin", () => {
     expectProviderRuntimePluginLoad({
       provider: "anthropic",
@@ -1071,17 +1610,16 @@ describe("provider-runtime", () => {
     ]);
 
     expect(
-      resolveProviderExtraParamsForTransport({
+      resolvePreparedExtraParams({
+        cfg: undefined,
         provider: DEMO_PROVIDER_ID,
-        context: createDemoResolvedModelContext({
-          extraParams: { transport: "websocket" },
-          transport: "websocket" as const,
-        }),
+        modelId: MODEL.id,
+        model: MODEL,
+        extraParamsOverride: { transport: "websocket" },
       }),
     ).toEqual({
-      patch: {
-        providerTransportPatch: true,
-      },
+      transport: "websocket",
+      providerTransportPatch: true,
     });
     expectRecordFields(
       requireRecord(firstMockArg(extraParamsForTransport), "transport params context"),
@@ -1146,14 +1684,14 @@ describe("provider-runtime", () => {
 
     expect(contribution?.stablePrefix).toContain("<persona_latch>");
     expect(contribution?.sectionOverrides?.interaction_style).toContain(
-      "Live chat tone: short, natural, human.",
+      "Live chat: short, natural, human.",
     );
     expect(contribution?.sectionOverrides?.interaction_style).not.toContain(
-      "Use heartbeats to create useful proactive progress",
+      "Heartbeat = useful proactive progress",
     );
   });
 
-  it("passes heartbeat trigger context to the shared GPT-5 prompt overlay", () => {
+  it("keeps scheduled heartbeat guidance out of shared GPT-5 provider overlays", () => {
     const contribution = resolveProviderSystemPromptContribution({
       provider: "openrouter",
       context: {
@@ -1164,32 +1702,9 @@ describe("provider-runtime", () => {
       } as never,
     });
 
-    expect(contribution?.sectionOverrides?.interaction_style).toContain(
-      "Use heartbeats to create useful proactive progress",
+    expect(contribution?.sectionOverrides?.interaction_style).not.toContain(
+      "Heartbeat = useful proactive progress",
     );
-  });
-
-  it("respects the shared GPT-5 prompt overlay personality config", () => {
-    const contribution = resolveProviderSystemPromptContribution({
-      provider: "opencode",
-      config: {
-        agents: {
-          defaults: {
-            promptOverlays: {
-              gpt5: { personality: "off" },
-            },
-          },
-        },
-      },
-      context: {
-        provider: "opencode",
-        modelId: "gpt-5.4",
-        promptMode: "full",
-      } as never,
-    });
-
-    expect(contribution?.stablePrefix).toContain("<persona_latch>");
-    expect(contribution?.sectionOverrides).toStrictEqual({});
   });
 
   it("lets provider-owned prompt overlays compose after the built-in GPT-5 overlay", () => {
@@ -1247,7 +1762,7 @@ describe("provider-runtime", () => {
 
     expect(contribution?.stablePrefix).toContain("<persona_latch>");
     expect(contribution?.sectionOverrides?.interaction_style).toContain(
-      "Live chat tone: short, natural, human.",
+      "Live chat: short, natural, human.",
     );
   });
 
@@ -1383,69 +1898,119 @@ describe("provider-runtime", () => {
     expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
   });
 
-  it("resolves thinking profiles from bundled policy surface before runtime plugins", () => {
-    const resolveThinkingProfile = vi.fn(() => ({
-      levels: [{ id: "off" as const }],
-      defaultLevel: "off" as const,
-    }));
-    resolveBundledProviderPolicySurfaceMock.mockReturnValue({
-      resolveThinkingProfile,
+  it("reads deprecated profile ids without loading provider runtime", () => {
+    resolveProviderPolicySurfaceMock.mockReturnValue({
+      deprecatedProfileIds: ["anthropic:claude-cli"],
     });
 
-    expect(
-      resolveProviderThinkingProfile({
-        provider: "xai",
-        context: {
-          provider: "xai",
-          modelId: "grok-4.3",
-          reasoning: true,
-        },
-      }),
-    ).toEqual({ levels: [{ id: "off" }], defaultLevel: "off" });
-
-    expect(resolveThinkingProfile).toHaveBeenCalledTimes(1);
+    expect(resolveProviderDeprecatedAuthProfileIds({ provider: "anthropic" })).toEqual([
+      "anthropic:claude-cli",
+    ]);
     expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
   });
 
-  it("resolves provider config defaults through owner plugins", () => {
-    resolvePluginProvidersMock.mockReturnValue([
-      {
-        id: "anthropic",
-        label: "Anthropic",
-        auth: [],
-        applyConfigDefaults: ({ config }) => ({
-          ...config,
-          agents: {
-            defaults: {
-              heartbeat: { every: "1h" },
-            },
-          },
-        }),
-      },
-    ]);
+  it("forwards prepared manifest metadata to bundled config policy resolution", () => {
+    const manifestRegistry = { plugins: [] };
+    const providerConfig: ModelProviderConfig = {
+      baseUrl: "https://api.example.com/v1",
+      api: "openai-completions",
+      models: [],
+    };
+    resolveBundledProviderPolicySurfaceMock.mockReturnValue({
+      normalizeConfig: ({ providerConfig: candidateConfig }) => ({
+        ...candidateConfig,
+        baseUrl: "https://normalized.example.com/v1",
+      }),
+      resolveConfigApiKey: () => "EXAMPLE_API_KEY",
+    });
 
     expect(
-      applyProviderConfigDefaultsWithPlugin({
-        provider: "anthropic",
+      normalizeProviderConfigWithPlugin({
+        provider: "example-alias",
+        manifestRegistry,
         context: {
-          provider: "anthropic",
+          provider: "example-alias",
+          providerConfig,
+        },
+      })?.baseUrl,
+    ).toBe("https://normalized.example.com/v1");
+    expect(
+      resolveProviderConfigApiKeyWithPlugin({
+        provider: "example-alias",
+        manifestRegistry,
+        context: {
+          provider: "example-alias",
           env: {},
-          config: {},
         },
       }),
-    ).toEqual({
-      agents: {
-        defaults: {
-          heartbeat: {
-            every: "1h",
-          },
-        },
-      },
+    ).toBe("EXAMPLE_API_KEY");
+
+    expect(resolveBundledProviderPolicySurfaceMock).toHaveBeenNthCalledWith(1, "example-alias", {
+      manifestRegistry,
+    });
+    expect(resolveBundledProviderPolicySurfaceMock).toHaveBeenNthCalledWith(2, "example-alias", {
+      manifestRegistry,
     });
   });
 
+  it.each([undefined, "openai", "custom-provider"])(
+    "does not discover providers while classifying an error for %s",
+    (provider) => {
+      expect(
+        classifyProviderFailoverSignalWithPlugin({
+          provider,
+          context: { provider, errorMessage: "bad request" },
+        }),
+      ).toBeUndefined();
+      expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([undefined, "openai"])(
+    "keeps an empty generation authoritative when classifying for %s",
+    (provider) => {
+      const classifyFailoverReason = vi.fn(() => "billing" as const);
+      registerLoadedProviders([
+        { id: "openai", label: "OpenAI", auth: [], classifyFailoverReason },
+      ]);
+      const config = {};
+      const metadataSnapshot = createPluginMetadataSnapshot({
+        config,
+        manifestRegistry: { plugins: [], diagnostics: [] },
+      });
+      withPluginRuntimeGenerationScope({ metadataSnapshot }, () => {
+        expect(
+          classifyProviderFailoverSignalWithPlugin({
+            provider,
+            context: { provider, errorMessage: "bad request" },
+          }),
+        ).toBeUndefined();
+        expect(resolveProviderPluginsForHooks({})).toEqual([]);
+      });
+      expect(classifyFailoverReason).not.toHaveBeenCalled();
+      expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([undefined, "openai", "custom-provider"])(
+    "reuses active hooks after an empty request scope for %s",
+    (provider) => {
+      registerLoadedProviders([
+        { id: "openai", label: "OpenAI", auth: [], classifyFailoverReason: () => "billing" },
+      ]);
+      const result = withPluginRuntimeRegistryScope(createEmptyPluginRegistry(), () =>
+        classifyProviderFailoverSignalWithPlugin({
+          provider,
+          context: { provider, errorMessage: "bad request" },
+        }),
+      );
+      expect(result).toBe("billing");
+      expect(resolvePluginProvidersMock).not.toHaveBeenCalled();
+    },
+  );
+
   it("resolves failover classification through hook-only aliases", () => {
-    resolvePluginProvidersMock.mockReturnValue([
+    registerLoadedProviders([
       {
         id: "openai",
         label: "OpenAI",
@@ -1463,16 +2028,16 @@ describe("provider-runtime", () => {
     ]);
 
     expect(
-      matchesProviderContextOverflowWithPlugin({
+      classifyProviderFailoverSignalWithPlugin({
         provider: "azure-openai-responses",
         context: {
           provider: "azure-openai-responses",
           errorMessage: "content_filter prompt too long",
         },
       }),
-    ).toBe(true);
+    ).toBe("context_overflow");
     expect(
-      classifyProviderFailoverReasonWithPlugin({
+      classifyProviderFailoverSignalWithPlugin({
         provider: "azure-openai-responses",
         context: {
           provider: "azure-openai-responses",
@@ -1481,7 +2046,7 @@ describe("provider-runtime", () => {
       }),
     ).toBe("rate_limit");
     expect(
-      classifyProviderFailoverReasonWithPlugin({
+      classifyProviderFailoverSignalWithPlugin({
         provider: "azure-openai-responses",
         context: {
           provider: "azure-openai-responses",
@@ -1493,11 +2058,41 @@ describe("provider-runtime", () => {
     ).toBe("billing");
   });
 
-  it("falls back to all failover hooks when a provider owner cannot be resolved", () => {
+  it.each([
+    { result: "billing", expected: "billing", laterCalls: 0 },
+    { result: "context_overflow", expected: "context_overflow", laterCalls: 0 },
+    { result: "unsupported-reason", expected: undefined, laterCalls: 0 },
+    { result: {}, expected: undefined, laterCalls: 0 },
+    { result: true, expected: undefined, laterCalls: 0 },
+    { result: null, expected: "overloaded", laterCalls: 1 },
+    { result: undefined, expected: "overloaded", laterCalls: 1 },
+    { result: "", expected: "overloaded", laterCalls: 1 },
+  ])(
+    "normalizes external failover result $result without changing hook precedence",
+    ({ result, expected, laterCalls }) => {
+      const later = vi.fn(() => "overloaded" as const);
+      registerLoadedProviders([
+        // External JavaScript plugins are not constrained by the TypeScript return type.
+        {
+          id: "first",
+          label: "First",
+          auth: [],
+          classifyFailoverReason: () => result,
+        } as ProviderPlugin,
+        { id: "second", label: "Second", auth: [], classifyFailoverReason: later },
+      ]);
+      expect(
+        classifyProviderFailoverSignalWithPlugin({ context: { errorMessage: "fixture failure" } }),
+      ).toBe(expected);
+      expect(later).toHaveBeenCalledTimes(laterCalls);
+    },
+  );
+
+  it("consults loaded failover hooks when a provider owner cannot be resolved", () => {
     const classifyFailoverReason = vi.fn(({ errorMessage }) =>
       /\bconcurrency limit breached\b/i.test(errorMessage) ? "rate_limit" : undefined,
     );
-    resolvePluginProvidersMock.mockReturnValue([
+    registerLoadedProviders([
       {
         id: "together",
         label: "Together",
@@ -1507,7 +2102,7 @@ describe("provider-runtime", () => {
     ]);
 
     expect(
-      classifyProviderFailoverReasonWithPlugin({
+      classifyProviderFailoverSignalWithPlugin({
         provider: "my-together",
         context: {
           provider: "my-together",
@@ -1521,9 +2116,25 @@ describe("provider-runtime", () => {
     });
   });
 
+  it("resolves prepared provider owner hints for custom routes", () => {
+    const openrouterPlugin: ProviderPlugin = {
+      id: "openrouter",
+      label: "OpenRouter",
+      auth: [],
+    };
+    resolvePluginProvidersMock.mockReturnValue([openrouterPlugin]);
+    expect(
+      resolveProviderRuntimePlugin({
+        provider: "custom-openrouter",
+        providerOwner: "openrouter",
+        modelId: "anthropic/claude-sonnet-4",
+      }),
+    ).toBe(openrouterPlugin);
+  });
+
   it("does not broad-scan failover hooks for unresolved providers with structured descriptors", () => {
     const classifyFailoverReason = vi.fn(() => "overloaded" as const);
-    resolvePluginProvidersMock.mockReturnValue([
+    registerLoadedProviders([
       {
         id: "mantle",
         label: "Mantle",
@@ -1533,7 +2144,7 @@ describe("provider-runtime", () => {
     ]);
 
     expect(
-      classifyProviderFailoverReasonWithPlugin({
+      classifyProviderFailoverSignalWithPlugin({
         provider: "my-openai-compatible",
         context: {
           provider: "my-openai-compatible",
@@ -1557,11 +2168,28 @@ describe("provider-runtime", () => {
       },
     ]);
 
+    const agent: { streamFn: StreamFn } = { streamFn: wrappedStreamFn };
+    applyExtraParamsToAgent(agent, undefined, "azure-openai-responses", MODEL.id);
+    void agent.streamFn(MODEL, { messages: [] });
+    expect(wrappedStreamFn).toHaveBeenCalledOnce();
+  });
+
+  it("resolves opt-in simple-completion stream wrappers", () => {
+    const wrappedStreamFn = vi.fn();
+    resolvePluginProvidersMock.mockReturnValue([
+      {
+        id: "moonshot",
+        label: "Moonshot",
+        auth: [],
+        wrapSimpleCompletionStreamFn: ({ streamFn }) => streamFn ?? wrappedStreamFn,
+      },
+    ]);
+
     expect(
-      wrapProviderStreamFn({
-        provider: "azure-openai-responses",
+      wrapProviderSimpleCompletionStreamFn({
+        provider: "moonshot",
         context: createDemoResolvedModelContext({
-          provider: "azure-openai-responses",
+          provider: "moonshot",
           streamFn: wrappedStreamFn,
         }),
       }),
@@ -1619,15 +2247,12 @@ describe("provider-runtime", () => {
     });
 
     expect(
-      resolveProviderExtraParamsForTransport({
+      resolvePreparedExtraParams({
+        cfg: undefined,
         provider: "mock-openai",
-        context: createDemoRuntimeContext({
-          provider: "mock-openai",
-          modelId: "gpt-5.5",
-          extraParams: {},
-        }),
+        modelId: "gpt-5.5",
       }),
-    ).toBeUndefined();
+    ).toEqual({});
     expect(resolvePluginProvidersMock).toHaveBeenCalledOnce();
   });
 
@@ -1660,6 +2285,78 @@ describe("provider-runtime", () => {
       api: "google-generative-ai",
       baseUrl: "https://generativelanguage.googleapis.com/v1beta",
     });
+  });
+
+  it("does not broad-scan provider hooks for configured core transport providers", () => {
+    resolvePluginProvidersMock.mockImplementation((params) => {
+      if (params.providerRefs?.includes("mock-openai")) {
+        return [];
+      }
+      throw new Error("unexpected broad provider hook scan");
+    });
+
+    expect(
+      normalizeProviderTransportWithPlugin({
+        provider: "mock-openai",
+        config: {
+          models: {
+            providers: {
+              "mock-openai": {
+                api: "openai-responses",
+                baseUrl: "http://127.0.0.1:64087/v1",
+                models: [{ id: "gpt-5.5" }],
+              },
+            },
+          },
+        } as never,
+        context: {
+          provider: "mock-openai",
+          api: "openai-responses",
+          baseUrl: "http://127.0.0.1:64087/v1",
+        },
+      }),
+    ).toBeUndefined();
+    expect(resolvePluginProvidersMock).toHaveBeenCalledOnce();
+  });
+
+  it("scopes resolved transport hook lookup to explicit custom provider models", () => {
+    const openaiPlugin: ProviderPlugin = {
+      id: "openai",
+      label: "OpenAI",
+      auth: [],
+      normalizeTransport: () => ({ api: "openai-responses" }),
+    };
+    resolvePluginProvidersMock.mockReturnValue([openaiPlugin]);
+
+    expect(
+      applyProviderResolvedTransportWithPlugin({
+        provider: "tui-pty-mock",
+        config: {
+          models: {
+            providers: {
+              "tui-pty-mock": {
+                api: "openai-responses",
+                baseUrl: "http://127.0.0.1:64087/v1",
+                models: [{ id: "gpt-5.5" }],
+              },
+            },
+          },
+        } as never,
+        context: createDemoResolvedModelContext({
+          provider: "tui-pty-mock",
+          modelId: "gpt-5.5",
+          model: {
+            ...MODEL,
+            provider: "tui-pty-mock",
+            id: "gpt-5.5",
+            api: "openai-responses",
+            baseUrl: "http://127.0.0.1:64087/v1",
+          },
+        }),
+      }),
+    ).toBeUndefined();
+    expect(getLastResolvePluginProvidersParams().providerRefs).toEqual(["tui-pty-mock"]);
+    expect(getLastResolvePluginProvidersParams().modelRefs).toEqual(["tui-pty-mock/gpt-5.5"]);
   });
 
   it("invalidates cached runtime providers when config mutates in place", () => {
@@ -1704,21 +2401,12 @@ describe("provider-runtime", () => {
 
   it("dispatches runtime hooks for the matched provider", async () => {
     resolveCatalogHookProviderPluginIdsMock.mockReturnValue(["openai"]);
+    resolveUsageHookProviderPluginContractsMock.mockReturnValue([
+      { pluginId: "demo", providerIds: ["demo"] },
+    ]);
     resolveExternalAuthProfileProviderPluginIdsMock.mockReturnValue(["demo"]);
-    const prepareDynamicModel = vi.fn(async () => undefined);
+    const prepareDynamicModel = vi.fn(async () => MODEL);
     const createStreamFn = vi.fn(() => vi.fn());
-    const createEmbeddingProvider = vi.fn(async () => ({
-      id: "demo",
-      model: "demo-embed",
-      embedQuery: async () => [1, 0, 0],
-      embedBatch: async () => [[1, 0, 0]],
-      client: { token: "embed-token" },
-    }));
-    const buildReplayPolicy = vi.fn(() => ({
-      sanitizeMode: "full" as const,
-      toolCallIdMode: "strict9" as const,
-      allowSyntheticToolResults: true,
-    }));
     const sanitizeReplayHistory = vi.fn(
       async ({
         messages,
@@ -1783,11 +2471,6 @@ describe("provider-runtime", () => {
           normalizeModelId: ({ modelId }) => modelId.replace("-legacy", ""),
           resolveDynamicModel: () => MODEL,
           prepareDynamicModel,
-          applyNativeStreamingUsageCompat: ({ providerConfig }) => ({
-            ...providerConfig,
-            compat: { supportsUsageInStreaming: true },
-          }),
-          buildReplayPolicy,
           sanitizeReplayHistory,
           validateReplayTurns,
           normalizeToolSchemas,
@@ -1802,7 +2485,6 @@ describe("provider-runtime", () => {
             expect(model).toEqual(MODEL);
             return streamFn;
           },
-          createEmbeddingProvider,
           resolveSyntheticAuth,
           resolveExternalAuthProfiles: ({ store }): ProviderExternalAuthProfile[] =>
             store.profiles["demo:managed"]
@@ -1835,9 +2517,6 @@ describe("provider-runtime", () => {
           resolveUsageAuth,
           fetchUsageSnapshot,
           isCacheTtlEligible: ({ modelId }) => modelId.startsWith("anthropic/"),
-          isBinaryThinking: () => true,
-          supportsXHighThinking: ({ modelId }) => modelId === "gpt-5.4",
-          resolveDefaultThinkingLevel: ({ reasoning }) => (reasoning ? "low" : "off"),
           isModernModelRef: ({ modelId }) => modelId.startsWith("gpt-5"),
         },
         {
@@ -1849,6 +2528,10 @@ describe("provider-runtime", () => {
         } as ProviderPlugin,
       ];
     });
+
+    expect(listProviderUsagePluginDescriptors({ env: process.env })).toEqual([
+      { provider: "demo", displayName: "demo" },
+    ]);
 
     expect(
       runProviderDynamicModel({
@@ -1897,21 +2580,6 @@ describe("provider-runtime", () => {
       })?.baseUrl,
     ).toBe("https://normalized.example.com/v1");
 
-    const streamingCompatConfig = applyProviderNativeStreamingUsageCompatWithPlugin({
-      provider: DEMO_PROVIDER_ID,
-      context: {
-        provider: DEMO_PROVIDER_ID,
-        providerConfig: {
-          baseUrl: "https://demo.example.com",
-          api: "openai-completions",
-          models: [],
-        },
-      },
-    });
-    expect(requireRecord(streamingCompatConfig, "streaming compat config").compat).toEqual({
-      supportsUsageInStreaming: true,
-    });
-
     expect(
       resolveProviderConfigApiKeyWithPlugin({
         provider: DEMO_PROVIDER_ID,
@@ -1922,25 +2590,14 @@ describe("provider-runtime", () => {
       }),
     ).toBe("DEMO_PROFILE");
 
-    await prepareProviderDynamicModel({
-      provider: DEMO_PROVIDER_ID,
-      context: createDemoRuntimeContext({
-        modelRegistry: EMPTY_MODEL_REGISTRY,
-      }),
-    });
-
     expect(
-      resolveProviderReplayPolicyWithPlugin({
+      await prepareProviderDynamicModel({
         provider: DEMO_PROVIDER_ID,
-        context: createDemoResolvedModelContext({
-          modelApi: MODEL.api,
+        context: createDemoRuntimeContext({
+          modelRegistry: EMPTY_MODEL_REGISTRY,
         }),
       }),
-    ).toEqual({
-      sanitizeMode: "full",
-      toolCallIdMode: "strict9",
-      allowSyntheticToolResults: true,
-    });
+    ).toEqual(MODEL);
 
     expect(
       resolveProviderReasoningOutputModeWithPlugin({
@@ -1952,11 +2609,11 @@ describe("provider-runtime", () => {
     ).toBe("tagged");
 
     expect(
-      prepareProviderExtraParams({
+      resolvePreparedExtraParams({
+        cfg: undefined,
         provider: DEMO_PROVIDER_ID,
-        context: createDemoRuntimeContext({
-          extraParams: { temperature: 0.3 },
-        }),
+        modelId: MODEL.id,
+        extraParamsOverride: { temperature: 0.3 },
       }),
     ).toEqual({
       temperature: 0.3,
@@ -1971,21 +2628,6 @@ describe("provider-runtime", () => {
     ).toBeTypeOf("function");
 
     await expectResolvedMatches([
-      {
-        actual: () =>
-          createProviderEmbeddingProvider({
-            provider: DEMO_PROVIDER_ID,
-            context: createDemoProviderContext({
-              config: {} as never,
-              model: "demo-embed",
-            }),
-          }),
-        expected: {
-          id: "demo",
-          model: "demo-embed",
-          client: { token: "embed-token" },
-        },
-      },
       {
         actual: () =>
           prepareProviderRuntimeAuth({
@@ -2083,14 +2725,19 @@ describe("provider-runtime", () => {
       },
     ]);
 
-    expect(
-      wrapProviderStreamFn({
-        provider: DEMO_PROVIDER_ID,
-        context: createDemoResolvedModelContext({
-          streamFn: vi.fn(),
-        }),
-      }),
-    ).toBeTypeOf("function");
+    const agent = { streamFn: vi.fn() };
+    applyExtraParamsToAgent(
+      agent,
+      undefined,
+      DEMO_PROVIDER_ID,
+      MODEL.id,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      MODEL,
+    );
+    expect(agent.streamFn).toBeTypeOf("function");
 
     expect(
       normalizeProviderToolSchemasWithPlugin({
@@ -2159,37 +2806,6 @@ describe("provider-runtime", () => {
             }),
           }),
         expected: true,
-      },
-      {
-        actual: () =>
-          resolveProviderBinaryThinking({
-            provider: DEMO_PROVIDER_ID,
-            context: createDemoProviderContext({
-              modelId: "glm-5",
-            }),
-          }),
-        expected: true,
-      },
-      {
-        actual: () =>
-          resolveProviderXHighThinking({
-            provider: DEMO_PROVIDER_ID,
-            context: createDemoProviderContext({
-              modelId: "gpt-5.4",
-            }),
-          }),
-        expected: true,
-      },
-      {
-        actual: () =>
-          resolveProviderDefaultThinkingLevel({
-            provider: DEMO_PROVIDER_ID,
-            context: createDemoProviderContext({
-              modelId: "gpt-5.4",
-              reasoning: true,
-            }),
-          }),
-        expected: "low",
       },
       {
         actual: () =>
@@ -2269,7 +2885,6 @@ describe("provider-runtime", () => {
     await expectAugmentedCodexCatalog(augmentModelCatalogWithProviderPlugins);
 
     expectCalledOnce(
-      buildReplayPolicy,
       prepareDynamicModel,
       sanitizeReplayHistory,
       validateReplayTurns,
@@ -2326,13 +2941,14 @@ describe("provider-runtime", () => {
 
     const plugin = resolveProviderRuntimePlugin({
       provider: "tui-pty-mock",
+      modelId: "gpt-5.5",
       config: {
         models: {
           providers: {
             "tui-pty-mock": {
               api: "openai-responses",
               baseUrl: "http://127.0.0.1:64087/v1",
-              models: [],
+              models: [{ id: "gpt-5.5" }],
             },
           },
         },
@@ -2341,6 +2957,7 @@ describe("provider-runtime", () => {
 
     expect(plugin).toBeUndefined();
     expect(getLastResolvePluginProvidersParams().providerRefs).toEqual(["tui-pty-mock"]);
+    expect(getLastResolvePluginProvidersParams().modelRefs).toEqual(["tui-pty-mock/gpt-5.5"]);
   });
 
   it("does not match alias hooks when an exact custom provider declares a foreign api owner", () => {
@@ -2418,40 +3035,6 @@ describe("provider-runtime", () => {
       api: "openai-responses",
       baseUrl: "https://api.openai.com/v1",
     });
-  });
-
-  it("resolves bundled catalog hooks through provider plugins", async () => {
-    resolveCatalogHookProviderPluginIdsMock.mockReturnValue(["openai"]);
-    resolvePluginProvidersMock.mockImplementation((params?: { onlyPluginIds?: string[] }) => {
-      const onlyPluginIds = params?.onlyPluginIds;
-      if (!onlyPluginIds || !onlyPluginIds.includes("openai")) {
-        return [];
-      }
-      return [createOpenAiCatalogProviderPlugin()];
-    });
-
-    await expect(
-      augmentModelCatalogWithProviderPlugins({
-        env: process.env,
-        context: {
-          env: process.env,
-          entries: [
-            { provider: "openai", id: "gpt-5.4", name: "GPT-5.2" },
-            { provider: "openai", id: "gpt-5.4-pro", name: "GPT-5.2 Pro" },
-            { provider: "openai", id: "gpt-5.4-mini", name: "GPT-5 mini" },
-            { provider: "openai", id: "gpt-5.4-nano", name: "GPT-5 nano" },
-            { provider: "openai", id: "gpt-5.4", name: "GPT-5.4" },
-          ],
-        },
-      }),
-    ).resolves.toEqual(expectedAugmentedOpenaiCodexCatalogEntries);
-
-    expectRecordFields(getLastResolvePluginProvidersParams(), {
-      onlyPluginIds: ["openai"],
-      activate: false,
-    });
-    expect(resolveCatalogHookProviderPluginIdsMock).toHaveBeenCalledTimes(1);
-    expect(resolvePluginProvidersMock).toHaveBeenCalledTimes(1);
   });
 
   it("does not stack-overflow when provider hook resolution reenters the same plugin load", () => {
@@ -2557,3 +3140,4 @@ describe("provider-runtime", () => {
     expect(resolvePluginProvidersMock).toHaveBeenCalledTimes(2);
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

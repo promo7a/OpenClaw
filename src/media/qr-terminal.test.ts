@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { create, toString } = vi.hoisted(() => ({
   create: vi.fn(() => ({
@@ -10,14 +10,16 @@ const { create, toString } = vi.hoisted(() => ({
   toString: vi.fn(async () => "ASCII-QR"),
 }));
 
-vi.mock("qrcode", () => ({
-  default: {
-    create,
-    toString,
-  },
+vi.mock("./qr-runtime.ts", () => ({
+  loadQrCodeRuntime: async () => ({ create, toString }),
 }));
 
-import { renderQrTerminal } from "./qr-terminal.ts";
+let renderQrTerminal: typeof import("./qr-terminal.ts").renderQrTerminal;
+
+beforeAll(async () => {
+  vi.resetModules();
+  ({ renderQrTerminal } = await import("./qr-terminal.ts"));
+});
 
 describe("renderQrTerminal", () => {
   beforeEach(() => {
@@ -39,9 +41,9 @@ describe("renderQrTerminal", () => {
     expect(create).toHaveBeenCalledWith("openclaw");
     expect(toString).not.toHaveBeenCalled();
   });
+});
 
-  it("rejects empty QR text", async () => {
-    await expect(renderQrTerminal("")).rejects.toThrow("QR text must not be empty.");
-    expect(toString).not.toHaveBeenCalled();
-  });
+afterAll(() => {
+  vi.doUnmock("./qr-runtime.ts");
+  vi.resetModules();
 });

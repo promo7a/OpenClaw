@@ -1,3 +1,4 @@
+// Telegram tests cover conversation route.base session key plugin behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   testing as conversationBindingTesting,
@@ -152,6 +153,7 @@ describe("resolveTelegramConversationBaseSessionKey", () => {
       accountId: "default",
       chatId: 12345,
       isGroup: false,
+      threadSpec: { scope: "none" },
       senderId: 12345,
     });
 
@@ -197,13 +199,15 @@ describe("resolveTelegramConversationBaseSessionKey", () => {
       accountId: "default",
       chatId: -1001234567890,
       isGroup: true,
-      resolvedThreadId: 11,
-      replyThreadId: 11,
+      threadSpec: { id: 11, scope: "forum" },
       senderId: 12345,
     });
 
     expect(touch).toHaveBeenCalledWith("binding-plugin-owned", undefined);
-    expect(result.bindingMode).toEqual({ kind: "plugin-owned-runtime" });
+    expect(result.bindingMode).toEqual({
+      kind: "plugin-owned-runtime",
+      pluginId: "openclaw-codex-app-server",
+    });
     expect(result.route.agentId).toBe("main");
     expect(result.route.sessionKey).toBe("agent:main:telegram:group:-1001234567890:topic:11");
     expect(result.route.matchedBy).toBe("default");

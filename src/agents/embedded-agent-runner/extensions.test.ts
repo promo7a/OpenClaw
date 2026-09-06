@@ -1,13 +1,15 @@
+// Coverage for embedded extension factory selection and runtime wiring.
 import type { SessionManager } from "openclaw/plugin-sdk/agent-sessions";
 import type { Model } from "openclaw/plugin-sdk/llm";
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
 import { getCompactionSafeguardRuntime } from "../agent-hooks/compaction-safeguard-runtime.js";
 import compactionSafeguardExtension from "../agent-hooks/compaction-safeguard.js";
-import contextPruningExtension from "../agent-hooks/context-pruning.js";
 import { buildEmbeddedExtensionFactories } from "./extensions.js";
 
 vi.mock("../../plugins/provider-runtime.js", () => ({
+  // Plugin-owned cache-TTL decisions are mocked out here; extension selection
+  // tests assert the core default wiring only.
   resolveProviderCacheTtlEligibility: () => undefined,
   resolveProviderRuntimePlugin: () => undefined,
 }));
@@ -17,6 +19,8 @@ vi.mock("../../plugins/provider-hook-runtime.js", () => ({
 }));
 
 function buildSafeguardFactories(cfg: OpenClawConfig, workspaceDir?: string) {
+  // The safeguard runtime attaches to the session manager, so tests keep the
+  // same manager instance around for both factory construction and inspection.
   const sessionManager = {} as SessionManager;
   const model = {
     id: "claude-sonnet-4-20250514",
@@ -49,6 +53,29 @@ function expectSafeguardRuntime(
 }
 
 describe("buildEmbeddedExtensionFactories", () => {
+  it("uses the prepared context budget for safeguard sizing", () => {
+    const sessionManager = {} as SessionManager;
+    const factories = buildEmbeddedExtensionFactories({
+      cfg: {
+        agents: {
+          defaults: { compaction: { mode: "safeguard" } },
+        },
+      } as OpenClawConfig,
+      sessionManager,
+      provider: "anthropic",
+      modelId: "claude-sonnet-4-20250514",
+      model: {
+        id: "claude-sonnet-4-20250514",
+        contextWindow: 272_000,
+        contextTokens: 272_000,
+      } as Model,
+      contextTokenBudget: 128_000,
+      agentId: "capped",
+    });
+    expect(factories).toContain(compactionSafeguardExtension);
+    expect(getCompactionSafeguardRuntime(sessionManager)?.contextWindowTokens).toBe(128_000);
+  });
+
   it("enables quality-guard retries by default in safeguard mode", () => {
     const cfg = {
       agents: {
@@ -119,25 +146,5 @@ describe("buildEmbeddedExtensionFactories", () => {
     expect(getCompactionSafeguardRuntime(sessionManager)?.workspaceDir).toBe(
       "/tmp/openclaw-workspace",
     );
-  });
-
-  it("enables cache-ttl pruning for custom anthropic-messages providers", () => {
-    const factories = buildEmbeddedExtensionFactories({
-      cfg: {
-        agents: {
-          defaults: {
-            contextPruning: {
-              mode: "cache-ttl",
-            },
-          },
-        },
-      } as OpenClawConfig,
-      sessionManager: {} as SessionManager,
-      provider: "litellm",
-      modelId: "claude-sonnet-4-6",
-      model: { api: "anthropic-messages", contextWindow: 200_000 } as Model,
-    });
-
-    expect(factories).toContain(contextPruningExtension);
   });
 });

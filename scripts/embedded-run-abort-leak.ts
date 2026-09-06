@@ -19,6 +19,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as v8 from "node:v8";
+import { expectDefined } from "../packages/normalization-core/src/expect.js";
+import { toErrorObject as toLintErrorObject } from "./lib/error-format.mts";
+import { parseNonNegativeInt, parsePositiveInt } from "./lib/numeric-options.mjs";
 
 type Mode = "production" | "closure-extracted" | "closure-inline" | "synthetic-leak";
 type Abortable = <T>(signal: AbortSignal, promise: Promise<T>) => Promise<T>;
@@ -34,6 +37,24 @@ type Options = {
   quiet: boolean;
 };
 
+const VALUE_FLAGS = new Set([
+  "--iters",
+  "--batches",
+  "--snap-dir",
+  "--mode",
+  "--max-rss-growth-mb",
+  "--max-tracked-retention",
+  "--scope-bytes",
+]);
+
+function readValue(raw: string | undefined, flag: string): string {
+  const value = raw?.trim() ?? "";
+  if (!value || value.startsWith("-")) {
+    fail(`${flag} requires a value`);
+  }
+  return value;
+}
+
 function parseArgs(argv: string[]): Options {
   const opts: Options = {
     iters: 50,
@@ -45,30 +66,38 @@ function parseArgs(argv: string[]): Options {
     scopeBytes: 2_000_000,
     quiet: false,
   };
+  const seenValueFlags = new Set<string>();
   for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
+    const arg = expectDefined(argv[i], `embedded abort benchmark argument at index ${i}`);
     const next = argv[i + 1];
+    if (VALUE_FLAGS.has(arg)) {
+      if (seenValueFlags.has(arg)) {
+        fail(`${arg} was provided more than once`);
+      }
+      seenValueFlags.add(arg);
+    }
     switch (arg) {
       case "--iters":
-        opts.iters = parsePositiveInt(next, arg);
+        opts.iters = parsePositiveInt(readValue(next, arg), arg);
         i += 1;
         break;
       case "--batches":
-        opts.batches = parsePositiveInt(next, arg);
+        opts.batches = parsePositiveInt(readValue(next, arg), arg);
         i += 1;
         break;
       case "--snap-dir":
-        opts.snapDir = next ?? opts.snapDir;
+        opts.snapDir = readValue(next, arg);
         i += 1;
         break;
-      case "--mode":
+      case "--mode": {
+        const mode = readValue(next, arg);
         if (
-          next === "production" ||
-          next === "closure-extracted" ||
-          next === "closure-inline" ||
-          next === "synthetic-leak"
+          mode === "production" ||
+          mode === "closure-extracted" ||
+          mode === "closure-inline" ||
+          mode === "synthetic-leak"
         ) {
-          opts.mode = next;
+          opts.mode = mode;
         } else {
           fail(
             `--mode must be one of: production, closure-extracted, closure-inline, synthetic-leak`,
@@ -76,16 +105,17 @@ function parseArgs(argv: string[]): Options {
         }
         i += 1;
         break;
+      }
       case "--max-rss-growth-mb":
-        opts.maxRssGrowthMb = parseNonNegativeInt(next, arg);
+        opts.maxRssGrowthMb = parseNonNegativeInt(readValue(next, arg), arg);
         i += 1;
         break;
       case "--max-tracked-retention":
-        opts.maxTrackedRetention = parseNonNegativeInt(next, arg);
+        opts.maxTrackedRetention = parseNonNegativeInt(readValue(next, arg), arg);
         i += 1;
         break;
       case "--scope-bytes":
-        opts.scopeBytes = parsePositiveInt(next, arg);
+        opts.scopeBytes = parsePositiveInt(readValue(next, arg), arg);
         i += 1;
         break;
       case "--quiet":
@@ -100,45 +130,7 @@ function parseArgs(argv: string[]): Options {
         fail(`Unknown arg: ${arg}`);
     }
   }
-  if (!Number.isFinite(opts.iters) || opts.iters <= 0) {
-    fail("--iters must be > 0");
-  }
-  if (!Number.isFinite(opts.batches) || opts.batches <= 0) {
-    fail("--batches must be > 0");
-  }
   return opts;
-}
-
-function parsePositiveInt(raw: string | undefined, flag: string): number {
-  const value = parseStrictInt(raw, flag, "positive");
-  if (value <= 0) {
-    fail(`${flag} must be a positive integer`);
-  }
-  return value;
-}
-
-function parseNonNegativeInt(raw: string | undefined, flag: string): number {
-  const value = parseStrictInt(raw, flag, "non-negative");
-  if (value < 0) {
-    fail(`${flag} must be a non-negative integer`);
-  }
-  return value;
-}
-
-function parseStrictInt(
-  raw: string | undefined,
-  flag: string,
-  label: "positive" | "non-negative",
-): number {
-  const text = (raw ?? "").trim();
-  if (!/^\d+$/u.test(text)) {
-    fail(`${flag} must be a ${label} integer`);
-  }
-  const value = Number(text);
-  if (!Number.isSafeInteger(value)) {
-    fail(`${flag} must be a ${label} integer`);
-  }
-  return value;
 }
 
 function printUsage(): void {
@@ -289,7 +281,12 @@ function fmtBytes(bytes: number): string {
 }
 
 async function main(): Promise<void> {
-  const opts = parseArgs(process.argv.slice(2));
+  let opts: Options;
+  try {
+    opts = parseArgs(process.argv.slice(2));
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error));
+  }
   if (opts.mode === "production") {
     await loadProductionAbortable();
   }
@@ -386,17 +383,3 @@ main().catch((err: unknown) => {
   process.stderr.write(`harness crashed: ${String(err)}\n${(err as Error)?.stack ?? ""}\n`);
   process.exit(2);
 });
-
-function toLintErrorObject(value: unknown, fallbackMessage: string): Error {
-  if (value instanceof Error) {
-    return value;
-  }
-  if (typeof value === "string") {
-    return new Error(value);
-  }
-  const error = new Error(fallbackMessage, { cause: value });
-  if ((typeof value === "object" && value !== null) || typeof value === "function") {
-    Object.assign(error, value);
-  }
-  return error;
-}

@@ -1,6 +1,7 @@
-import type { WorkboardCard } from "./types.js";
+// Workboard plugin module implements card lookup behavior.
+import type { WorkboardCard } from "@openclaw/workboard-contract";
 
-export type WorkboardCardLookupResult =
+type WorkboardCardLookupResult =
   | { card: WorkboardCard; error?: undefined }
   | { card?: undefined; error: string };
 

@@ -1,5 +1,7 @@
+// Windows launcher normalization for npm/bun wrappers that duplicate node.exe in argv.
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 
+/** Remove duplicated Windows node launcher argv entries while preserving normal POSIX argv. */
 export function normalizeWindowsArgv(
   argv: string[],
   options: {
@@ -56,31 +58,13 @@ export function normalizeWindowsArgv(
     );
   };
 
-  const argv0IsExecPath = isExecPath(argv[0]);
   const next = [...argv];
-  let removedLauncherPrefix = false;
-  for (const i = 1; i < next.length; ) {
+  for (const i = 1; i < next.length;) {
     if (isExecPath(next[i])) {
       next.splice(i, 1);
-      removedLauncherPrefix = true;
       continue;
     }
     break;
   }
-  if (next.length < 3 || (!argv0IsExecPath && !removedLauncherPrefix)) {
-    return next;
-  }
-  const cleaned = [...next];
-  for (const i = 2; i < cleaned.length; ) {
-    const arg = cleaned[i];
-    if (!arg || arg.startsWith("-")) {
-      break;
-    }
-    if (isExecPath(arg)) {
-      cleaned.splice(i, 1);
-      continue;
-    }
-    break;
-  }
-  return cleaned;
+  return next;
 }

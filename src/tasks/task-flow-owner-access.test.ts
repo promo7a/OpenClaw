@@ -1,3 +1,4 @@
+// Verifies task-flow owner access checks for parent and child sessions.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   findLatestTaskFlowForOwner,
@@ -5,12 +6,12 @@ import {
   listTaskFlowsForOwner,
   resolveTaskFlowForLookupTokenForOwner,
 } from "./task-flow-owner-access.js";
-import {
-  createManagedTaskFlow as createManagedTaskFlowOrNull,
-  resetTaskFlowRegistryForTests,
-} from "./task-flow-registry.js";
-import { configureTaskFlowRegistryRuntime } from "./task-flow-registry.store.js";
+import { createManagedTaskFlow as createManagedTaskFlowOrNull } from "./task-flow-registry.js";
 import type { TaskFlowRecord } from "./task-flow-registry.types.js";
+import {
+  configureTaskFlowRegistryRuntime,
+  resetTaskFlowRegistryForTests,
+} from "./task-runtime.test-helpers.js";
 
 function createManagedTaskFlow(
   params: Parameters<typeof createManagedTaskFlowOrNull>[0],
@@ -39,7 +40,7 @@ afterEach(() => {
 });
 
 describe("task flow owner access", () => {
-  it("returns owner-scoped flows for direct and owner-key lookups", () => {
+  it("returns owner-scoped flows and resolves owner keys to live work", () => {
     const older = createManagedTaskFlow({
       ownerKey: "agent:main:main",
       controllerId: "tests/owner-access",
@@ -51,8 +52,10 @@ describe("task flow owner access", () => {
       ownerKey: "agent:main:main",
       controllerId: "tests/owner-access",
       goal: "Latest flow",
+      status: "succeeded",
       createdAt: 200,
       updatedAt: 200,
+      endedAt: 200,
     });
 
     expect(
@@ -71,7 +74,7 @@ describe("task flow owner access", () => {
         token: "agent:main:main",
         callerOwnerKey: "agent:main:main",
       })?.flowId,
-    ).toBe(latest.flowId);
+    ).toBe(older.flowId);
     expect(
       listTaskFlowsForOwner({
         callerOwnerKey: "agent:main:main",

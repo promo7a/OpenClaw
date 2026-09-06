@@ -1,3 +1,4 @@
+// Memory Lancedb tests cover config plugin behavior.
 import fs from "node:fs";
 import {
   type JsonSchemaObject,
@@ -8,9 +9,17 @@ import { memoryConfigSchema } from "./config.js";
 
 const manifest = JSON.parse(
   fs.readFileSync(new URL("./openclaw.plugin.json", import.meta.url), "utf-8"),
-) as { configSchema: JsonSchemaObject };
+) as { configSchema: JsonSchemaObject; uiHints?: Record<string, unknown> };
 
 describe("memory-lancedb config", () => {
+  it("keeps config presentation metadata manifest-owned", () => {
+    expect(memoryConfigSchema).not.toHaveProperty("uiHints");
+    expect(manifest.uiHints?.["embedding.apiKey"]).toMatchObject({
+      label: "Embedding API Key",
+      sensitive: true,
+    });
+  });
+
   it("accepts dreaming in the manifest schema and preserves it in runtime parsing", () => {
     const manifestResult = validateJsonSchemaValue({
       schema: manifest.configSchema,

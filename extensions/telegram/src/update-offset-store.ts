@@ -1,13 +1,18 @@
+// Telegram plugin module implements update offset store behavior.
 import { readJsonFileWithFallback } from "openclaw/plugin-sdk/json-store";
 import type { PluginStateKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
 import { getTelegramRuntime } from "./runtime.js";
-import { fingerprintTelegramBotToken } from "./token-fingerprint.js";
+import { normalizeTelegramStateAccountId } from "./state-account-id.js";
+import {
+  fingerprintTelegramBotToken,
+  resolveTelegramBotUserIdFromToken,
+} from "./token-fingerprint.js";
 
 const STORE_VERSION = 3;
 export const TELEGRAM_UPDATE_OFFSET_NAMESPACE = "telegram.update-offsets";
 export const TELEGRAM_UPDATE_OFFSET_MAX_ENTRIES = 1_000;
 
-export type TelegramUpdateOffsetState = {
+type TelegramUpdateOffsetState = {
   version: number;
   lastUpdateId: number | null;
   botId: string | null;
@@ -16,41 +21,25 @@ export type TelegramUpdateOffsetState = {
 
 type TelegramUpdateOffsetStore = PluginStateKeyedStore<TelegramUpdateOffsetState>;
 
-let updateOffsetStoreForTest: TelegramUpdateOffsetStore | undefined;
-
 function isValidUpdateId(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 export function normalizeTelegramUpdateOffsetAccountId(accountId?: string) {
-  const trimmed = accountId?.trim();
-  if (!trimmed) {
-    return "default";
-  }
-  return trimmed.replace(/[^a-z0-9._-]+/gi, "_");
+  return normalizeTelegramStateAccountId(accountId);
 }
 
 function openUpdateOffsetStore(env?: NodeJS.ProcessEnv): TelegramUpdateOffsetStore {
-  return (
-    updateOffsetStoreForTest ??
-    getTelegramRuntime().state.openKeyedStore<TelegramUpdateOffsetState>({
-      namespace: TELEGRAM_UPDATE_OFFSET_NAMESPACE,
-      maxEntries: TELEGRAM_UPDATE_OFFSET_MAX_ENTRIES,
-      ...(env ? { env } : {}),
-    })
-  );
+  return getTelegramRuntime().state.openKeyedStore<TelegramUpdateOffsetState>({
+    namespace: TELEGRAM_UPDATE_OFFSET_NAMESPACE,
+    maxEntries: TELEGRAM_UPDATE_OFFSET_MAX_ENTRIES,
+    ...(env ? { env } : {}),
+  });
 }
 
 function extractBotIdFromToken(token?: string): string | null {
-  const trimmed = token?.trim();
-  if (!trimmed) {
-    return null;
-  }
-  const [rawBotId] = trimmed.split(":", 1);
-  if (!rawBotId || !/^\d+$/.test(rawBotId)) {
-    return null;
-  }
-  return rawBotId;
+  const botUserId = resolveTelegramBotUserIdFromToken(token);
+  return botUserId === undefined ? null : String(botUserId);
 }
 
 function fingerprintFromToken(token?: string): string | null {
@@ -186,12 +175,6 @@ export async function deleteTelegramUpdateOffset(params: {
   await openUpdateOffsetStore(params.env).delete(
     normalizeTelegramUpdateOffsetAccountId(params.accountId),
   );
-}
-
-export function setTelegramUpdateOffsetStoreForTest(
-  store: TelegramUpdateOffsetStore | undefined,
-): void {
-  updateOffsetStoreForTest = store;
 }
 
 export async function listTelegramLegacyUpdateOffsetEntries(params: {

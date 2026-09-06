@@ -1,9 +1,11 @@
+// Imessage plugin module implements the same-sender inbound debounce merge.
+import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
+import { sliceUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import type { IMessagePayload } from "./types.js";
 
-// Keep the coalescing contract narrow (caps, ID tracking, reply-context
-// preference) so a future SDK lift into `openclaw/plugin-sdk/channel-inbound`
-// is a mechanical extraction instead of a behavioral redesign. Apple's
-// split-send pipeline is the behavior this protects.
+// Keep the merge contract narrow (caps, ID tracking, reply-context preference)
+// so a future SDK lift into `openclaw/plugin-sdk/channel-inbound` is a
+// mechanical extraction instead of a behavioral redesign.
 
 /**
  * Bounds on the merged output when multiple inbound iMessage payloads are
@@ -12,11 +14,11 @@ import type { IMessagePayload } from "./types.js";
  * prompt past a safe ceiling. Every source GUID still surfaces via
  * `coalescedMessageGuids` so a future replay path can recognize duplicates.
  */
-export const MAX_COALESCED_TEXT_CHARS = 4000;
-export const MAX_COALESCED_ATTACHMENTS = 20;
-export const MAX_COALESCED_ENTRIES = 10;
+const MAX_COALESCED_TEXT_CHARS = 4000;
+const MAX_COALESCED_ATTACHMENTS = 20;
+const MAX_COALESCED_ENTRIES = 10;
 
-export type CoalescedIMessagePayload = IMessagePayload & {
+type CoalescedIMessagePayload = IMessagePayload & {
   /**
    * Source GUIDs folded into this merged payload, in arrival order. Includes
    * GUIDs from entries that were dropped by the entry cap so downstream
@@ -31,9 +33,8 @@ export type CoalescedIMessagePayload = IMessagePayload & {
 
 /**
  * Combine consecutive same-sender iMessage payloads into a single payload for
- * downstream dispatch. Used when the debouncer flushes a bucket containing
- * more than one event — e.g. Apple's split-send for `Dump https://example.com`
- * arriving as two separate `chat.db` rows ~0.8-2.0 s apart.
+ * downstream dispatch. Used for the general inbound debounce
+ * (`messages.inbound`, off by default) when configured.
  *
  * The first payload anchors the merged shape (preserving its GUID for reply
  * threading). Text is concatenated with deduplication, attachments are merged
@@ -44,12 +45,12 @@ export function combineIMessagePayloads(payloads: IMessagePayload[]): CoalescedI
   if (payloads.length === 0) {
     throw new Error("combineIMessagePayloads: cannot combine empty payloads");
   }
+  const first = expectDefined(payloads[0], "first iMessage payload to coalesce");
   if (payloads.length === 1) {
-    return payloads[0];
+    return first;
   }
 
-  const first = payloads[0];
-  const last = payloads[payloads.length - 1];
+  const last = expectDefined(payloads.at(-1), "last iMessage payload to coalesce");
 
   // Cap entries: keep first (preserves command/context) + most recent
   // (preserves latest payload) when a flood exceeds the cap.
@@ -58,9 +59,7 @@ export function combineIMessagePayloads(payloads: IMessagePayload[]): CoalescedI
       ? [...payloads.slice(0, MAX_COALESCED_ENTRIES - 1), last]
       : payloads;
 
-  // Combine text across bounded entries. Skip duplicates so a URL appearing
-  // both as plain text and as a separately-rendered link-preview row does not
-  // get repeated in the merged prompt.
+  // Combine text across bounded entries, skipping duplicate message text.
   const seenTexts = new Set<string>();
   const textParts: string[] = [];
   for (const payload of boundedPayloads) {
@@ -77,7 +76,7 @@ export function combineIMessagePayloads(payloads: IMessagePayload[]): CoalescedI
   }
   let combinedText = textParts.join(" ");
   if (combinedText.length > MAX_COALESCED_TEXT_CHARS) {
-    combinedText = `${combinedText.slice(0, MAX_COALESCED_TEXT_CHARS)}…[truncated]`;
+    combinedText = `${sliceUtf16Safe(combinedText, 0, MAX_COALESCED_TEXT_CHARS)}…[truncated]`;
   }
 
   // Merge attachments across bounded entries, capped to keep downstream media
@@ -121,19 +120,21 @@ export function combineIMessagePayloads(payloads: IMessagePayload[]): CoalescedI
     coalescedMessageGuids.push(guid);
   }
 
-  // Reply context: prefer any entry that carries one; the last balloon in a
-  // split-send rarely does, but a manual quote-reply earlier in the bucket
-  // might.
-  const entryWithReply = payloads.find((p) => p.reply_to_id != null);
+  // Keep both parent GUIDs and their quote fields attached to the same source.
+  const reply =
+    payloads.find(
+      (payload) => payload.thread_originator_guid != null || payload.reply_to_guid != null,
+    ) ?? first;
 
   return {
     ...first,
     text: combinedText,
     attachments: allAttachments.length > 0 ? allAttachments : null,
     created_at: latestCreatedAt,
-    reply_to_id: entryWithReply?.reply_to_id ?? first.reply_to_id ?? null,
-    reply_to_text: entryWithReply?.reply_to_text ?? first.reply_to_text ?? null,
-    reply_to_sender: entryWithReply?.reply_to_sender ?? first.reply_to_sender ?? null,
+    thread_originator_guid: reply.thread_originator_guid ?? null,
+    reply_to_guid: reply.reply_to_guid ?? null,
+    reply_to_text: reply.reply_to_text ?? null,
+    reply_to_sender: reply.reply_to_sender ?? null,
     coalescedMessageGuids: coalescedMessageGuids.length > 0 ? coalescedMessageGuids : undefined,
     coalescedCatchupCursor:
       Number.isFinite(maxRowid) && Number.isFinite(maxDateMs)

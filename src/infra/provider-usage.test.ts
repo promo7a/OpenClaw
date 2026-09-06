@@ -1,3 +1,4 @@
+// Tests provider usage aggregation and formatting.
 import { beforeEach, describe, expect, it } from "vitest";
 import { createProviderUsageFetch } from "../test-utils/provider-usage-fetch.js";
 import {
@@ -6,7 +7,6 @@ import {
 } from "./provider-usage-plugin-runtime.test-mocks.js";
 import {
   formatUsageReportLines,
-  formatUsageSummaryLine,
   loadProviderUsageSummary,
   type UsageSummary,
 } from "./provider-usage.js";
@@ -18,31 +18,6 @@ const resolveProviderUsageSnapshotWithPluginMock = getProviderUsageSnapshotWithP
 describe("provider usage formatting", () => {
   beforeEach(() => {
     resetProviderUsageSnapshotWithPluginMock();
-  });
-
-  it("returns null when no usage is available", () => {
-    const summary: UsageSummary = { updatedAt: 0, providers: [] };
-    expect(formatUsageSummaryLine(summary)).toBeNull();
-  });
-
-  it("picks the most-used window for summary line", () => {
-    const summary: UsageSummary = {
-      updatedAt: 0,
-      providers: [
-        {
-          provider: "anthropic",
-          displayName: "Claude",
-          windows: [
-            { label: "5h", usedPercent: 10 },
-            { label: "Week", usedPercent: 60 },
-          ],
-        },
-      ],
-    };
-    const line = formatUsageSummaryLine(summary, { now: 0 });
-    expect(line).toContain("Claude");
-    expect(line).toContain("40% left");
-    expect(line).toContain("(Week");
   });
 
   it("prints provider errors in report output", () => {
@@ -74,7 +49,6 @@ describe("provider usage formatting", () => {
       ],
     };
 
-    expect(formatUsageSummaryLine(summary)).toBe("📊 Usage: DeepSeek Balance ¥42.50");
     expect(formatUsageReportLines(summary).join("\n")).toContain("DeepSeek: Balance ¥42.50");
   });
 

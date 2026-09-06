@@ -1,37 +1,36 @@
+// Skill filter tests cover active skill selection for isolated cron runs.
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { describe, expect, it } from "vitest";
 import {
-  makeIsolatedAgentTurnJob,
-  makeIsolatedAgentTurnParams,
-  setupRunCronIsolatedAgentTurnSuite,
-} from "./run.suite-helpers.js";
+  runInitialModelFallbackAttempt,
+  type TestModelFallbackRunnerParams,
+} from "../../agents/test-helpers/model-fallback-runner.test-support.js";
+import { makeIsolatedAgentJobFixture, makeIsolatedAgentParamsFixture } from "./job-fixtures.js";
+import { setupRunCronIsolatedAgentTurnSuite } from "./run.suite-helpers.js";
 import {
   buildWorkspaceSkillSnapshotMock,
   dispatchCronDeliveryMock,
-  getCliSessionIdMock,
+  getCliSessionBindingMock,
   isCliProviderMock,
-  lookupContextTokensMock,
+  resolveContextTokensForModelMock,
   loadRunCronIsolatedAgentTurn,
   logWarnMock,
   makeCronSession,
   makeCronSessionEntry,
+  patchSessionEntryMock,
   resolveAgentConfigMock,
   resolveAgentSkillsFilterMock,
   resolveAllowedModelRefMock,
   resolveCronSessionMock,
+  resolveEffectiveAgentRuntimeMock,
   runCliAgentMock,
+  runEmbeddedAgentMock,
   runWithModelFallbackMock,
 } from "./run.test-harness.js";
 
 const runCronIsolatedAgentTurn = await loadRunCronIsolatedAgentTurn();
-const makeSkillJob = makeIsolatedAgentTurnJob;
-const makeSkillParams = makeIsolatedAgentTurnParams;
 
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error(`expected ${label} to be an object`);
-  }
-  return value as Record<string, unknown>;
-}
+const requireRecord = createRequireRecord("record", "expected-label-object");
 
 function getMockCallArg(
   mock: { mock: { calls: readonly unknown[][] } },
@@ -59,7 +58,7 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
   setupRunCronIsolatedAgentTurnSuite();
 
   async function runSkillFilterCase(overrides?: Record<string, unknown>) {
-    const result = await runCronIsolatedAgentTurn(makeIsolatedAgentTurnParams(overrides));
+    const result = await runCronIsolatedAgentTurn(makeIsolatedAgentParamsFixture(overrides));
     expect(result.status).toBe("ok");
     return result;
   }
@@ -76,8 +75,12 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
 
   function mockCliFallbackInvocation() {
     runWithModelFallbackMock.mockImplementationOnce(
-      async (params: { run: (provider: string, model: string) => Promise<unknown> }) => {
-        const result = await params.run("claude-cli", "claude-opus-4-6");
+      async (params: TestModelFallbackRunnerParams) => {
+        const result = await runInitialModelFallbackAttempt(
+          params,
+          "claude-cli",
+          "claude-opus-4-6",
+        );
         return { result, provider: "claude-cli", model: "claude-opus-4-6", attempts: [] };
       },
     );
@@ -165,6 +168,44 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
     expect(getFirstMockArg(resolveCronSessionMock, "cron session").forceNew).toBe(true);
   });
 
+  it("persists the selected harness on base and run rows before turn startup fails", async () => {
+    const persistedAtStartup = new Map<string, Record<string, unknown>>();
+    resolveEffectiveAgentRuntimeMock.mockReturnValue("codex");
+    runWithModelFallbackMock.mockImplementationOnce(
+      async (params: TestModelFallbackRunnerParams) => ({
+        result: await runInitialModelFallbackAttempt(params),
+        provider: params.provider,
+        model: params.model,
+      }),
+    );
+    runEmbeddedAgentMock.mockImplementationOnce(async () => {
+      for (const [index, result] of patchSessionEntryMock.mock.results.entries()) {
+        const scope = requireRecord(
+          getMockCallArg(patchSessionEntryMock, index, 0, "session patch"),
+          "patch scope",
+        );
+        const entry = requireRecord(await result.value, "persisted session entry");
+        persistedAtStartup.set(String(scope.sessionKey), entry);
+      }
+      throw new Error("turn/start rejected before result metadata");
+    });
+
+    const result = await runCronIsolatedAgentTurn(
+      makeIsolatedAgentParamsFixture({ agentId: "main" }),
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.error).toContain("turn/start rejected before result metadata");
+    expect(persistedAtStartup.get("agent:main:cron:test")).toMatchObject({
+      sessionId: "test-session-id",
+      agentHarnessId: "codex",
+    });
+    expect(persistedAtStartup.get("agent:main:cron:test:run:test-session-id")).toMatchObject({
+      sessionId: "test-session-id",
+      agentHarnessId: "codex",
+    });
+  });
+
   it("reuses cached snapshot when version and normalized skillFilter are unchanged", async () => {
     resolveAgentSkillsFilterMock.mockReturnValue([" weather ", "meme-factory", "weather"]);
     resolveCronSessionMock.mockReturnValue({
@@ -232,8 +273,8 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
       });
 
       const result = await runCronIsolatedAgentTurn(
-        makeSkillParams({
-          job: makeSkillJob({
+        makeIsolatedAgentParamsFixture({
+          job: makeIsolatedAgentJobFixture({
             payload: { kind: "agentTurn", message: "test", model: "anthropic/claude-sonnet-4-6" },
           }),
         }),
@@ -253,16 +294,17 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
       });
 
       const result = await runCronIsolatedAgentTurn(
-        makeSkillParams({
+        makeIsolatedAgentParamsFixture({
           cfg: {
             agents: {
               defaults: {
                 model: { primary: "openai/gpt-5.4", fallbacks: defaultFallbacks },
                 models: { "openai/gpt-5.4": {} },
+                modelPolicy: { allow: ["openai/gpt-5.4"] },
               },
             },
           },
-          job: makeSkillJob({
+          job: makeIsolatedAgentJobFixture({
             payload: {
               kind: "agentTurn",
               message: "test",
@@ -274,7 +316,7 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
 
       expect(result.status).toBe("error");
       expect(result.error).toBe(
-        "cron payload.model 'anthropic/claude-sonnet-4-6' rejected by agents.defaults.models allowlist: anthropic/claude-sonnet-4-6 is not in [openai/gpt-5.4]",
+        "automation model override 'anthropic/claude-sonnet-4-6' rejected by agents.defaults.modelPolicy.allow: anthropic/claude-sonnet-4-6 is not in [openai/gpt-5.4]",
       );
       expect(logWarnMock).not.toHaveBeenCalled();
       expect(runWithModelFallbackMock).not.toHaveBeenCalled();
@@ -286,15 +328,17 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
       });
 
       const result = await runCronIsolatedAgentTurn(
-        makeSkillParams({
-          job: makeSkillJob({
+        makeIsolatedAgentParamsFixture({
+          job: makeIsolatedAgentJobFixture({
             payload: { kind: "agentTurn", message: "test", model: "openai/" },
           }),
         }),
       );
 
       expect(result.status).toBe("error");
-      expect(result.error).toBe("cron payload.model 'openai/' rejected: invalid model: openai/");
+      expect(result.error).toBe(
+        "automation model override 'openai/' rejected: invalid model: openai/",
+      );
       expect(logWarnMock).not.toHaveBeenCalled();
       expect(runWithModelFallbackMock).not.toHaveBeenCalled();
     });
@@ -310,7 +354,8 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
 
       isCliProviderMock.mockReturnValue(true);
       runCliAgentMock.mockImplementationOnce(async (params: { abortSignal?: AbortSignal }) => {
-        expect(params.abortSignal).toBe(abortController.signal);
+        expect(params.abortSignal).not.toBe(abortController.signal);
+        expect(params.abortSignal?.aborted).toBe(false);
         if (!markCliStarted) {
           throw new Error("Expected CLI start marker callback to be initialized");
         }
@@ -326,7 +371,7 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
       mockCliFallbackInvocation();
 
       const runPromise = runCronIsolatedAgentTurn(
-        makeSkillParams({ abortSignal: abortController.signal }),
+        makeIsolatedAgentParamsFixture({ abortSignal: abortController.signal }),
       );
       await cliStarted;
       abortController.abort("cron: job execution timed out");
@@ -340,7 +385,7 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
 
     it("does not pass stored cliSessionId on fresh isolated runs (isNewSession=true)", async () => {
       // Simulate a persisted CLI session ID from a previous run.
-      getCliSessionIdMock.mockReturnValue("prev-cli-session-abc");
+      getCliSessionBindingMock.mockReturnValue({ sessionId: "prev-cli-session-abc" });
       isCliProviderMock.mockReturnValue(true);
       runCliAgentMock.mockResolvedValue({
         payloads: [{ text: "output" }],
@@ -363,7 +408,7 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
         isNewSession: true,
       });
 
-      await runCronIsolatedAgentTurn(makeSkillParams());
+      await runCronIsolatedAgentTurn(makeIsolatedAgentParamsFixture());
 
       expect(runCliAgentMock).toHaveBeenCalledOnce();
       // Fresh session: cliSessionId must be undefined, not the stored value.
@@ -371,7 +416,7 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
     });
 
     it("reuses stored cliSessionId on continuation runs (isNewSession=false)", async () => {
-      getCliSessionIdMock.mockReturnValue("existing-cli-session-def");
+      getCliSessionBindingMock.mockReturnValue({ sessionId: "existing-cli-session-def" });
       isCliProviderMock.mockReturnValue(true);
       runCliAgentMock.mockResolvedValue({
         payloads: [{ text: "output" }],
@@ -394,7 +439,7 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
         isNewSession: false,
       });
 
-      await runCronIsolatedAgentTurn(makeSkillParams());
+      await runCronIsolatedAgentTurn(makeIsolatedAgentParamsFixture());
 
       expect(runCliAgentMock).toHaveBeenCalledOnce();
       // Continuation: cliSessionId should be passed through for session resume.
@@ -406,35 +451,284 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
   });
 
   describe("context token fallback", () => {
-    it("preserves existing session contextTokens when no configured or cached model window is loaded", async () => {
+    it("prefers the harness-reported runtime window and provenance", async () => {
       const session = makeCronSession({
         sessionEntry: makeCronSessionEntry({
+          agentHarnessId: "openclaw",
           contextTokens: 222_000,
+          contextTokensSource: "resolved",
         }),
       });
       resolveCronSessionMock.mockReturnValue(session);
-      lookupContextTokensMock.mockReturnValue(undefined);
+      resolveContextTokensForModelMock.mockReturnValue(512_000);
+      runWithModelFallbackMock.mockResolvedValueOnce({
+        result: {
+          payloads: [{ text: "test output" }],
+          meta: {
+            agentMeta: {
+              provider: "openai",
+              model: "gpt-5.4",
+              agentHarnessId: "codex",
+              contextTokens: 1_000_000,
+              contextTokensSource: "runtime",
+            },
+          },
+        },
+        provider: "openai",
+        model: "gpt-5.4",
+      });
+
+      const result = await runSkillFilterCase();
+
+      expect(result.status).toBe("ok");
+      expect(session.sessionEntry.agentHarnessId).toBe("codex");
+      expect(session.sessionEntry.contextTokens).toBe(1_000_000);
+      expect(session.sessionEntry.contextTokensSource).toBe("runtime");
+    });
+
+    it("preserves existing session contextTokens when no configured or cached model window is loaded", async () => {
+      const session = makeCronSession({
+        sessionEntry: makeCronSessionEntry({
+          modelProvider: "openai",
+          model: "gpt-5.4",
+          agentHarnessId: "codex",
+          contextTokens: 222_000,
+          contextTokensSource: "runtime",
+        }),
+      });
+      resolveCronSessionMock.mockReturnValue(session);
+      resolveContextTokensForModelMock.mockReturnValue(undefined);
+      runWithModelFallbackMock.mockResolvedValueOnce({
+        result: {
+          payloads: [{ text: "test output" }],
+          meta: {
+            agentMeta: {
+              provider: "openai",
+              model: "gpt-5.4",
+              agentHarnessId: "codex",
+            },
+          },
+        },
+        provider: "openai",
+        model: "gpt-5.4",
+      });
 
       const result = await runSkillFilterCase();
 
       expect(result.status).toBe("ok");
       expect(session.sessionEntry.contextTokens).toBe(222_000);
+      expect(session.sessionEntry.contextTokensSource).toBe("runtime");
+    });
+
+    it("preserves a matching lower runtime window when current model capacity is higher", async () => {
+      const session = makeCronSession({
+        sessionEntry: makeCronSessionEntry({
+          modelProvider: "openai",
+          model: "gpt-5.4",
+          agentHarnessId: "codex",
+          contextTokens: 222_000,
+          contextTokensSource: "runtime",
+        }),
+      });
+      resolveCronSessionMock.mockReturnValue(session);
+      resolveContextTokensForModelMock.mockReturnValue(512_000);
+      runWithModelFallbackMock.mockResolvedValueOnce({
+        result: {
+          payloads: [{ text: "test output" }],
+          meta: {
+            agentMeta: {
+              provider: "openai",
+              model: "gpt-5.4",
+              agentHarnessId: "codex",
+            },
+          },
+        },
+        provider: "openai",
+        model: "gpt-5.4",
+      });
+
+      const result = await runSkillFilterCase();
+
+      expect(result.status).toBe("ok");
+      expect(session.sessionEntry.contextTokens).toBe(222_000);
+      expect(session.sessionEntry.contextTokensSource).toBe("runtime");
+    });
+
+    it("preserves a locked session window when current model capacity differs", async () => {
+      const session = makeCronSession({
+        sessionEntry: makeCronSessionEntry({
+          modelProvider: "openai",
+          model: "gpt-5.4",
+          agentHarnessId: "codex",
+          contextTokens: 222_000,
+          modelSelectionLocked: true,
+        }),
+      });
+      resolveCronSessionMock.mockReturnValue(session);
+      resolveContextTokensForModelMock.mockReturnValue(512_000);
+      runWithModelFallbackMock.mockResolvedValueOnce({
+        result: {
+          payloads: [{ text: "test output" }],
+          meta: {
+            agentMeta: {
+              provider: "openai",
+              model: "gpt-5.4",
+              agentHarnessId: "codex",
+            },
+          },
+        },
+        provider: "openai",
+        model: "gpt-5.4",
+      });
+
+      const result = await runSkillFilterCase();
+
+      expect(result.status).toBe("ok");
+      expect(session.sessionEntry.contextTokens).toBe(222_000);
+      expect(session.sessionEntry.contextTokensSource).toBeUndefined();
+    });
+
+    it("prefers a current authored cap over matching older runtime telemetry", async () => {
+      const session = makeCronSession({
+        sessionEntry: makeCronSessionEntry({
+          modelProvider: "openai",
+          model: "gpt-5.4",
+          agentHarnessId: "codex",
+          contextTokens: 222_000,
+          contextTokensSource: "runtime",
+        }),
+      });
+      resolveCronSessionMock.mockReturnValue(session);
+      resolveContextTokensForModelMock.mockReturnValue(512_000);
+      runWithModelFallbackMock.mockResolvedValueOnce({
+        result: {
+          payloads: [{ text: "test output" }],
+          meta: {
+            agentMeta: {
+              provider: "openai",
+              model: "gpt-5.4",
+              agentHarnessId: "codex",
+            },
+          },
+        },
+        provider: "openai",
+        model: "gpt-5.4",
+      });
+
+      const result = await runSkillFilterCase({
+        cfg: {
+          models: {
+            providers: {
+              openai: {
+                models: [{ id: "gpt-5.4", contextTokens: 512_000 }],
+              },
+            },
+          },
+        },
+      });
+
+      expect(result.status).toBe("ok");
+      expect(session.sessionEntry.contextTokens).toBe(512_000);
+      expect(session.sessionEntry.contextTokensSource).toBe("resolved");
+    });
+
+    it("does not relabel a previous harness window when the current run reports none", async () => {
+      const session = makeCronSession({
+        sessionEntry: makeCronSessionEntry({
+          modelProvider: "openai",
+          model: "gpt-5.4",
+          agentHarnessId: "openclaw",
+          contextTokens: 222_000,
+          contextTokensSource: "runtime",
+          contextBudgetStatus: {} as NonNullable<
+            ReturnType<typeof makeCronSessionEntry>["contextBudgetStatus"]
+          >,
+        }),
+      });
+      resolveCronSessionMock.mockReturnValue(session);
+      resolveContextTokensForModelMock.mockReturnValue(undefined);
+      runWithModelFallbackMock.mockResolvedValueOnce({
+        result: {
+          payloads: [{ text: "test output" }],
+          meta: {
+            agentMeta: {
+              provider: "openai",
+              model: "gpt-5.4",
+              agentHarnessId: "codex",
+            },
+          },
+        },
+        provider: "openai",
+        model: "gpt-5.4",
+      });
+
+      const result = await runSkillFilterCase();
+
+      expect(result.status).toBe("ok");
+      expect(session.sessionEntry.agentHarnessId).toBe("codex");
+      expect(session.sessionEntry.contextTokens).toBe(128_000);
+      expect(session.sessionEntry.contextTokensSource).toBe("resolved");
+      expect(session.sessionEntry.contextBudgetStatus).toBeUndefined();
+    });
+
+    it("does not relabel a previous model window when the harness stays the same", async () => {
+      const session = makeCronSession({
+        sessionEntry: makeCronSessionEntry({
+          modelProvider: "openai",
+          model: "gpt-5.3",
+          agentHarnessId: "codex",
+          contextTokens: 222_000,
+          contextTokensSource: "runtime",
+          contextBudgetStatus: {} as NonNullable<
+            ReturnType<typeof makeCronSessionEntry>["contextBudgetStatus"]
+          >,
+        }),
+      });
+      resolveCronSessionMock.mockReturnValue(session);
+      resolveContextTokensForModelMock.mockReturnValue(undefined);
+      runWithModelFallbackMock.mockResolvedValueOnce({
+        result: {
+          payloads: [{ text: "test output" }],
+          meta: {
+            agentMeta: {
+              provider: "openai",
+              model: "gpt-5.4",
+              agentHarnessId: "codex",
+            },
+          },
+        },
+        provider: "openai",
+        model: "gpt-5.4",
+      });
+
+      const result = await runSkillFilterCase();
+
+      expect(result.status).toBe("ok");
+      expect(session.sessionEntry.model).toBe("gpt-5.4");
+      expect(session.sessionEntry.contextTokens).toBe(128_000);
+      expect(session.sessionEntry.contextTokensSource).toBe("resolved");
+      expect(session.sessionEntry.contextBudgetStatus).toBeUndefined();
     });
 
     it("prefers sync-configured model contextTokens over the previous session value", async () => {
       const session = makeCronSession({
         sessionEntry: makeCronSessionEntry({
           contextTokens: 222_000,
+          contextTokensSource: "runtime",
         }),
       });
       resolveCronSessionMock.mockReturnValue(session);
-      lookupContextTokensMock.mockReturnValue(512_000);
+      resolveContextTokensForModelMock.mockReturnValue(512_000);
 
       const result = await runSkillFilterCase();
 
       expect(result.status).toBe("ok");
       expect(session.sessionEntry.contextTokens).toBe(512_000);
-      expect(lookupContextTokensMock).toHaveBeenCalledWith("gpt-5.4", {
+      expect(session.sessionEntry.contextTokensSource).toBe("resolved");
+      expect(resolveContextTokensForModelMock).toHaveBeenCalledWith({
+        cfg: expect.any(Object),
+        provider: "openai",
+        model: "gpt-5.4",
         allowAsyncLoad: false,
       });
     });

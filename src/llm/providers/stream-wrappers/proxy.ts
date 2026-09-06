@@ -1,24 +1,49 @@
+import { parseStrictFiniteNumber } from "@openclaw/normalization-core/number-coercion";
+// Proxy stream wrapper applies provider-specific wrappers around base stream functions.
 import {
   normalizeOptionalLowercaseString,
   readStringValue,
 } from "@openclaw/normalization-core/string-coerce";
 import { resolveProviderRequestPolicy } from "../../../agents/provider-attribution.js";
-import { resolveProviderRequestPolicyConfig } from "../../../agents/provider-request-config.js";
+import {
+  getModelProviderRequestRouteFacts,
+  resolveProviderRequestPolicyConfig,
+} from "../../../agents/provider-request-config.js";
 import type { StreamFn } from "../../../agents/runtime/index.js";
 import type { ThinkLevel } from "../../../auto-reply/thinking.js";
-import { parseStrictFiniteNumber } from "../../../infra/parse-finite-number.js";
+import { normalizeOpenAICompatibleReasoningPayload } from "../../../plugin-sdk/provider-stream-shared.js";
+import { parseBooleanValue } from "../../../utils/boolean.js";
 import { streamSimple } from "../../stream.js";
-import { applyAnthropicEphemeralCacheControlMarkers } from "./anthropic-cache-control-payload.js";
+import {
+  applyAnthropicEphemeralCacheControlMarkers,
+  resolveAnthropicEphemeralCacheControl,
+} from "./anthropic-cache-control-payload.js";
 import { isAnthropicModelRef } from "./anthropic-family-cache-semantics.js";
-import { mapThinkingLevelToReasoningEffort } from "./reasoning-effort-utils.js";
 import { streamWithPayloadPatch } from "./stream-payload-utils.js";
 const KILOCODE_FEATURE_HEADER = "X-KILOCODE-FEATURE";
 const KILOCODE_FEATURE_DEFAULT = "openclaw";
 const KILOCODE_FEATURE_ENV_VAR = "KILOCODE_FEATURE";
+const BOOLEAN_PARAM_PARSE_OPTIONS = {
+  truthy: ["1", "true", "yes", "on", "enable", "enabled"],
+  falsy: ["0", "false", "no", "off", "disable", "disabled"],
+};
 
 function resolveKilocodeAppHeaders(): Record<string, string> {
   const feature = process.env[KILOCODE_FEATURE_ENV_VAR]?.trim() || KILOCODE_FEATURE_DEFAULT;
   return { [KILOCODE_FEATURE_HEADER]: feature };
+}
+
+function resolveModelEndpointClass(model: Parameters<StreamFn>[0]) {
+  return (
+    getModelProviderRequestRouteFacts(model)?.capabilities.endpointClass ??
+    resolveProviderRequestPolicy({
+      provider: readStringValue(model.provider),
+      api: readStringValue(model.api),
+      baseUrl: readStringValue(model.baseUrl),
+      capability: "llm",
+      transport: "stream",
+    }).endpointClass
+  );
 }
 
 function readExtraParam(
@@ -32,26 +57,6 @@ function readExtraParam(
     if (Object.hasOwn(extraParams, key)) {
       return extraParams[key];
     }
-  }
-  return undefined;
-}
-
-function resolveBooleanParam(value: unknown): boolean | undefined {
-  if (typeof value === "boolean") {
-    return value;
-  }
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const normalized = normalizeOptionalLowercaseString(value);
-  if (!normalized) {
-    return undefined;
-  }
-  if (["1", "true", "yes", "on", "enable", "enabled"].includes(normalized)) {
-    return true;
-  }
-  if (["0", "false", "no", "off", "disable", "disabled"].includes(normalized)) {
-    return false;
   }
   return undefined;
 }
@@ -71,13 +76,7 @@ function resolveOpenRouterResponseCacheTtlSeconds(value: unknown): string | unde
 
 function shouldApplyOpenRouterResponseCacheHeaders(model: Parameters<StreamFn>[0]): boolean {
   const provider = readStringValue(model.provider);
-  const endpointClass = resolveProviderRequestPolicy({
-    provider,
-    api: readStringValue(model.api),
-    baseUrl: readStringValue(model.baseUrl),
-    capability: "llm",
-    transport: "stream",
-  }).endpointClass;
+  const endpointClass = resolveModelEndpointClass(model);
   return (
     endpointClass === "openrouter" ||
     (endpointClass === "default" && normalizeOptionalLowercaseString(provider) === "openrouter")
@@ -91,11 +90,13 @@ function resolveOpenRouterResponseCacheHeaders(
   if (!shouldApplyOpenRouterResponseCacheHeaders(model)) {
     return undefined;
   }
-  const configuredCache = resolveBooleanParam(
+  const configuredCache = parseBooleanValue(
     readExtraParam(extraParams, ["responseCache", "response_cache"]),
+    BOOLEAN_PARAM_PARSE_OPTIONS,
   );
-  const clearCache = resolveBooleanParam(
+  const clearCache = parseBooleanValue(
     readExtraParam(extraParams, ["responseCacheClear", "response_cache_clear"]),
+    BOOLEAN_PARAM_PARSE_OPTIONS,
   );
   const cacheEnabled = configuredCache ?? (clearCache ? true : undefined);
   if (cacheEnabled === undefined) {
@@ -126,49 +127,18 @@ function resolveOpenRouterResponseCacheHeaders(
   return headers;
 }
 
-function normalizeProxyReasoningPayload(payload: unknown, thinkingLevel?: ThinkLevel): void {
-  if (!payload || typeof payload !== "object") {
-    return;
-  }
-
-  const payloadObj = payload as Record<string, unknown>;
-  delete payloadObj.reasoning_effort;
-  if (!thinkingLevel || thinkingLevel === "off") {
-    return;
-  }
-
-  const existingReasoning = payloadObj.reasoning;
-  if (
-    existingReasoning &&
-    typeof existingReasoning === "object" &&
-    !Array.isArray(existingReasoning)
-  ) {
-    const reasoningObj = existingReasoning as Record<string, unknown>;
-    if (!("max_tokens" in reasoningObj) && !("effort" in reasoningObj)) {
-      reasoningObj.effort = mapThinkingLevelToReasoningEffort(thinkingLevel);
-    }
-  } else if (!existingReasoning) {
-    payloadObj.reasoning = {
-      effort: mapThinkingLevelToReasoningEffort(thinkingLevel),
-    };
-  }
-}
-
 /** @deprecated OpenRouter provider-owned stream helper; do not use from third-party plugins. */
-export function createOpenRouterSystemCacheWrapper(baseStreamFn: StreamFn | undefined): StreamFn {
+export function createOpenRouterSystemCacheWrapper(
+  baseStreamFn: StreamFn | undefined,
+  extraParams?: Record<string, unknown>,
+): StreamFn {
   const underlying = baseStreamFn ?? streamSimple;
   return (model, context, options) => {
     const provider = readStringValue(model.provider);
     const modelId = readStringValue(model.id);
     // Keep OpenRouter-specific cache markers on verified OpenRouter routes
     // (or the provider's default route), but not on arbitrary OpenAI proxies.
-    const endpointClass = resolveProviderRequestPolicy({
-      provider,
-      api: readStringValue(model.api),
-      baseUrl: readStringValue(model.baseUrl),
-      capability: "llm",
-      transport: "stream",
-    }).endpointClass;
+    const endpointClass = resolveModelEndpointClass(model);
     if (
       !modelId ||
       !isAnthropicModelRef(modelId) ||
@@ -180,10 +150,35 @@ export function createOpenRouterSystemCacheWrapper(baseStreamFn: StreamFn | unde
       return underlying(model, context, options);
     }
 
-    return streamWithPayloadPatch(underlying, model, context, options, (payloadObj) => {
-      applyAnthropicEphemeralCacheControlMarkers(payloadObj);
-    });
+    const cacheRetention =
+      readCacheRetention(options?.cacheRetention) ??
+      readCacheRetention(extraParams?.cacheRetention);
+    return streamWithPayloadPatch(
+      underlying,
+      model,
+      context,
+      stripCacheRetentionOption(options),
+      (payloadObj) => {
+        applyAnthropicEphemeralCacheControlMarkers(
+          payloadObj,
+          resolveAnthropicEphemeralCacheControl(readStringValue(model.baseUrl), cacheRetention) ??
+            null,
+        );
+      },
+    );
   };
+}
+
+function readCacheRetention(value: unknown): "long" | "none" | "short" | undefined {
+  return value === "long" || value === "none" || value === "short" ? value : undefined;
+}
+
+function stripCacheRetentionOption(options: Parameters<StreamFn>[2]): Parameters<StreamFn>[2] {
+  if (!options || !Object.hasOwn(options, "cacheRetention")) {
+    return options;
+  }
+  const { cacheRetention: _cacheRetention, ...rest } = options;
+  return rest;
 }
 
 /** @deprecated OpenRouter provider-owned stream helper; do not use from third-party plugins. */
@@ -201,6 +196,7 @@ export function createOpenRouterWrapper(
       baseUrl: readStringValue(model.baseUrl),
       capability: "llm",
       transport: "stream",
+      routeFacts: getModelProviderRequestRouteFacts(model),
       callerHeaders: options?.headers,
       providerHeaders,
       precedence: "caller-wins",
@@ -214,7 +210,7 @@ export function createOpenRouterWrapper(
         headers,
       },
       (payload) => {
-        normalizeProxyReasoningPayload(payload, thinkingLevel);
+        normalizeOpenAICompatibleReasoningPayload(payload, thinkingLevel);
       },
     );
   };
@@ -240,6 +236,7 @@ export function createKilocodeWrapper(
       baseUrl: readStringValue(model.baseUrl),
       capability: "llm",
       transport: "stream",
+      routeFacts: getModelProviderRequestRouteFacts(model),
       callerHeaders: options?.headers,
       providerHeaders: resolveKilocodeAppHeaders(),
       precedence: "defaults-win",
@@ -253,7 +250,7 @@ export function createKilocodeWrapper(
         headers,
       },
       (payload) => {
-        normalizeProxyReasoningPayload(payload, thinkingLevel);
+        normalizeOpenAICompatibleReasoningPayload(payload, thinkingLevel);
       },
     );
   };

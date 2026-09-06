@@ -1,9 +1,7 @@
-/**
- * @deprecated Compatibility subpath for shipped approval reaction helpers.
- * New plugin code should use the focused approval runtime/reply subpaths.
- */
 import { sanitizeForPromptLiteral } from "../agents/sanitize-for-prompt.js";
 import { formatApprovalDisplayPath } from "../infra/approval-display-paths.js";
+import { summarizeApprovalScope } from "../infra/approval-scope.js";
+import { normalizeApprovalRequest, type ChannelApprovalKind } from "../infra/approval-types.js";
 import { buildPendingApprovalView } from "../infra/approval-view-model.js";
 import type { ApprovalRequest, PendingApprovalView } from "../infra/approval-view-model.types.js";
 import {
@@ -12,15 +10,25 @@ import {
   type ExecApprovalPendingReplyParams,
   type ExecApprovalReplyDecision,
 } from "../infra/exec-approval-reply.js";
-import type { PluginApprovalRequest } from "../infra/plugin-approvals.js";
+import { pruneMapToMaxSize } from "../infra/map-size.js";
+import { formatFencedCodeBlock } from "../shared/markdown-code.js";
 import {
   buildApprovalPendingReplyPayload,
   buildPluginApprovalPendingReplyPayload,
 } from "./approval-renderers.js";
-export { shouldSuppressLocalNativeExecApprovalPrompt } from "./approval-native-helpers.js";
 import type { ReplyPayload } from "./reply-payload.js";
+export { shouldSuppressLocalNativeExecApprovalPrompt } from "./approval-native-helpers.js";
+export {
+  approvalReactionDecisionSetsMatch,
+  buildApprovalReactionDeliveredBindingMarker,
+  normalizeApprovalReactionDecision,
+  readApprovalReactionDecisionList,
+  readApprovalReactionDeliveredBinding,
+  readApprovalReactionDeliveryMetadata,
+  readApprovalReactionPresentationBinding,
+  type ApprovalReactionDeliveryBinding,
+} from "./approval-reaction-binding.js";
 
-type ApprovalKind = "exec" | "plugin";
 type KeyedStore<TValue> = {
   register(key: string, value: TValue, opts?: { ttlMs?: number }): Promise<void>;
   lookup(key: string): Promise<TValue | undefined>;
@@ -37,6 +45,7 @@ type InMemoryApprovalReactionTarget<TTarget> = {
   expiresAtMs: number;
 };
 
+/** In-memory or backed store for approval targets awaiting reaction decisions. */
 export type ApprovalReactionTargetStore<TTarget> = {
   register(key: string, target: TTarget, opts?: { ttlMs?: number }): void;
   lookup(key: string): Promise<TTarget | null>;
@@ -44,42 +53,50 @@ export type ApprovalReactionTargetStore<TTarget> = {
   clearForTest(): void;
 };
 
+/** Product-ordered emoji binding for one approval decision. */
 export type ApprovalReactionDecisionBinding = {
   decision: ExecApprovalReplyDecision;
   emoji: string;
   label: string;
 };
 
+/** Normalized reaction decision resolved from a channel reaction key. */
 export type ApprovalReactionDecisionResolution = {
   decision: ExecApprovalReplyDecision;
   normalizedEmoji: string;
 };
 
+/** Stored target metadata needed to convert a reaction into an approval decision. */
 export type ApprovalReactionTargetRecord<TRoute = unknown> = {
   approvalId: string;
-  approvalKind?: ApprovalKind;
+  /** Explicit ownership; omission is supported only by the deprecated resolver. */
+  approvalKind?: ChannelApprovalKind;
   allowedDecisions: readonly ExecApprovalReplyDecision[];
   route?: TRoute;
   expiresAtMs?: number;
 };
 
+/** Resolved approval target and decision produced from a reaction event. */
 export type ApprovalReactionTargetResolution<TRoute = unknown> =
   ApprovalReactionDecisionResolution & {
     approvalId: string;
-    approvalKind: ApprovalKind;
+    approvalKind: ChannelApprovalKind;
     route?: TRoute;
   };
 
+/** Reply payload enriched with reaction decision metadata. */
 export type ApprovalReactionPromptPayload = ReplyPayload & {
   allowedDecisions: readonly ExecApprovalReplyDecision[];
   reactionBindings: readonly ApprovalReactionDecisionBinding[];
 };
 
+/** Pair of reaction-enabled and manual-fallback approval prompt payloads. */
 export type ApprovalReactionPendingContent = {
   reactionPayload: ApprovalReactionPromptPayload;
   manualFallbackPayload: ReplyPayload;
 };
 
+/** Canonical reaction controls shown for approval prompts, in product display order. */
 export const APPROVAL_REACTION_BINDINGS = [
   { decision: "allow-once", emoji: "👍", label: "Allow Once" },
   { decision: "allow-always", emoji: "♾️", label: "Allow Always" },
@@ -97,6 +114,7 @@ function normalizeDecisionList(
   return APPROVAL_REACTION_ORDER.filter((decision) => allowed.has(decision));
 }
 
+/** List the canonical reaction bindings allowed for a specific approval request. */
 export function listApprovalReactionBindings(params: {
   allowedDecisions: readonly ExecApprovalReplyDecision[];
 }): ApprovalReactionDecisionBinding[] {
@@ -110,6 +128,7 @@ export function listApprovalReactionBindings(params: {
   );
 }
 
+/** Build user-facing reaction instructions, or null when no reaction decisions are allowed. */
 export function buildApprovalReactionHint(params: {
   allowedDecisions: readonly ExecApprovalReplyDecision[];
 }): string | null {
@@ -120,17 +139,57 @@ export function buildApprovalReactionHint(params: {
   return `React with:\n\n${bindings.map((binding) => `${binding.emoji} ${binding.label}`).join("\n")}`;
 }
 
+const APPROVAL_REACTION_HINT_PRESENT_RE = /(^|\n)React with:\s*(\n|$)/i;
+
+/** True when approval prompt text already carries a reaction hint block. */
+export function hasApprovalReactionHintText(text?: string | null): boolean {
+  return APPROVAL_REACTION_HINT_PRESENT_RE.test(text ?? "");
+}
+
+/** Inserts a reaction hint after the `ID: <id>` header line, else prepends it. */
+export function insertApprovalReactionHintNearIdHeader(params: {
+  text: string;
+  hint: string;
+}): string {
+  const lines = params.text.split(/\r?\n/);
+  const idLineIndex = lines.findIndex((line) => /^ID:\s*\S+/.test(line.trim()));
+  if (idLineIndex >= 0) {
+    const before = lines.slice(0, idLineIndex + 1).join("\n");
+    const after = lines
+      .slice(idLineIndex + 1)
+      .join("\n")
+      .replace(/^\n+/, "");
+    return after ? `${before}\n\n${params.hint}\n\n${after}` : `${before}\n\n${params.hint}`;
+  }
+  return `${params.hint}\n\n${params.text}`;
+}
+
+/** Adds the canonical reaction hint to approval prompt text unless one is present. */
+export function addApprovalReactionHintToText(params: {
+  text: string;
+  allowedDecisions: readonly ExecApprovalReplyDecision[];
+}): string {
+  if (hasApprovalReactionHintText(params.text)) {
+    return params.text;
+  }
+  const hint = buildApprovalReactionHint({ allowedDecisions: params.allowedDecisions });
+  return hint ? insertApprovalReactionHintNearIdHeader({ text: params.text, hint }) : params.text;
+}
+
+/** Normalize reaction emoji so skin-tone and text/presentation variants match canonical bindings. */
 export function normalizeApprovalReactionEmoji(reactionKey: string): string {
   const normalized = reactionKey
     .trim()
     .replace(VARIATION_SELECTOR_RE, "")
     .replace(FITZPATRICK_MODIFIER_RE, "");
+  // Infinity commonly arrives without the emoji variation selector; restore the canonical binding.
   if (normalized === "♾") {
     return "♾️";
   }
   return normalized;
 }
 
+/** Resolve a reaction key to an allowed approval decision. */
 export function resolveApprovalReactionDecision(params: {
   reactionKey: string;
   allowedDecisions: readonly ExecApprovalReplyDecision[];
@@ -147,9 +206,10 @@ export function resolveApprovalReactionDecision(params: {
   return null;
 }
 
-export function resolveApprovalReactionTarget<TRoute = unknown>(params: {
+function resolveApprovalReactionTargetInternal<TRoute>(params: {
   target: ApprovalReactionTargetRecord<TRoute> | null | undefined;
   reactionKey: string;
+  allowLegacyKindInference: boolean;
 }): ApprovalReactionTargetResolution<TRoute> | null {
   const target = params.target;
   if (!target) {
@@ -162,25 +222,45 @@ export function resolveApprovalReactionTarget<TRoute = unknown>(params: {
   if (!decision) {
     return null;
   }
-  const approvalId = target.approvalId.trim();
+  // Typed targets already carry canonical protocol identity. Preserve it byte-for-byte;
+  // only the shipped ownerless path retains its historical trimming behavior.
+  const approvalId = params.allowLegacyKindInference ? target.approvalId.trim() : target.approvalId;
+  const approvalKind = target.approvalKind;
   if (!approvalId) {
+    return null;
+  }
+  const resolvedKind =
+    approvalKind === "exec" || approvalKind === "plugin"
+      ? approvalKind
+      : params.allowLegacyKindInference
+        ? approvalId.startsWith("plugin:")
+          ? "plugin"
+          : "exec"
+        : null;
+  if (!resolvedKind) {
     return null;
   }
   return {
     approvalId,
-    approvalKind: target.approvalKind ?? (approvalId.startsWith("plugin:") ? "plugin" : "exec"),
+    approvalKind: resolvedKind,
     decision: decision.decision,
     normalizedEmoji: decision.normalizedEmoji,
     ...(target.route === undefined ? {} : { route: target.route }),
   };
 }
 
-function buildFence(text: string, language?: string): string {
-  let fence = "```";
-  while (text.includes(fence)) {
-    fence += "`";
-  }
-  return `${fence}${language ?? ""}\n${text}\n${fence}`;
+/** Resolve an explicitly typed target without deriving ownership from its id. */
+export function resolveTypedApprovalReactionTarget<TRoute = unknown>(params: {
+  target:
+    | (ApprovalReactionTargetRecord<TRoute> & { approvalKind: ChannelApprovalKind })
+    | null
+    | undefined;
+  reactionKey: string;
+}): ApprovalReactionTargetResolution<TRoute> | null {
+  return resolveApprovalReactionTargetInternal({
+    ...params,
+    allowLegacyKindInference: false,
+  });
 }
 
 function formatSeverity(value: "info" | "warning" | "critical"): string {
@@ -192,13 +272,16 @@ function buildDecisionText(allowedDecisions: readonly ExecApprovalReplyDecision[
 }
 
 function buildManualInstructionSection(params: {
+  approvalKind: ChannelApprovalKind;
   approvalId: string;
   allowedDecisions: readonly ExecApprovalReplyDecision[];
 }): string[] {
   const lines: string[] = [];
   if (!params.allowedDecisions.includes("allow-always")) {
     lines.push(
-      "Allow Always is unavailable because the effective policy requires approval every time.",
+      params.approvalKind === "exec"
+        ? "Allow Always is unavailable for this command."
+        : "Allow Always is unavailable because the effective policy requires approval every time.",
     );
   }
   if (params.allowedDecisions.length > 0) {
@@ -226,61 +309,90 @@ function buildApprovalReactionPromptText(params: {
   reactionHint: string | null;
 }): string {
   const { view } = params;
+  const scopeSummary = view.scope ? summarizeApprovalScope(view.scope) : undefined;
   const allowedDecisions = listDecisionActions(view.actions);
   const sections: string[] = [];
   if (view.approvalKind === "exec") {
-    const header = ["Exec approval required", `ID: ${view.approvalId}`];
+    // Bold headers and field labels (#85954). Channels that render markdown
+    // translate these into native styling — iMessage into attributed-body
+    // ranges — and channels that downgrade drop the markers cleanly.
+    const header = ["**Exec approval required**", `**ID:** ${view.approvalId}`];
     sections.push(header.join("\n"));
     const warningText = view.warningText?.trim();
     if (warningText) {
-      sections.push(warningText);
+      // The auto-review rationale is the reason for the interruption, so bold
+      // it. It is generated text: the reaction-runtime renderers parse to an
+      // IR, so an unmatched `*`/`_` in the rationale degrades to imperfect
+      // styling rather than a delivery failure, but the emphasis is not
+      // guaranteed pixel-perfect for hostile rationale text.
+      sections.push(`**${warningText}**`);
     }
     const warningLines = view.commandAnalysis?.warningLines
       ?.map((line) => line.trim())
       .filter(Boolean)
       .slice(0, 5);
     if (warningLines?.length) {
-      sections.push(["Command analysis:", ...warningLines.map((line) => `- ${line}`)].join("\n"));
+      sections.push(
+        ["**Command analysis:**", ...warningLines.map((line) => `- ${line}`)].join("\n"),
+      );
     }
-    sections.push(["Pending command:", buildFence(view.commandText, "sh")].join("\n"));
+    sections.push(
+      ["**Pending command:**", formatFencedCodeBlock(view.commandText, "sh")].join("\n"),
+    );
     const info: string[] = [];
     if (view.cwd) {
-      info.push(`CWD: ${formatApprovalDisplayPath(sanitizeForPromptLiteral(view.cwd))}`);
+      info.push(`**CWD:** ${formatApprovalDisplayPath(sanitizeForPromptLiteral(view.cwd))}`);
     }
     if (view.host) {
-      info.push(`Host: ${view.host}`);
+      info.push(`**Host:** ${view.host}`);
     }
     if (view.nodeId) {
-      info.push(`Node: ${view.nodeId}`);
+      info.push(`**Node:** ${view.nodeId}`);
+    }
+    if (scopeSummary) {
+      info.push(`**Scope:** ${scopeSummary}`);
     }
     if (view.agentId) {
-      info.push(`Agent: ${view.agentId}`);
+      info.push(`**Agent:** ${view.agentId}`);
     }
     if (view.ask) {
-      info.push(`Ask: ${view.ask}`);
+      info.push(`**Ask:** ${view.ask}`);
     }
-    info.push(`Expires in: ${formatExecApprovalExpiresIn(view.expiresAtMs, params.nowMs)}`);
-    info.push(`Full id: \`${view.approvalId}\``);
+    info.push(`**Expires in:** ${formatExecApprovalExpiresIn(view.expiresAtMs, params.nowMs)}`);
+    info.push(`**Full id:** \`${view.approvalId}\``);
     sections.push(info.join("\n"));
-  } else {
-    const header = ["Plugin approval required", `ID: ${view.approvalId}`];
-    sections.push(header.join("\n"));
-    const details = [`Title: ${view.title}`];
-    if (view.description) {
-      details.push(`Description: ${view.description}`);
+  } else if (view.approvalKind === "system-agent") {
+    const details = [
+      "**OpenClaw change requires approval**",
+      `**Change:** ${view.operationSummary}`,
+    ];
+    if (view.agentId) {
+      details.push(`**Agent:** ${view.agentId}`);
     }
-    details.push(`Severity: ${formatSeverity(view.severity)}`);
+    details.push(`**Expires in:** ${formatExecApprovalExpiresIn(view.expiresAtMs, params.nowMs)}`);
+    sections.push(details.join("\n"));
+  } else {
+    const header = ["**Plugin approval required**", `**ID:** ${view.approvalId}`];
+    sections.push(header.join("\n"));
+    const details = [`**Title:** ${view.title}`];
+    if (view.description) {
+      details.push(`**Description:** ${view.description}`);
+    }
+    if (scopeSummary) {
+      details.push(`**Scope:** ${scopeSummary}`);
+    }
+    details.push(`**Severity:** ${formatSeverity(view.severity)}`);
     if (view.toolName) {
-      details.push(`Tool: ${view.toolName}`);
+      details.push(`**Tool:** ${view.toolName}`);
     }
     if (view.pluginId) {
-      details.push(`Plugin: ${view.pluginId}`);
+      details.push(`**Plugin:** ${view.pluginId}`);
     }
     if (view.agentId) {
-      details.push(`Agent: ${view.agentId}`);
+      details.push(`**Agent:** ${view.agentId}`);
     }
-    details.push(`Expires in: ${formatExecApprovalExpiresIn(view.expiresAtMs, params.nowMs)}`);
-    details.push(`Full id: \`${view.approvalId}\``);
+    details.push(`**Expires in:** ${formatExecApprovalExpiresIn(view.expiresAtMs, params.nowMs)}`);
+    details.push(`**Full id:** \`${view.approvalId}\``);
     sections.push(details.join("\n"));
   }
   if (params.reactionHint) {
@@ -291,6 +403,7 @@ function buildApprovalReactionPromptText(params: {
     sections.push(commandInstructions.join("\n"));
   }
   const manualInstructions = buildManualInstructionSection({
+    approvalKind: view.approvalKind,
     approvalId: view.approvalId,
     allowedDecisions,
   });
@@ -311,10 +424,7 @@ function buildMetadataPayload(params: {
   text: string;
   allowedDecisions: readonly ExecApprovalReplyDecision[];
 }): ReplyPayload {
-  const sessionKey =
-    params.request.request && "sessionKey" in params.request.request
-      ? params.request.request.sessionKey
-      : null;
+  const sessionKey = params.request.request.sessionKey ?? null;
   return withoutPresentation(
     buildApprovalPendingReplyPayload({
       approvalKind: params.view.approvalKind,
@@ -328,6 +438,7 @@ function buildMetadataPayload(params: {
   );
 }
 
+/** Build an approval prompt payload with reaction bindings for a prepared view. */
 export function buildApprovalPendingPromptPayload(params: {
   request: ApprovalRequest;
   view: PendingApprovalView;
@@ -352,6 +463,7 @@ export function buildApprovalPendingPromptPayload(params: {
   };
 }
 
+/** Build an approval prompt payload with reaction bindings directly from a request. */
 export function buildApprovalReactionPromptPayloadForRequest(params: {
   request: ApprovalRequest;
   nowMs: number;
@@ -367,46 +479,95 @@ function replaceApprovalIdPlaceholder(text: string | undefined, approvalId: stri
   return (text ?? "").replace(/\/approve\s+<id>/g, `/approve ${approvalId}`);
 }
 
+/** Build reaction and manual-fallback pending approval content for a prepared view. */
 export function buildApprovalReactionPendingContent(params: {
   request: ApprovalRequest;
   view: PendingApprovalView;
   nowMs: number;
 }): ApprovalReactionPendingContent {
   const reactionPayload = buildApprovalPendingPromptPayload(params);
-  const manualFallbackPayload =
-    params.view.approvalKind === "plugin"
-      ? (() => {
-          const payload = buildPluginApprovalPendingReplyPayload({
-            request: params.request as PluginApprovalRequest,
-            nowMs: params.nowMs,
-            allowedDecisions: reactionPayload.allowedDecisions,
-          });
-          return withoutPresentation({
-            ...payload,
-            text: replaceApprovalIdPlaceholder(payload.text, params.request.id),
-          });
-        })()
-      : withoutPresentation(
-          buildExecApprovalPendingReplyPayload({
-            approvalId: params.request.id,
-            approvalSlug: params.request.id.slice(0, 8),
-            approvalCommandId: params.request.id,
-            warningText: params.view.warningText ?? undefined,
-            ask: params.view.ask ?? null,
-            agentId: params.view.agentId ?? null,
-            allowedDecisions: reactionPayload.allowedDecisions,
-            command: params.view.commandText,
-            cwd: params.view.cwd ?? undefined,
-            host: params.view.host === "node" ? "node" : "gateway",
-            nodeId: params.view.nodeId ?? undefined,
-            sessionKey: params.view.sessionKey ?? null,
-            expiresAtMs: params.request.expiresAtMs,
-            nowMs: params.nowMs,
-          } satisfies ExecApprovalPendingReplyParams),
-        );
-  return { reactionPayload, manualFallbackPayload };
+  const request = normalizeApprovalRequest(params.request);
+  if (params.view.approvalKind === "plugin") {
+    if (request.approvalKind !== "plugin") {
+      throw new Error("approval request and view kinds do not match");
+    }
+    const payload = buildPluginApprovalPendingReplyPayload({
+      request,
+      nowMs: params.nowMs,
+      allowedDecisions: reactionPayload.allowedDecisions,
+    });
+    return {
+      reactionPayload,
+      manualFallbackPayload: withoutPresentation({
+        ...payload,
+        text: replaceApprovalIdPlaceholder(payload.text, request.id),
+      }),
+    };
+  }
+  if (params.view.approvalKind === "system-agent") {
+    if (request.approvalKind !== "system-agent") {
+      throw new Error("approval request and view kinds do not match");
+    }
+    return {
+      reactionPayload,
+      manualFallbackPayload: withoutPresentation(
+        buildApprovalPendingReplyPayload({
+          approvalKind: "system-agent",
+          approvalId: request.id,
+          approvalSlug: request.id.slice(0, 8),
+          text: reactionPayload.text ?? "",
+          agentId: params.view.agentId ?? null,
+          allowedDecisions: reactionPayload.allowedDecisions,
+          sessionKey: request.request.sessionKey ?? null,
+        }),
+      ),
+    };
+  }
+  if (request.approvalKind !== "exec") {
+    throw new Error("approval request and view kinds do not match");
+  }
+  return {
+    reactionPayload,
+    manualFallbackPayload: withoutPresentation(
+      buildExecApprovalPendingReplyPayload({
+        approvalId: request.id,
+        approvalSlug: request.id.slice(0, 8),
+        approvalCommandId: request.id,
+        warningText: params.view.warningText ?? undefined,
+        ask: params.view.ask ?? null,
+        agentId: params.view.agentId ?? null,
+        allowedDecisions: reactionPayload.allowedDecisions,
+        command: params.view.commandText,
+        cwd: params.view.cwd ?? undefined,
+        host: params.view.host === "node" ? "node" : "gateway",
+        nodeId: params.view.nodeId ?? undefined,
+        scope: params.view.scope ?? undefined,
+        sessionKey: params.view.sessionKey ?? null,
+        expiresAtMs: request.expiresAtMs,
+        nowMs: params.nowMs,
+      } satisfies ExecApprovalPendingReplyParams),
+    ),
+  };
 }
 
+/**
+ * Prompt copy for channels whose native controls (Apple Messages polls, inline
+ * buttons) own the decision surface. Same bold headers and labels as the
+ * reaction prompt (#85954) minus the tapback hint, which would advertise a
+ * second, redundant control path next to the native one.
+ */
+export function buildApprovalNativeControlsPromptText(params: {
+  view: PendingApprovalView;
+  nowMs: number;
+}): string {
+  return buildApprovalReactionPromptText({
+    view: params.view,
+    nowMs: params.nowMs,
+    reactionHint: null,
+  });
+}
+
+/** Build reaction and manual-fallback pending approval content directly from a request. */
 export function buildApprovalReactionPendingContentForRequest(params: {
   request: ApprovalRequest;
   nowMs: number;
@@ -418,6 +579,7 @@ export function buildApprovalReactionPendingContentForRequest(params: {
   });
 }
 
+/** Create an approval target store backed by memory with optional persistent storage. */
 export function createApprovalReactionTargetStore<TTarget>(params: {
   namespace: string;
   maxEntries: number;
@@ -431,7 +593,7 @@ export function createApprovalReactionTargetStore<TTarget>(params: {
   readPersistedTarget?: (target: unknown) => TTarget | null;
   nowMs?: () => number;
 }): ApprovalReactionTargetStore<TTarget> {
-  const nowMs = params.nowMs ?? Date.now;
+  const nowMs = params.nowMs ?? (() => Date.now());
   const memory = new Map<string, InMemoryApprovalReactionTarget<TTarget>>();
   let persistentStore: KeyedStore<PersistedApprovalReactionTarget<TTarget>> | undefined;
   let persistentStoreDisabled = false;
@@ -469,13 +631,7 @@ export function createApprovalReactionTargetStore<TTarget>(params: {
         memory.delete(key);
       }
     }
-    while (memory.size > params.maxEntries) {
-      const oldestKey = memory.keys().next().value;
-      if (!oldestKey) {
-        return;
-      }
-      memory.delete(oldestKey);
-    }
+    pruneMapToMaxSize(memory, params.maxEntries);
   };
 
   return {

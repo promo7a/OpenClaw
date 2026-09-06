@@ -1,3 +1,8 @@
+/**
+ * Tests safe-bin exec policy inside assembled coding tools.
+ * Verifies safe-bin profiles and supervisor spawn wiring without loading real
+ * shell environment state.
+ */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,7 +11,7 @@ import type { OpenClawConfig } from "../config/config.js";
 import type { ExecApprovalsResolved } from "../infra/exec-approvals.js";
 import type { SafeBinProfileFixture } from "../infra/exec-safe-bin-policy.js";
 import { withEnvAsync } from "../test-utils/env.js";
-import { resetProcessRegistryForTests } from "./bash-process-registry.js";
+import { resetProcessRegistryForTests } from "./bash-process-registry.test-support.js";
 
 let createOpenClawCodingTools: typeof import("./agent-tools.js").createOpenClawCodingTools;
 
@@ -51,6 +56,7 @@ const { mockExecApprovals, supervisorSpawnMock } = vi.hoisted(() => {
       async (input: { argv?: string[]; onStdout?: (chunk: string) => void }) => {
         input.onStdout?.(`${input.argv?.join(" ") ?? ""}\n`);
         return {
+          activity: { resultSettled: true, lastOutputAtMs: Date.now() },
           runId: "safe-bins-test-run",
           pid: 1234,
           startedAtMs: Date.now(),
@@ -102,8 +108,6 @@ vi.mock("../process/supervisor/index.js", () => ({
     spawn: supervisorSpawnMock,
     cancel: vi.fn(),
     cancelScope: vi.fn(),
-    reconcileOrphans: vi.fn(),
-    getRecord: vi.fn(),
   }),
 }));
 
@@ -113,9 +117,13 @@ vi.mock("./channel-tools.js", () => ({
   listChannelAgentTools: () => [],
 }));
 
-vi.mock("./openclaw-tools.js", () => ({
-  createOpenClawTools: () => [],
-}));
+vi.mock("./openclaw-tools.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./openclaw-tools.js")>();
+  return {
+    createOpenClawTools: () => [],
+    filterToolsByClientCaps: actual.filterToolsByClientCaps,
+  };
+});
 
 vi.mock("./bash-tools.exec-host-shared.js", async () => {
   const mod = await vi.importActual<typeof import("./bash-tools.exec-host-shared.js")>(
@@ -133,9 +141,7 @@ vi.mock("./bash-tools.exec-host-shared.js", async () => {
 });
 
 vi.mock("../plugins/tools.js", () => ({
-  copyPluginToolMeta: vi.fn((_from, to) => to),
   resolvePluginTools: () => [],
-  getPluginToolMeta: () => undefined,
 }));
 
 vi.mock("openclaw/plugin-sdk/agent-sessions", () => ({
@@ -161,6 +167,7 @@ vi.mock("../infra/exec-approvals.js", async () => {
     ...mod,
     loadExecApprovals: () => approvals.file,
     resolveExecApprovals: () => approvals,
+    resolveExecApprovalsLocked: async () => approvals,
   };
 });
 
@@ -195,8 +202,7 @@ async function createSafeBinsExecTool(params: {
     tools: {
       exec: {
         host: "gateway",
-        security: "allowlist",
-        ask: "off",
+        mode: "allowlist",
         safeBins: params.safeBins,
         safeBinProfiles: params.safeBinProfiles,
       },

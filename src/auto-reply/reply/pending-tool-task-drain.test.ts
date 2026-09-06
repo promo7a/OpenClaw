@@ -1,3 +1,4 @@
+// Tests pending tool task drain ordering, settlement, and failure handling.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { drainPendingToolTasks } from "./pending-tool-task-drain.js";
 
@@ -63,6 +64,21 @@ describe("drainPendingToolTasks", () => {
     second.resolve();
     await expect(drain).resolves.toEqual({ kind: "settled" });
     expect(onTimeout).not.toHaveBeenCalled();
+  });
+
+  it("drains tasks added after the initial snapshot", async () => {
+    const first = deferredTask();
+    const second = deferredTask();
+    const tasks = new Set([first.promise]);
+
+    const drain = drainPendingToolTasks({ tasks, idleTimeoutMs: 1_000 });
+    tasks.add(second.promise);
+    first.resolve();
+    await flushPromises();
+    expect(tasks).toEqual(new Set([second.promise]));
+
+    second.resolve();
+    await expect(drain).resolves.toEqual({ kind: "settled" });
   });
 
   it("returns timeout when no pending task settles before the idle window", async () => {

@@ -1,4 +1,5 @@
-function formatCloseValue(value) {
+// WebSocket open/close wait helper for E2E clients.
+export function formatCloseValue(value) {
   if (value === undefined || value === null) {
     return "";
   }

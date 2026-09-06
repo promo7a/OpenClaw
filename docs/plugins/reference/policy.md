@@ -16,7 +16,7 @@ Adds policy-backed doctor checks for workspace conformance.
 
 ## Surface
 
-plugin
+CLI commands: `openclaw policy`
 
 <!-- openclaw-plugin-reference:manual-start -->
 
@@ -27,7 +27,7 @@ settings and governed workspace declarations. Policy currently covers channel
 conformance, governed tool metadata, MCP server posture, model-provider posture,
 private-network access posture, Gateway exposure posture, agent workspace/tool
 posture, configured global/per-agent tool posture, configured sandbox runtime
-posture, ingress/channel access posture, and OpenClaw config secret
+posture, ingress/channel access posture, data-handling posture, and OpenClaw config secret
 provider/auth profile posture.
 
 Policy stores authored requirements in `policy.jsonc`, observes existing
@@ -35,6 +35,10 @@ OpenClaw settings and workspace declarations as evidence, and reports drift
 through `openclaw policy check` and `openclaw doctor --lint`. A clean policy
 check emits policy, evidence, findings, and attestation hashes that operators
 can record for audit.
+
+`openclaw policy check`, `watch`, and workspace-relative `compare` accept
+`--agent <id>`. Explicit multi-agent fleets must select the workspace owner;
+the plugin does not infer one from roster order.
 
 `openclaw policy compare --baseline <file>` compares one policy file to another
 policy file. It is config-level conformance only: it uses policy rule metadata
@@ -55,10 +59,17 @@ and require sandbox browser CDP source ranges.
 These checks observe config conformance only; they do not read runtime approval
 state, inspect live containers, or add runtime enforcement.
 
+Data-handling rules can require sensitive logging redaction, deny telemetry
+content capture, require session retention maintenance, and deny session
+transcript memory indexing. These checks observe config conformance only; they
+do not inspect raw logs, telemetry exports, transcripts, memory files, secrets,
+or personal data.
+
 Named policy scopes under `scopes.<scopeName>` can add stricter normal policy
 sections for the selector they list. `agentIds` supports `tools`,
-`agents.workspace`, and `sandbox`; `channelIds` supports `ingress.channels`.
-Runtime agent ids that are not explicitly listed in `agents.list[]` are checked
+`agents.workspace`, `sandbox`, and `dataHandling.memory`; `channelIds` supports
+`ingress.channels`.
+Runtime agent ids that are not explicitly listed in `agents.entries.*` are checked
 against inherited global/default posture rather than silently passing with no
 evidence. Every scope present in `policy.jsonc` must be valid and enforceable
 for its selector. Overlay rules are additional claims, so they do not weaken

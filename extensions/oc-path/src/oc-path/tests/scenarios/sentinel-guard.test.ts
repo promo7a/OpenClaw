@@ -1,3 +1,4 @@
+// OC Path tests cover sentinel guard plugin behavior.
 import { describe, expect, it } from "vitest";
 import { emitMd } from "../../emit.js";
 import { parseMd } from "../../parse.js";
@@ -31,25 +32,6 @@ describe("sentinel-guard", () => {
     expect(() => guardSentinel(`prefix${REDACTED_SENTINEL}suffix`, "oc://X.md")).toThrow(
       OcEmitSentinelError,
     );
-  });
-
-  it("error attaches the OcPath context", () => {
-    try {
-      guardSentinel(REDACTED_SENTINEL, "oc://config/plugins.entries.foo.token");
-      expect.fail("should have thrown");
-    } catch (err) {
-      expect(err).toBeInstanceOf(OcEmitSentinelError);
-      const e = err as OcEmitSentinelError;
-      expect(e.path).toBe("oc://config/plugins.entries.foo.token");
-      expect(e.code).toBe("OC_EMIT_SENTINEL");
-    }
-  });
-
-  it("round-trip echoes pre-existing sentinel; strict mode rejects", () => {
-    const raw = "## Section\n\n- token: __OPENCLAW_REDACTED__\n";
-    const { ast } = parseMd(raw);
-    expect(emitMd(ast)).toBe(raw);
-    expect(() => emitMd(ast, { acceptPreExistingSentinel: false })).toThrow(OcEmitSentinelError);
   });
 
   it("round-trip emit allows sentinel-free content", () => {

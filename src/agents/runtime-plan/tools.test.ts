@@ -1,12 +1,26 @@
+// Runtime plan tool tests cover schema normalization and diagnostics when the
+// runtime plan owns tool policy, with legacy provider fallback still available.
+
+import { expectDefined } from "@openclaw/normalization-core";
 import type { AgentTool } from "openclaw/plugin-sdk/agent-core";
 import {
   createNativeOpenAIResponsesModel,
   createParameterFreeTool,
   normalizedParameterFreeSchema,
 } from "openclaw/plugin-sdk/agent-runtime-test-contracts";
+import { Type } from "typebox";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { getPluginToolMeta, setPluginToolMeta } from "../../plugins/tools.js";
+import { getPluginToolMeta, setPluginToolMeta } from "../../plugins/tool-metadata.js";
+import {
+  isToolWrappedWithBeforeToolCallHook,
+  wrapToolWithBeforeToolCallHook,
+} from "../agent-tools.before-tool-call.js";
 import type { RuntimeToolSchemaDiagnostic } from "../tool-schema-projection.js";
+import {
+  getToolTerminalPresentation,
+  setToolTerminalPresentation,
+} from "../tool-terminal-presentation.js";
+import type { AnyAgentTool } from "../tools/common.js";
 import { logAgentRuntimeToolDiagnostics, normalizeAgentRuntimeTools } from "./tools.js";
 import type { AgentRuntimePlan } from "./types.js";
 
@@ -57,6 +71,8 @@ describe("AgentRuntimePlan tool policy helpers", () => {
   });
 
   it("quarantines unreadable tools before RuntimePlan normalization", () => {
+    // Broken plugin tool getters are removed before plan/provider normalization
+    // so one bad tool cannot crash the full runtime tool list.
     const healthy = { ...createParameterFreeTool(), name: "healthy" } as AgentTool;
     const unreadable = { ...createParameterFreeTool(), name: "fuzzplugin_unreadable" } as AgentTool;
     Object.defineProperty(unreadable, "parameters", {
@@ -189,18 +205,45 @@ describe("AgentRuntimePlan tool policy helpers", () => {
     });
   });
 
+  it("does not load a provider runtime to normalize an empty tool set", () => {
+    const onPreNormalizationSchemaDiagnostics = vi.fn();
+
+    expect(
+      normalizeAgentRuntimeTools({
+        tools: [],
+        provider: "openai",
+        onPreNormalizationSchemaDiagnostics,
+      }),
+    ).toEqual([]);
+    expect(onPreNormalizationSchemaDiagnostics).toHaveBeenCalledWith([], []);
+    expect(mocks.normalizeProviderToolSchemas).not.toHaveBeenCalled();
+  });
+
   it("preserves plugin metadata when provider schema normalization clones tools", () => {
+    // Provider normalization may clone tool objects; plugin metadata has to move
+    // with the clone so later dispatch still knows the owning plugin/MCP server.
     const tool = createParameterFreeTool("fixture__lookup_note") as AgentTool;
-    setPluginToolMeta(tool, {
+    const metadata: Parameters<typeof setPluginToolMeta>[1] = {
       pluginId: "bundle-mcp",
-      optional: false,
+      kind: "memory",
+      optional: true,
+      replaySafe: true,
+      sideEffecting: true,
+      trustedLocalMedia: false,
       mcp: {
         serverName: "fixture",
         safeServerName: "fixture",
         toolName: "lookup_note",
         operation: "tool",
+        deniedBySession: true,
+        codexApproval: {
+          mode: "prompt",
+          annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+        },
+        node: { id: "fixture-node", displayName: "Fixture node" },
       },
-    });
+    };
+    setPluginToolMeta(tool, metadata);
     const normalized = {
       ...tool,
       parameters: normalizedParameterFreeSchema(),
@@ -213,13 +256,76 @@ describe("AgentRuntimePlan tool policy helpers", () => {
     });
 
     expect(result[0]).toBe(normalized);
-    expect(getPluginToolMeta(result[0])).toMatchObject({
-      pluginId: "bundle-mcp",
-      mcp: {
-        serverName: "fixture",
-        toolName: "lookup_note",
-      },
+    expect(getPluginToolMeta(expectDefined(result[0], "result[0] test invariant"))).toBe(metadata);
+  });
+
+  it.each([true, false, undefined])(
+    "preserves output schemas and channel-progress visibility (%s) across runtime clones",
+    (hideFromChannelProgress) => {
+      const outputSchema = Type.Object(
+        { id: Type.String(), ready: Type.Boolean() },
+        { additionalProperties: false },
+      );
+      const tool = {
+        ...createParameterFreeTool("fixture_status"),
+        outputSchema,
+      } as unknown as AgentTool;
+      Object.defineProperty(tool, "hideFromChannelProgress", { value: hideFromChannelProgress });
+      const normalized = {
+        ...createParameterFreeTool("fixture_status"),
+        parameters: normalizedParameterFreeSchema(),
+      } as unknown as AgentTool;
+      mocks.normalizeProviderToolSchemas.mockReturnValueOnce([normalized]);
+
+      const result = normalizeAgentRuntimeTools({
+        tools: [tool],
+        provider: "openai",
+      });
+
+      expect(result[0]).toBe(normalized);
+      expect(result[0]?.outputSchema).toBe(outputSchema);
+      expect(result[0]?.hideFromChannelProgress).toBe(
+        hideFromChannelProgress === true ? true : undefined,
+      );
+    },
+  );
+
+  it("preserves private execution metadata when provider normalization clones tools", () => {
+    const formatter = vi.fn(() => ({ text: "Terminal summary" }));
+    const tool = {
+      ...createParameterFreeTool("web_fetch"),
+      label: "Web fetch",
+      execute: vi.fn(),
+    } as AgentTool;
+    const source = setToolTerminalPresentation(
+      wrapToolWithBeforeToolCallHook(tool, {
+        agentId: "main",
+        sessionId: "session-runtime-normalization",
+      }),
+      formatter,
+    );
+    (source as AnyAgentTool).catalogMode = "direct-only";
+    const normalized = {
+      ...createParameterFreeTool("web_fetch"),
+      label: "Web fetch",
+      execute: vi.fn(),
+      parameters: normalizedParameterFreeSchema(),
+    } as AgentTool;
+    mocks.normalizeProviderToolSchemas.mockReturnValueOnce([normalized]);
+
+    const result = normalizeAgentRuntimeTools({
+      tools: [source],
+      provider: "openai",
     });
+
+    expect(result[0]).toBe(normalized);
+    expect((result[0] as AnyAgentTool).catalogMode).toBe("direct-only");
+    expect(
+      isToolWrappedWithBeforeToolCallHook(expectDefined(result[0], "result[0] test invariant")),
+    ).toBe(true);
+    expect(getToolTerminalPresentation(expectDefined(result[0], "result[0] test invariant"))).toBe(
+      formatter,
+    );
   });
 
   it("does not reread quarantined tools while preserving normalized metadata", () => {
@@ -257,7 +363,7 @@ describe("AgentRuntimePlan tool policy helpers", () => {
     });
 
     expect(result).toEqual([normalized]);
-    expect(getPluginToolMeta(result[0])).toMatchObject({
+    expect(getPluginToolMeta(expectDefined(result[0], "result[0] test invariant"))).toMatchObject({
       pluginId: "bundle-mcp",
       mcp: {
         serverName: "fixture",

@@ -1,11 +1,14 @@
+// Debug Claude Usage script supports OpenClaw repository automation.
 import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { expectDefined } from "../packages/normalization-core/src/expect.js";
 import { normalizeOptionalString } from "../packages/normalization-core/src/string-coerce.js";
-import { readBoundedResponseText as readBoundedResponseTextWithLimit } from "./lib/bounded-response.ts";
+import { requireOptionArgument } from "./lib/arg-utils.mts";
+import { readBoundedResponseText as readBoundedResponseTextWithLimit } from "./lib/bounded-response.mjs";
 import {
   maskIdentifier,
   parseStrictIntegerOption,
@@ -15,6 +18,7 @@ import {
 
 type Args = {
   agentId: string;
+  help: boolean;
   reveal: boolean;
   sessionKey?: string;
 };
@@ -35,30 +39,77 @@ const mask = (value: string) => {
   );
 };
 
-const parseArgs = (): Args => {
-  const args = process.argv.slice(2);
+const parseArgs = (args = process.argv.slice(2)): Args => {
   let agentId = "main";
+  let help = false;
   let reveal = false;
   let sessionKey: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === "--agent" && args[i + 1]) {
-      agentId = args[++i].trim() || "main";
+    const arg = expectDefined(args[i], `Claude usage argument at index ${i}`);
+    if (arg === "--agent") {
+      agentId = parseNonBlankArgValue(requireOptionArgument(args, i, "--agent"), "--agent");
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--agent=")) {
+      agentId = parseNonBlankArgValue(parseInlineArgValue(arg, "--agent"), "--agent");
+      continue;
+    }
+    if (arg === "--help" || arg === "-h") {
+      help = true;
       continue;
     }
     if (arg === "--reveal") {
       reveal = true;
       continue;
     }
-    if (arg === "--session-key" && args[i + 1]) {
-      sessionKey = normalizeOptionalString(args[++i]);
+    if (arg === "--session-key") {
+      sessionKey = parseNonBlankArgValue(
+        requireOptionArgument(args, i, "--session-key"),
+        "--session-key",
+      );
+      i += 1;
       continue;
     }
+    if (arg.startsWith("--session-key=")) {
+      sessionKey = parseNonBlankArgValue(
+        parseInlineArgValue(arg, "--session-key"),
+        "--session-key",
+      );
+      continue;
+    }
+    throw new Error(`Unknown argument: ${arg}`);
   }
 
-  return { agentId, reveal, sessionKey };
+  return { agentId, help, reveal, sessionKey };
 };
+
+function parseInlineArgValue(arg: string, label: string): string {
+  const value = arg.slice(`${label}=`.length);
+  if (!value) {
+    throw new Error(`${label} requires a value`);
+  }
+  return value;
+}
+
+function parseNonBlankArgValue(value: string, label: string): string {
+  const normalized = normalizeOptionalString(value);
+  if (!normalized) {
+    throw new Error(`${label} requires a value`);
+  }
+  return normalized;
+}
+
+function printUsage(): void {
+  console.log(`Usage: node --import tsx scripts/debug-claude-usage.ts [options]
+
+Options:
+  --agent <id>          OpenClaw agent id to inspect (default: main)
+  --session-key <key>   Claude web session key override
+  --reveal              Print token/session values instead of masked identifiers
+  --help, -h            Show this help message`);
+}
 
 const loadAuthProfiles = (agentId: string) => {
   const stateRoot = process.env.OPENCLAW_STATE_DIR?.trim() || path.join(os.homedir(), ".openclaw");
@@ -133,7 +184,7 @@ const readBoundedResponseText = (
   maxBytes = FETCH_RESPONSE_MAX_BYTES,
 ): Promise<string> =>
   readBoundedResponseTextWithLimit(response, label, maxBytes, {
-    createTooLargeError: (message) => new Error(message),
+    createTooLargeError: (message: string) => new Error(message),
     signal,
   });
 
@@ -412,8 +463,13 @@ const fetchClaudeWebUsage = async (sessionKey: string, options: FetchOptions = {
     : { ok: false as const, step: "usage", status: usageRes.status, body: usageText };
 };
 
-const main = async () => {
-  const opts = parseArgs();
+const main = async (argv = process.argv.slice(2)) => {
+  const opts = parseArgs(argv);
+  if (opts.help) {
+    printUsage();
+    return;
+  }
+
   const { authPath, store } = loadAuthProfiles(opts.agentId);
   console.log(`Auth file: ${redactHomePath(authPath)}`);
 
@@ -479,16 +535,14 @@ const main = async () => {
 
 export const testing = {
   CLAUDE_COOKIE_HOST_SQL,
-  CLAUDE_FIREFOX_COOKIE_HOST_SQL,
   FETCH_RESPONSE_MAX_BYTES,
-  browserRootLabel,
   fetchAnthropicOAuthUsage,
-  mask,
+  parseArgs,
   readBoundedResponseText,
   resolveFetchTimeoutMs,
 };
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+if (import.meta.url === pathToFileURL(path.resolve(process.argv[1] ?? "")).href) {
   await main().catch((error: unknown) => {
     console.error(
       previewForDevToolLog(error instanceof Error ? error.message : String(error), 800),

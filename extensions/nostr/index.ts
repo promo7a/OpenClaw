@@ -1,3 +1,4 @@
+// Nostr plugin entrypoint registers its OpenClaw integration.
 import {
   defineBundledChannelEntry,
   loadBundledEntryExportSync,
@@ -37,6 +38,10 @@ export default defineBundledChannelEntry({
   plugin: {
     specifier: "./channel-plugin-api.js",
     exportName: "nostrPlugin",
+  },
+  secrets: {
+    specifier: "./secret-contract-api.js",
+    exportName: "channelSecrets",
   },
   runtime: {
     specifier: "./api.js",

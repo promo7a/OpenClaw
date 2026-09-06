@@ -1,3 +1,4 @@
+// Media Generation Core tests cover model ref behavior.
 import { describe, expect, it } from "vitest";
 import {
   resolveCapabilityModelRefForProviders,
@@ -62,11 +63,8 @@ describe("media-generation model refs", () => {
         parseModelRef: parseGenerationModelRef,
         normalizeProviderId: (value) => value.toLowerCase(),
         providers: [
-          {
-            id: "openai",
-            aliases: ["openai"],
-            defaultModel: "gpt-image-2",
-          },
+          { id: "example", aliases: ["OPENAI"] },
+          { id: "other", defaultModel: "openai/gpt-image-2" },
         ],
       }),
     ).toEqual({ provider: "openai", model: "gpt-image-2" });

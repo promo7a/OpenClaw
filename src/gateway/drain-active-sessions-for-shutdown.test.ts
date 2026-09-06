@@ -1,5 +1,8 @@
+// Shutdown drain tests protect bounded session_end hook emission for tracked
+// active sessions during gateway shutdown and restart.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { clearInternalHooks, registerInternalHook } from "../hooks/internal-hooks.js";
 
 // Regression coverage for #57790: the bounded shutdown drain must fire a
 // typed `session_end` for every session the tracker has noted, must skip
@@ -27,6 +30,7 @@ vi.mock("../plugins/hook-runner-global.js", () => ({
 }));
 
 vi.mock("./session-transcript-files.fs.js", () => ({
+  extractGeneratedTranscriptSessionId: vi.fn(() => undefined),
   resolveStableSessionEndTranscript: vi.fn(() => ({
     sessionFile: undefined,
     transcriptArchived: false,
@@ -44,12 +48,10 @@ vi.mock("../auto-reply/reply/session-hooks.js", () => ({
   buildSessionStartHookPayload: vi.fn(() => ({ event: {}, context: {} })),
 }));
 
-const {
-  drainActiveSessionsForShutdown,
-  emitGatewaySessionEndPluginHook,
-  emitGatewaySessionStartPluginHook,
-} = await import("./session-reset-service.js");
-const { clearActiveSessionsForShutdownTracker, listActiveSessionsForShutdown } =
+const { emitGatewaySessionEndPluginHook, emitGatewaySessionStartPluginHook } =
+  await import("./session-reset-service.js");
+const { drainActiveSessionsForShutdown } = await import("./active-sessions-shutdown-drain.js");
+const { forgetActiveSessionForShutdown, listActiveSessionsForShutdown } =
   await import("./active-sessions-shutdown-tracker.js");
 
 const cfg: OpenClawConfig = {};
@@ -68,18 +70,27 @@ function trackSessionForShutdown(params: { sessionId: string; sessionKey?: strin
     sessionKey: params.sessionKey ?? "agent:main:main",
     sessionId: params.sessionId,
     storePath: "/tmp/store.json",
+    agentId: "main",
   });
 }
 
+function clearTrackedSessions(): void {
+  for (const entry of listActiveSessionsForShutdown()) {
+    forgetActiveSessionForShutdown(entry.sessionId);
+  }
+}
+
 beforeEach(() => {
-  clearActiveSessionsForShutdownTracker();
+  clearTrackedSessions();
+  clearInternalHooks();
   runSessionEndMock.mockClear();
   hasHooksMock.mockClear();
   hasHooksMock.mockImplementation((name: string) => name === "session_end");
 });
 
 afterEach(() => {
-  clearActiveSessionsForShutdownTracker();
+  clearTrackedSessions();
+  clearInternalHooks();
 });
 
 describe("drainActiveSessionsForShutdown", () => {
@@ -129,6 +140,7 @@ describe("drainActiveSessionsForShutdown", () => {
       sessionKey: "agent:main:main",
       sessionId: "sess-A",
       storePath: "/tmp/store.json",
+      agentId: "main",
       reason: "reset",
     });
     runSessionEndMock.mockClear();
@@ -202,6 +214,7 @@ describe("drainActiveSessionsForShutdown", () => {
       sessionKey: "agent:main:main",
       sessionId: "sess-A",
       storePath: "/tmp/store.json",
+      agentId: "main",
       reason: "deleted",
     });
 
@@ -209,5 +222,34 @@ describe("drainActiveSessionsForShutdown", () => {
     const result = await drainActiveSessionsForShutdown({ reason: "shutdown" });
 
     expect(result.emittedSessionIds).toEqual([]);
+  });
+
+  it("emits session:auto-reset for idle rollover without a session_end plugin", async () => {
+    hasHooksMock.mockImplementation(() => false);
+    const listener = vi.fn();
+    registerInternalHook("session:auto-reset", listener);
+
+    emitGatewaySessionEndPluginHook({
+      cfg,
+      sessionKey: "agent:main:main",
+      sessionId: "sess-A",
+      storePath: "/tmp/store.json",
+      agentId: "main",
+      reason: "idle",
+      nextSessionId: "sess-B",
+    });
+
+    await vi.waitFor(() => expect(listener).toHaveBeenCalledTimes(1));
+    expect(runSessionEndMock).not.toHaveBeenCalled();
+    expect(listener.mock.calls[0]?.[0]).toMatchObject({
+      type: "session",
+      action: "auto-reset",
+      sessionKey: "agent:main:main",
+      context: {
+        reason: "idle",
+        nextSessionId: "sess-B",
+        sessionEntry: { sessionId: "sess-A" },
+      },
+    });
   });
 });

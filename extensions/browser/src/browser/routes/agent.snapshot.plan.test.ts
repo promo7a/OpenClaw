@@ -1,3 +1,4 @@
+// Browser tests cover agent.snapshot.plan plugin behavior.
 import { describe, expect, it } from "vitest";
 import type { ResolvedBrowserProfile } from "../config.js";
 import { DEFAULT_AI_SNAPSHOT_MAX_CHARS } from "../constants.js";
@@ -47,6 +48,17 @@ describe("resolveSnapshotPlan", () => {
 
     expect(plan.urls).toBe(true);
     expect(plan.wantsRoleSnapshot).toBe(true);
+  });
+
+  it("does not treat refs=role alone as a role snapshot feature", () => {
+    const plan = resolveSnapshotPlan({
+      profile: profile("openclaw"),
+      query: { refs: "role" },
+      hasPlaywright: true,
+    });
+
+    expect(plan.refsMode).toBe("role");
+    expect(plan.wantsRoleSnapshot).toBe(false);
   });
 
   it("parses timeoutMs from the snapshot query string", () => {

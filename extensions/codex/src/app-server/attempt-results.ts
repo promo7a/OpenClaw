@@ -1,54 +1,38 @@
+/**
+ * Result-shaping helpers for Codex app-server attempt terminal text, replay
+ * safety, startup failures, and malformed image errors.
+ */
 import type {
   AgentMessage,
-  EmbeddedRunAttemptParams,
-  EmbeddedRunAttemptResult,
+  EmbeddedRunAttemptParamsV2 as EmbeddedRunAttemptParams,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import type { CodexSystemPromptReport } from "./attempt-context.js";
+import type { CodexAttemptTimeout } from "./attempt-deadlines.js";
+import { attemptTerminal, type EmbeddedRunAttemptResult } from "./attempt-terminal.js";
 
-const CODEX_APP_SERVER_MISSING_TERMINAL_EVENT_USER_MESSAGE =
-  "Codex stopped before confirming the turn was complete. The response may be incomplete; retry if needed.";
-const CODEX_APP_SERVER_MISSING_TERMINAL_EVENT_SIDE_EFFECT_USER_MESSAGE =
-  "Codex stopped before confirming the turn was complete. Some work may already have been performed; verify the current state before retrying.";
-
+/** Joins terminal assistant text blocks into the final attempt answer. */
 export function collectTerminalAssistantText(result: EmbeddedRunAttemptResult): string {
   return result.assistantTexts.join("\n\n").trim();
 }
 
-export function hasCodexAppServerPotentialSideEffectEvidence(
-  result: EmbeddedRunAttemptResult,
-): boolean {
-  return result.replayMetadata.hadPotentialSideEffects;
-}
-
-export function buildCodexAppServerPromptTimeoutOutcome(params: {
-  result: EmbeddedRunAttemptResult;
-  turnCompletionIdleTimedOut: boolean;
-}): EmbeddedRunAttemptResult["promptTimeoutOutcome"] {
-  const completionIdleTimeoutHadPotentialSideEffects = hasCodexAppServerPotentialSideEffectEvidence(
-    params.result,
-  );
-  const replayBlockedReason = resolveCodexAppServerReplayBlockedReason(params.result);
-  if (
-    !params.turnCompletionIdleTimedOut ||
-    (params.result.itemLifecycle.completedCount === 0 &&
-      !completionIdleTimeoutHadPotentialSideEffects &&
-      replayBlockedReason === undefined)
-  ) {
+/** Reports the owner's deadline without guessing whether native work finished. */
+export function buildCodexAppServerPromptTimeoutOutcome(
+  timeout: CodexAttemptTimeout | undefined,
+): EmbeddedRunAttemptResult["promptTimeoutOutcome"] {
+  if (!timeout) {
     return undefined;
   }
   return {
-    message: completionIdleTimeoutHadPotentialSideEffects
-      ? CODEX_APP_SERVER_MISSING_TERMINAL_EVENT_SIDE_EFFECT_USER_MESSAGE
-      : CODEX_APP_SERVER_MISSING_TERMINAL_EVENT_USER_MESSAGE,
-    ...(completionIdleTimeoutHadPotentialSideEffects
-      ? {
-          replayInvalid: true,
-          livenessState: "abandoned" as const,
-        }
-      : {}),
+    message:
+      timeout.kind === "execution"
+        ? "Codex reached the configured execution time limit. Some work may already have been performed; verify the current state before continuing."
+        : "Codex finished its turn, but OpenClaw could not finish processing the result. Some work may already have been performed; verify the current state before continuing.",
+    replayInvalid: true,
+    livenessState: "abandoned",
   };
 }
 
+/** Explains why an incomplete app-server turn cannot be safely replayed. */
 export function resolveCodexAppServerReplayBlockedReason(
   result: EmbeddedRunAttemptResult,
 ):
@@ -74,26 +58,25 @@ export function resolveCodexAppServerReplayBlockedReason(
   return undefined;
 }
 
+/** Builds an attempt result for failures before the app-server turn starts. */
 export function buildCodexTurnStartFailureResult(params: {
   params: EmbeddedRunAttemptParams;
   message: string;
+  promptError?: unknown;
   messagesSnapshot: AgentMessage[];
   systemPromptReport: CodexSystemPromptReport;
 }): EmbeddedRunAttemptResult {
   return {
-    aborted: false,
-    externalAbort: false,
-    timedOut: false,
-    idleTimedOut: false,
-    timedOutDuringCompaction: false,
-    timedOutDuringToolExecution: false,
-    promptError: params.message,
-    promptErrorSource: "prompt",
+    terminal: attemptTerminal.normalize({
+      promptError: params.promptError ?? params.message,
+      promptErrorSource: "prompt",
+    }),
     sessionIdUsed: params.params.sessionId,
     messagesSnapshot: params.messagesSnapshot,
     assistantTexts: [],
     toolMetas: [],
     lastAssistant: undefined,
+    currentAttemptAssistant: undefined,
     didSendViaMessagingTool: false,
     messagingToolSentTexts: [],
     messagingToolSentMediaUrls: [],
@@ -113,6 +96,7 @@ export function buildCodexTurnStartFailureResult(params: {
   };
 }
 
+/** Detects app-server errors caused by invalid image payload data. */
 export function isInvalidCodexImagePayloadError(message: unknown): boolean {
   if (typeof message !== "string" || !message.trim()) {
     return false;

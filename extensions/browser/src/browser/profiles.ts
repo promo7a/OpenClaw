@@ -1,4 +1,10 @@
-import { parseBrowserHttpUrl } from "openclaw/plugin-sdk/browser-config";
+import { parseBrowserHttpUrl } from "openclaw/plugin-sdk/browser-cdp";
+/**
+ * Browser profile allocation helpers.
+ *
+ * Validates profile names and allocates CDP ports/colors for newly persisted
+ * browser profiles.
+ */
 
 /**
  * CDP port allocation for browser profiles.
@@ -14,12 +20,15 @@ import { parseBrowserHttpUrl } from "openclaw/plugin-sdk/browser-config";
  *   18792-18799 - Reserved for future one-off services (canvas at 18793)
  */
 
-export const CDP_PORT_RANGE_START = 18800;
-export const CDP_PORT_RANGE_END = 18899;
+/** Default first CDP port for browser profiles. */
+const CDP_PORT_RANGE_START = 18800;
+/** Default last CDP port for browser profiles. */
+const CDP_PORT_RANGE_END = 18899;
 const MAX_TCP_PORT = 65_535;
 
 const PROFILE_NAME_REGEX = /^[a-z0-9][a-z0-9-]*$/;
 
+/** Return true when a profile name matches the supported config key format. */
 export function isValidProfileName(name: string): boolean {
   if (!name || name.length > 64) {
     return false;
@@ -27,6 +36,7 @@ export function isValidProfileName(name: string): boolean {
   return PROFILE_NAME_REGEX.test(name);
 }
 
+/** Allocate the first unused CDP port in the configured range. */
 export function allocateCdpPort(
   usedPorts: Set<number>,
   range?: { start: number; end: number },
@@ -51,6 +61,7 @@ function isValidTcpPort(port: number): boolean {
   return Number.isSafeInteger(port) && port > 0 && port <= MAX_TCP_PORT;
 }
 
+/** Extract currently used CDP ports from profile config. */
 export function getUsedPorts(
   profiles: Record<string, { cdpPort?: number; cdpUrl?: string }> | undefined,
 ): Set<number> {
@@ -74,38 +85,4 @@ export function getUsedPorts(
     }
   }
   return used;
-}
-
-export const PROFILE_COLORS = [
-  "#FF4500", // Orange-red (openclaw default)
-  "#0066CC", // Blue
-  "#00AA00", // Green
-  "#9933FF", // Purple
-  "#FF6699", // Pink
-  "#00CCCC", // Cyan
-  "#FF9900", // Orange
-  "#6666FF", // Indigo
-  "#CC3366", // Magenta
-  "#339966", // Teal
-];
-
-export function allocateColor(usedColors: Set<string>): string {
-  // Find first unused color from palette
-  for (const color of PROFILE_COLORS) {
-    if (!usedColors.has(color.toUpperCase())) {
-      return color;
-    }
-  }
-  // All colors used, cycle based on count
-  const index = usedColors.size % PROFILE_COLORS.length;
-  return PROFILE_COLORS[index] ?? PROFILE_COLORS[0];
-}
-
-export function getUsedColors(
-  profiles: Record<string, { color: string }> | undefined,
-): Set<string> {
-  if (!profiles) {
-    return new Set();
-  }
-  return new Set(Object.values(profiles).map((p) => p.color.toUpperCase()));
 }

@@ -1,16 +1,57 @@
-import fs from "node:fs";
-import fsp from "node:fs/promises";
 import { createServer } from "node:net";
 import path from "node:path";
-import type { Command } from "commander";
-import { formatErrorMessage } from "./error-runtime.js";
-import { loadBundledPluginPublicSurfaceModuleSync } from "./facade-runtime.js";
-import { resolvePrivateQaBundledPluginsEnv } from "./private-qa-bundled-env.js";
+// QA runtime helpers register and execute plugin QA scenarios from local files.
 import { runExec } from "./process-runtime.js";
+import { loadQaRuntimeModule as loadQaRunnerRuntimeModule } from "./qa-runner-runtime.js";
 import { fetchWithSsrFGuard } from "./ssrf-runtime.js";
 import { normalizeStringEntries } from "./string-coerce-runtime.js";
 
+export { writeGatewayRestartIntentSync } from "../infra/restart-intent.js";
+export {
+  createLazyCliRuntimeLoader,
+  createLiveTransportQaCliRegistration,
+  runLiveTransportQaSuiteCommand,
+} from "./qa-runner-runtime.js";
+export type {
+  LiveTransportQaCliRegistration,
+  LiveTransportQaCliRegistrationOptions,
+  LiveTransportQaCommandOptions,
+  LiveTransportQaCredentialCliOptions,
+  LiveTransportQaSuiteCommandOptions,
+} from "./qa-runner-runtime.js";
+
+/** Release only this QA root's parent stores before its files are removed. */
+export async function closeQaRuntimeStores(tempRoot: string): Promise<void> {
+  const [auth, agents, state, paths] = await Promise.all([
+    import("../agents/auth-profiles/sqlite.js"),
+    import("../state/openclaw-agent-db.js"),
+    import("../state/openclaw-state-db.js"),
+    import("../state/openclaw-state-db.paths.js"),
+  ]);
+  // Agent close releases leases through shared state. Keep that owner alive
+  // until every scoped handle closes, or exit-time release can recreate the root.
+  auth.closeAuthProfileReadPool({ kind: "root", rootPath: tempRoot });
+  await agents.closeOpenClawAgentDatabasesAsync(tempRoot);
+  state.closeOpenClawStateDatabaseByPath(
+    paths.resolveOpenClawStateSqlitePath({ OPENCLAW_STATE_DIR: path.join(tempRoot, "state") }),
+  );
+}
+
 type QaRuntimeSurface = {
+  acquireQaCredentialLease: <TPayload>(options: {
+    env?: NodeJS.ProcessEnv;
+    kind: string;
+    parsePayload: (payload: unknown) => TPayload;
+    resolveEnvPayload: () => TPayload;
+    source?: string;
+  }) => Promise<{
+    heartbeat(): Promise<void>;
+    heartbeatIntervalMs: number;
+    kind: string;
+    payload: TPayload;
+    release(): Promise<void>;
+    source: "convex" | "env";
+  }>;
   defaultQaRuntimeModelForMode: (
     mode: string,
     options?: {
@@ -18,7 +59,22 @@ type QaRuntimeSurface = {
       preferredLiveModel?: string;
     },
   ) => string;
-  startQaLiveLaneGateway: (...args: unknown[]) => Promise<unknown>;
+  createQaLiveLaneGateway: () => {
+    start: (...args: unknown[]) => Promise<unknown>;
+    stop: () => Promise<{
+      process: "never-spawned" | "confirmed-stopped" | "unconfirmed";
+      errors: unknown[];
+    }>;
+  };
+  startQaCredentialLeaseHeartbeat: (lease: {
+    heartbeat(): Promise<void>;
+    heartbeatIntervalMs: number;
+    kind: string;
+    source: "convex" | "env";
+  }) => {
+    stop(): Promise<void>;
+    throwIfFailed(): void;
+  };
 };
 
 function isMissingQaRuntimeError(error: unknown) {
@@ -29,18 +85,12 @@ function isMissingQaRuntimeError(error: unknown) {
   );
 }
 
-export function loadQaRuntimeModule(): QaRuntimeSurface {
-  const env = resolvePrivateQaBundledPluginsEnv();
-  return loadBundledPluginPublicSurfaceModuleSync<QaRuntimeSurface>({
-    dirName: "qa-lab",
-    artifactBasename: "runtime-api.js",
-    ...(env ? { env } : {}),
-  });
-}
+const loadQaLabRuntimeModule = loadQaRunnerRuntimeModule as unknown as () => QaRuntimeSurface;
+export { loadQaLabRuntimeModule as loadQaRuntimeModule };
 
-export function isQaRuntimeAvailable(): boolean {
+function isQaRuntimeAvailableStrict(): boolean {
   try {
-    loadQaRuntimeModule();
+    loadQaLabRuntimeModule();
     return true;
   } catch (error) {
     if (isMissingQaRuntimeError(error)) {
@@ -50,309 +100,27 @@ export function isQaRuntimeAvailable(): boolean {
   }
 }
 
-export type LiveTransportQaCommandOptions = {
-  repoRoot?: string;
-  outputDir?: string;
-  providerMode?: string;
-  primaryModel?: string;
-  alternateModel?: string;
-  fastMode?: boolean;
-  allowFailures?: boolean;
-  failFast?: boolean;
-  profile?: string;
-  scenarioIds?: string[];
-  listScenarios?: boolean;
-  sutAccountId?: string;
-  credentialSource?: string;
-  credentialRole?: string;
-};
+export { isQaRuntimeAvailableStrict as isQaRuntimeAvailable };
 
-type LiveTransportQaCommanderOptions = {
-  repoRoot?: string;
-  outputDir?: string;
-  providerMode?: string;
-  model?: string;
-  altModel?: string;
-  scenario?: string[];
-  listScenarios?: boolean;
-  fast?: boolean;
-  allowFailures?: boolean;
-  failFast?: boolean;
-  profile?: string;
-  sutAccount?: string;
-  credentialSource?: string;
-  credentialRole?: string;
-};
-
-export type LiveTransportQaCliRegistration = {
-  commandName: string;
-  register(qa: Command): void;
-};
-
-export type LiveTransportQaCredentialCliOptions = {
-  sourceDescription?: string;
-  roleDescription?: string;
-};
-
-export type LiveTransportQaCliRegistrationOptions = {
-  commandName: string;
-  credentialOptions?: LiveTransportQaCredentialCliOptions;
-  defaultProviderMode: string;
-  description: string;
-  providerModeHelp: string;
-  listScenariosHelp?: string;
-  outputDirHelp: string;
-  profileHelp?: string;
-  failFastHelp?: string;
-  allowFailuresHelp?: string;
-  scenarioHelp: string;
-  sutAccountHelp: string;
-  run: (opts: LiveTransportQaCommandOptions) => Promise<void>;
-};
-
-export function createLazyCliRuntimeLoader<T>(load: () => Promise<T>) {
-  let promise: Promise<T> | null = null;
-  return async () => {
-    promise ??= load();
-    return await promise;
-  };
-}
-
-function collectLiveTransportQaStringOption(value: string, previous: string[]) {
-  const trimmed = value.trim();
-  return trimmed ? [...previous, trimmed] : previous;
-}
-
-function mapLiveTransportQaCommanderOptions(
-  opts: LiveTransportQaCommanderOptions,
-): LiveTransportQaCommandOptions {
-  return {
-    repoRoot: opts.repoRoot,
-    outputDir: opts.outputDir,
-    providerMode: opts.providerMode,
-    primaryModel: opts.model,
-    alternateModel: opts.altModel,
-    fastMode: opts.fast,
-    allowFailures: opts.allowFailures,
-    failFast: opts.failFast,
-    profile: opts.profile,
-    scenarioIds: opts.scenario,
-    listScenarios: opts.listScenarios,
-    sutAccountId: opts.sutAccount,
-    credentialSource: opts.credentialSource,
-    credentialRole: opts.credentialRole,
-  };
-}
-
-function registerLiveTransportQaCli(
-  params: LiveTransportQaCliRegistrationOptions & {
-    qa: Command;
-  },
-) {
-  const command = params.qa
-    .command(params.commandName)
-    .description(params.description)
-    .option("--repo-root <path>", "Repository root to target when running from a neutral cwd")
-    .option("--output-dir <path>", params.outputDirHelp)
-    .option("--provider-mode <mode>", params.providerModeHelp, params.defaultProviderMode)
-    .option("--model <ref>", "Primary provider/model ref")
-    .option("--alt-model <ref>", "Alternate provider/model ref")
-    .option("--scenario <id>", params.scenarioHelp, collectLiveTransportQaStringOption, [])
-    .option("--fast", "Enable provider fast mode where supported", false);
-
-  if (params.allowFailuresHelp) {
-    command.option("--allow-failures", params.allowFailuresHelp, false);
-  }
-
-  command.option("--sut-account <id>", params.sutAccountHelp, "sut");
-
-  if (params.listScenariosHelp) {
-    command.option("--list-scenarios", params.listScenariosHelp, false);
-  }
-
-  if (params.profileHelp) {
-    command.option("--profile <profile>", params.profileHelp);
-  }
-
-  if (params.failFastHelp) {
-    command.option("--fail-fast", params.failFastHelp, false);
-  }
-
-  if (params.credentialOptions) {
-    command.option(
-      "--credential-source <source>",
-      params.credentialOptions.sourceDescription ??
-        "Credential source for live lanes: env or convex (default: env)",
-    );
-    if (params.credentialOptions.roleDescription) {
-      command.option("--credential-role <role>", params.credentialOptions.roleDescription);
-    }
-  }
-
-  command.action(async (opts: LiveTransportQaCommanderOptions) => {
-    await params.run(mapLiveTransportQaCommanderOptions(opts));
-  });
-}
-
-export function createLiveTransportQaCliRegistration(
-  params: LiveTransportQaCliRegistrationOptions,
-): LiveTransportQaCliRegistration {
-  return {
-    commandName: params.commandName,
-    register(qa: Command) {
-      registerLiveTransportQaCli({
-        ...params,
-        qa,
-      });
-    },
-  };
-}
-
-export type QaReportCheck = {
-  name: string;
-  status: "pass" | "fail" | "skip";
-  details?: string;
-};
-
-export type QaReportScenario = {
-  name: string;
-  status: "pass" | "fail" | "skip";
-  details?: string;
-  steps?: QaReportCheck[];
-};
-
-export {
-  LIVE_TRANSPORT_BASELINE_STANDARD_SCENARIO_IDS,
-  collectLiveTransportStandardScenarioCoverage,
-  findMissingLiveTransportStandardScenarios,
-  selectLiveTransportScenarios,
-  type LiveTransportScenarioDefinition,
-  type LiveTransportStandardScenarioId,
-} from "./qa-live-transport-scenarios.js";
-
+/** Docker command runner abstraction used by QA Docker helpers and tests. */
 export type QaDockerRunCommand = (
   command: string,
   args: string[],
   cwd: string,
 ) => Promise<{ stdout: string; stderr: string }>;
 
-export type QaDockerFetchLike = (input: string) => Promise<{ ok: boolean }>;
+/** Minimal fetch-like health probe used by QA Docker runtime helpers. */
+export type QaDockerFetchResponse = {
+  ok: boolean;
+  body?: { cancel?: () => unknown } | null;
+};
+export type QaDockerFetchLike = (
+  input: string,
+  init?: Pick<RequestInit, "signal">,
+) => Promise<QaDockerFetchResponse>;
 
 const DEFAULT_QA_DOCKER_COMMAND_TIMEOUT_MS = 120_000;
-
-function pushQaReportDetailsBlock(lines: string[], label: string, details: string, indent = "") {
-  if (!details.includes("\n")) {
-    lines.push(`${indent}- ${label}: ${details}`);
-    return;
-  }
-  lines.push(`${indent}- ${label}:`);
-  lines.push("", "```text", details, "```");
-}
-
-export function renderQaMarkdownReport(params: {
-  title: string;
-  startedAt: Date;
-  finishedAt: Date;
-  checks?: QaReportCheck[];
-  scenarios?: QaReportScenario[];
-  timeline?: string[];
-  notes?: string[];
-}) {
-  const checks = params.checks ?? [];
-  const scenarios = params.scenarios ?? [];
-  const passCount =
-    checks.filter((check) => check.status === "pass").length +
-    scenarios.filter((scenario) => scenario.status === "pass").length;
-  const failCount =
-    checks.filter((check) => check.status === "fail").length +
-    scenarios.filter((scenario) => scenario.status === "fail").length;
-
-  const lines = [
-    `# ${params.title}`,
-    "",
-    `- Started: ${params.startedAt.toISOString()}`,
-    `- Finished: ${params.finishedAt.toISOString()}`,
-    `- Duration ms: ${params.finishedAt.getTime() - params.startedAt.getTime()}`,
-    `- Passed: ${passCount}`,
-    `- Failed: ${failCount}`,
-    "",
-  ];
-
-  if (checks.length > 0) {
-    lines.push("## Checks", "");
-    for (const check of checks) {
-      lines.push(`- [${check.status === "pass" ? "x" : " "}] ${check.name}`);
-      if (check.details) {
-        pushQaReportDetailsBlock(lines, "Details", check.details, "  ");
-      }
-    }
-  }
-
-  if (scenarios.length > 0) {
-    lines.push("", "## Scenarios", "");
-    for (const scenario of scenarios) {
-      lines.push(`### ${scenario.name}`);
-      lines.push("");
-      lines.push(`- Status: ${scenario.status}`);
-      if (scenario.details) {
-        pushQaReportDetailsBlock(lines, "Details", scenario.details);
-      }
-      if (scenario.steps?.length) {
-        lines.push("- Steps:");
-        for (const step of scenario.steps) {
-          lines.push(`  - [${step.status === "pass" ? "x" : " "}] ${step.name}`);
-          if (step.details) {
-            pushQaReportDetailsBlock(lines, "Details", step.details, "    ");
-          }
-        }
-      }
-      lines.push("");
-    }
-  }
-
-  if (params.timeline && params.timeline.length > 0) {
-    lines.push("## Timeline", "");
-    for (const item of params.timeline) {
-      lines.push(`- ${item}`);
-    }
-  }
-
-  if (params.notes && params.notes.length > 0) {
-    lines.push("", "## Notes", "");
-    for (const note of params.notes) {
-      lines.push(`- ${note}`);
-    }
-  }
-
-  lines.push("");
-  return lines.join("\n");
-}
-
-export function appendQaLiveLaneIssue(issues: string[], label: string, error: unknown) {
-  issues.push(`${label}: ${formatErrorMessage(error)}`);
-}
-
-export function buildQaLiveLaneArtifactsError(params: {
-  heading: string;
-  artifacts: Record<string, string>;
-  details?: string[];
-}) {
-  return [
-    params.heading,
-    ...(params.details ?? []),
-    "Artifacts:",
-    ...Object.entries(params.artifacts).map(([label, filePath]) => `- ${label}: ${filePath}`),
-  ].join("\n");
-}
-
-export function printLiveTransportQaArtifacts(
-  laneLabel: string,
-  artifacts: Record<string, string>,
-) {
-  for (const [label, filePath] of Object.entries(artifacts)) {
-    process.stdout.write(`${laneLabel} ${label}: ${filePath}\n`);
-  }
-}
+const DEFAULT_QA_DOCKER_HEALTH_REQUEST_TIMEOUT_MS = 2_000;
 
 function describeQaDockerError(error: unknown) {
   if (error instanceof Error) {
@@ -378,7 +146,7 @@ async function findFreeQaDockerPort() {
   return await new Promise<number>((resolve, reject) => {
     const server = createServer();
     server.once("error", reject);
-    server.listen(0, () => {
+    server.listen(0, "127.0.0.1", () => {
       const address = server.address();
       if (!address || typeof address === "string") {
         server.close();
@@ -396,6 +164,7 @@ async function findFreeQaDockerPort() {
   });
 }
 
+/** Return the preferred Docker host port unless it is unpinned and already occupied. */
 export async function resolveQaDockerHostPort(preferredPort: number, pinned: boolean) {
   if (pinned || (await isQaDockerPortFree(preferredPort))) {
     return preferredPort;
@@ -440,6 +209,10 @@ function normalizeDockerServiceStatus(row?: { Health?: string; State?: string })
   return "unknown";
 }
 
+function firstDockerOutputLine(stdout: string) {
+  return normalizeStringEntries(stdout.split("\n"))[0] ?? "";
+}
+
 function parseDockerComposePsRows(stdout: string) {
   const trimmed = stdout.trim();
   if (!trimmed) {
@@ -461,15 +234,31 @@ function parseDockerComposePsRows(stdout: string) {
   }
 }
 
-async function isQaDockerHealthy(url: string, fetchImpl: QaDockerFetchLike) {
+async function isQaDockerHealthy(
+  url: string,
+  fetchImpl: QaDockerFetchLike,
+  timeoutMs = DEFAULT_QA_DOCKER_HEALTH_REQUEST_TIMEOUT_MS,
+) {
+  let response: QaDockerFetchResponse | undefined;
   try {
-    const response = await fetchImpl(url);
+    response = await fetchImpl(url, {
+      signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
+    });
     return response.ok;
   } catch {
     return false;
+  } finally {
+    await releaseQaDockerFetchResponse(response);
   }
 }
 
+async function releaseQaDockerFetchResponse(response: QaDockerFetchResponse | undefined) {
+  try {
+    await response?.body?.cancel?.();
+  } catch {}
+}
+
+/** Create Docker command, health-check, and compose helpers for QA harnesses. */
 export function createQaDockerRuntime(params: {
   auditContext: string;
   commandTimeoutMs?: number | null;
@@ -479,18 +268,18 @@ export function createQaDockerRuntime(params: {
       ? DEFAULT_QA_DOCKER_COMMAND_TIMEOUT_MS
       : params.commandTimeoutMs;
 
-  const fetchHealthUrl = async (url: string): Promise<{ ok: boolean }> => {
+  const fetchHealthUrl: QaDockerFetchLike = async (url, init) => {
     const { response, release } = await fetchWithSsrFGuard({
       url,
-      init: {
-        signal: AbortSignal.timeout(2_000),
-      },
+      signal: init?.signal ?? undefined,
+      timeoutMs: DEFAULT_QA_DOCKER_HEALTH_REQUEST_TIMEOUT_MS,
       policy: { allowPrivateNetwork: true },
       auditContext: params.auditContext,
     });
     try {
       return { ok: response.ok };
     } finally {
+      await releaseQaDockerFetchResponse(response);
       await release();
     }
   };
@@ -525,16 +314,36 @@ export function createQaDockerRuntime(params: {
     let lastError: unknown = null;
 
     while (Date.now() < deadline) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        break;
+      }
+      let response: QaDockerFetchResponse | undefined;
+      const requestTimeoutMs = Math.max(
+        1,
+        Math.min(DEFAULT_QA_DOCKER_HEALTH_REQUEST_TIMEOUT_MS, remainingMs),
+      );
+      const requestSignal = AbortSignal.timeout(requestTimeoutMs);
       try {
-        const response = await deps.fetchImpl(url);
+        response = await deps.fetchImpl(url, {
+          signal: requestSignal,
+        });
         if (response.ok) {
           return;
         }
         lastError = new Error(`Health check returned non-OK for ${url}`);
       } catch (error) {
         lastError = error;
+        if (requestSignal.aborted && requestTimeoutMs === remainingMs) {
+          break;
+        }
+      } finally {
+        await releaseQaDockerFetchResponse(response);
       }
-      await deps.sleepImpl(pollMs);
+      const remainingSleepMs = deadline - Date.now();
+      if (remainingSleepMs > 0) {
+        await deps.sleepImpl(Math.min(pollMs, remainingSleepMs));
+      }
     }
 
     const elapsedSec = Math.round((Date.now() - startMs) / 1000);
@@ -601,7 +410,7 @@ export function createQaDockerRuntime(params: {
       ["compose", "-f", composeFile, "ps", "-q", service],
       repoRoot,
     );
-    const containerId = containerStdout.trim();
+    const containerId = firstDockerOutputLine(containerStdout);
     if (!containerId) {
       return null;
     }
@@ -610,12 +419,12 @@ export function createQaDockerRuntime(params: {
       [
         "inspect",
         "--format",
-        "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+        "{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}",
         containerId,
       ],
       repoRoot,
     );
-    const ip = ipStdout.trim();
+    const ip = firstDockerOutputLine(ipStdout);
     if (!ip) {
       return null;
     }
@@ -634,80 +443,4 @@ export function createQaDockerRuntime(params: {
     waitForDockerServiceHealth,
     waitForHealth,
   };
-}
-
-type ProcessWriteCallback = (err?: Error | null) => void;
-
-export async function startLiveTransportQaOutputTee(params: {
-  fileName: string;
-  outputDir: string;
-}) {
-  await fsp.mkdir(params.outputDir, { recursive: true });
-  const outputPath = path.join(params.outputDir, params.fileName);
-  const output = fs.createWriteStream(outputPath, {
-    encoding: "utf8",
-    flags: "a",
-    mode: 0o600,
-  });
-  let outputError: Error | null = null;
-  output.on("error", (error) => {
-    outputError ??= error;
-  });
-  const originalStdoutWrite = Reflect.get(process.stdout, "write");
-  const originalStderrWrite = Reflect.get(process.stderr, "write");
-  const boundStdoutWrite = originalStdoutWrite.bind(process.stdout);
-  const boundStderrWrite = originalStderrWrite.bind(process.stderr);
-  let stopped = false;
-
-  const tee = (originalWrite: typeof process.stdout.write) =>
-    function writeWithTee(
-      this: NodeJS.WriteStream,
-      chunk: string | Uint8Array,
-      encodingOrCallback?: BufferEncoding | ProcessWriteCallback,
-      callback?: ProcessWriteCallback,
-    ) {
-      if (!stopped && !outputError) {
-        output.write(chunk);
-      }
-      return Reflect.apply(originalWrite, this, [chunk, encodingOrCallback, callback]) as boolean;
-    };
-
-  process.stdout.write = tee(boundStdoutWrite) as typeof process.stdout.write;
-  process.stderr.write = tee(boundStderrWrite) as typeof process.stderr.write;
-
-  return {
-    outputPath,
-    async stop() {
-      if (stopped) {
-        return;
-      }
-      stopped = true;
-      process.stdout.write = originalStdoutWrite;
-      process.stderr.write = originalStderrWrite;
-      if (outputError) {
-        throw outputError;
-      }
-      await new Promise<void>((resolve, reject) => {
-        output.once("error", reject);
-        output.end(resolve);
-      });
-      if (outputError) {
-        throw toLintErrorObject(outputError, "Non-Error thrown");
-      }
-    },
-  };
-}
-
-function toLintErrorObject(value: unknown, fallbackMessage: string): Error {
-  if (value instanceof Error) {
-    return value;
-  }
-  if (typeof value === "string") {
-    return new Error(value);
-  }
-  const error = new Error(fallbackMessage, { cause: value });
-  if ((typeof value === "object" && value !== null) || typeof value === "function") {
-    Object.assign(error, value);
-  }
-  return error;
 }

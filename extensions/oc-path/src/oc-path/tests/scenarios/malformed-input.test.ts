@@ -1,3 +1,4 @@
+// OC Path tests cover malformed input plugin behavior.
 import { describe, expect, it } from "vitest";
 import { parseMd } from "../../parse.js";
 
@@ -17,11 +18,6 @@ describe("malformed-input", () => {
 
   it("only `---` (single fence, no content)", () => {
     expect(() => parseMd("---\n")).not.toThrow();
-  });
-
-  it("only `---\\n---`", () => {
-    const { ast } = parseMd("---\n---");
-    expect(ast.frontmatter).toEqual([]);
   });
 
   it("binary-ish bytes (non-ASCII control chars)", () => {

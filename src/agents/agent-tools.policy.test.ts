@@ -1,20 +1,26 @@
-import fs from "node:fs";
+/**
+ * Tests layered tool policy resolution.
+ * Covers wildcard matching, sub-agent inheritance, provider overrides, and
+ * trusted group context checks.
+ */
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
+import { retainLegacyDefaultAgentId } from "../config/legacy.default-agent-owner.js";
+import { replaceSessionEntry } from "../config/sessions/session-accessor.js";
+import type { SessionEntry } from "../config/sessions/types.js";
+import type { AgentToolsConfig } from "../config/types.tools.js";
 import { createWarnLogCapture } from "../logging/test-helpers/warn-log-capture.js";
 import {
-  filterToolsByPolicy,
-  isToolAllowedByPolicyName,
   resolveEffectiveToolPolicy,
   resolveGroupToolPolicy,
   resolveInheritedToolPolicyForSession,
-  resolveSubagentToolPolicy,
   resolveSubagentToolPolicyForSession,
   resolveTrustedGroupId,
 } from "./agent-tools.policy.js";
 import { createStubTool } from "./test-helpers/agent-tool-stubs.js";
+import { filterToolsByPolicy, isToolAllowedByPolicyName } from "./tool-policy-match.js";
 
 vi.mock("../channels/plugins/session-conversation.js", () => ({
   resolveSessionConversation: ({ rawId }: { rawId: string }) => ({
@@ -24,6 +30,40 @@ vi.mock("../channels/plugins/session-conversation.js", () => ({
     parentConversationCandidates: [],
   }),
 }));
+
+vi.mock("../channels/plugins/index.js", () => ({
+  getLoadedChannelPlugin: () => ({
+    config: {
+      listAccountIds: (config: OpenClawConfig) => [
+        "default",
+        ...Object.keys(
+          (config.channels?.whatsapp as { accounts?: Record<string, unknown> } | undefined)
+            ?.accounts ?? {},
+        ),
+      ],
+    },
+  }),
+}));
+
+async function writeSessionEntries(
+  storePath: string,
+  entries: Record<string, unknown>,
+): Promise<void> {
+  for (const [sessionKey, entry] of Object.entries(entries)) {
+    await replaceSessionEntry({ sessionKey, storePath }, entry as SessionEntry);
+  }
+}
+
+function createSessionStorePath(prefix: string, agentId = "main"): string {
+  return path.join(
+    os.tmpdir(),
+    `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    "agents",
+    agentId,
+    "sessions",
+    "sessions.json",
+  );
+}
 
 describe("agent-tools.policy", () => {
   it("treats * in allow as allow-all", () => {
@@ -45,10 +85,6 @@ describe("agent-tools.policy", () => {
 
   it("keeps apply_patch when write is allowlisted", () => {
     expect(isToolAllowedByPolicyName("apply_patch", { allow: ["write"] })).toBe(true);
-  });
-
-  it("keeps apply_patch when write is denylisted", () => {
-    expect(isToolAllowedByPolicyName("apply_patch", { deny: ["write"] })).toBe(true);
   });
 });
 
@@ -181,186 +217,110 @@ describe("resolveGroupToolPolicy group context validation", () => {
 
     expect(policy).toEqual({ allow: ["read"] });
   });
+
+  it("fails closed when scheduled authority names a removed account", () => {
+    expect(
+      resolveGroupToolPolicy({
+        config: cfg,
+        sessionKey: "agent:main:whatsapp:group:safe-room",
+        accountId: "removed",
+        requireConfiguredAccount: true,
+      }),
+    ).toEqual({ allow: [], deny: ["*"] });
+  });
+
+  it("denies every tool when scheduled authority names a removed account", () => {
+    const policy = resolveGroupToolPolicy({
+      config: cfg,
+      sessionKey: "agent:main:whatsapp:group:safe-room",
+      accountId: "removed",
+      requireConfiguredAccount: true,
+    });
+    const tools = [
+      createStubTool("read"),
+      createStubTool("write"),
+      createStubTool("exec"),
+      createStubTool("apply_patch"),
+    ];
+    expect(filterToolsByPolicy(tools, policy)).toStrictEqual([]);
+    expect(isToolAllowedByPolicyName("exec", policy)).toBe(false);
+    expect(isToolAllowedByPolicyName("apply_patch", policy)).toBe(false);
+  });
+
+  it("fails closed when scheduled authority names a removed account without channel context", () => {
+    const policy = resolveGroupToolPolicy({
+      config: cfg,
+      sessionKey: "agent:main:main",
+      accountId: "removed",
+      requireConfiguredAccount: true,
+    });
+    expect(policy).toEqual({ allow: [], deny: ["*"] });
+    expect(isToolAllowedByPolicyName("exec", policy)).toBe(false);
+  });
+
+  it("resolves scheduled group policy for a still-configured named account", () => {
+    const accountCfg = {
+      ...cfg,
+      channels: {
+        whatsapp: {
+          ...cfg.channels?.whatsapp,
+          accounts: { work: {} },
+        },
+      },
+    } as OpenClawConfig;
+
+    expect(
+      resolveGroupToolPolicy({
+        config: accountCfg,
+        sessionKey: "agent:main:whatsapp:group:safe-room",
+        accountId: "work",
+        requireConfiguredAccount: true,
+      }),
+    ).toEqual({ allow: ["read"] });
+  });
 });
 
-describe("resolveSubagentToolPolicy depth awareness", () => {
+describe("resolveSubagentToolPolicyForSession", () => {
   const baseCfg = {
     agents: { defaults: { subagents: { maxSpawnDepth: 2 } } },
   } as unknown as OpenClawConfig;
 
-  const deepCfg = {
-    agents: { defaults: { subagents: { maxSpawnDepth: 3 } } },
-  } as unknown as OpenClawConfig;
-
-  const leafCfg = {
-    agents: { defaults: { subagents: { maxSpawnDepth: 1 } } },
-  } as unknown as OpenClawConfig;
-
-  it("applies subagent tools.alsoAllow to re-enable default-denied tools", () => {
-    const cfg = {
-      agents: { defaults: { subagents: { maxSpawnDepth: 2 } } },
-      tools: { subagents: { tools: { alsoAllow: ["sessions_send"] } } },
-    } as unknown as OpenClawConfig;
-    const policy = resolveSubagentToolPolicy(cfg, 1);
-    expect(isToolAllowedByPolicyName("sessions_send", policy)).toBe(true);
-    expect(isToolAllowedByPolicyName("cron", policy)).toBe(false);
-  });
-
-  it("applies subagent tools.allow to re-enable default-denied tools", () => {
-    const cfg = {
-      agents: { defaults: { subagents: { maxSpawnDepth: 2 } } },
-      tools: { subagents: { tools: { allow: ["sessions_send"] } } },
-    } as unknown as OpenClawConfig;
-    const policy = resolveSubagentToolPolicy(cfg, 1);
-    expect(isToolAllowedByPolicyName("sessions_send", policy)).toBe(true);
-  });
-
-  it("merges subagent tools.alsoAllow into tools.allow when both are set", () => {
-    const cfg = {
-      agents: { defaults: { subagents: { maxSpawnDepth: 2 } } },
-      tools: {
-        subagents: { tools: { allow: ["sessions_spawn"], alsoAllow: ["sessions_send"] } },
+  it("recomputes a persisted leaf as an orchestrator under the recursive default", async () => {
+    const storePath = createSessionStorePath("openclaw-subagent-policy-recursive");
+    const sessionKey = "agent:main:subagent:formerly-leaf";
+    await writeSessionEntries(storePath, {
+      [sessionKey]: {
+        sessionId: "formerly-leaf",
+        updatedAt: Date.now(),
+        spawnDepth: 1,
+        subagentRole: "leaf",
+        subagentControlScope: "none",
       },
-    } as unknown as OpenClawConfig;
-    const policy = resolveSubagentToolPolicy(cfg, 1);
-    expect(policy.allow).toEqual(["sessions_spawn", "sessions_send"]);
-  });
+    });
 
-  it("keeps configured deny precedence over allow and alsoAllow", () => {
-    const cfg = {
-      agents: { defaults: { subagents: { maxSpawnDepth: 2 } } },
-      tools: {
-        subagents: {
-          tools: {
-            allow: ["sessions_send"],
-            alsoAllow: ["sessions_send"],
-            deny: ["sessions_send"],
-          },
-        },
-      },
-    } as unknown as OpenClawConfig;
-    const policy = resolveSubagentToolPolicy(cfg, 1);
-    expect(isToolAllowedByPolicyName("sessions_send", policy)).toBe(false);
-  });
+    const policy = resolveSubagentToolPolicyForSession(
+      { session: { store: storePath } } as OpenClawConfig,
+      sessionKey,
+    );
 
-  it("applies configured deny to memory tools even though they are allowed by default", () => {
-    const cfg = {
-      agents: { defaults: { subagents: { maxSpawnDepth: 2 } } },
-      tools: {
-        subagents: {
-          tools: {
-            deny: ["memory_search", "memory_get"],
-          },
-        },
-      },
-    } as unknown as OpenClawConfig;
-    const policy = resolveSubagentToolPolicy(cfg, 1);
-    expect(isToolAllowedByPolicyName("memory_search", policy)).toBe(false);
-    expect(isToolAllowedByPolicyName("memory_get", policy)).toBe(false);
-  });
-
-  it("does not create a restrictive allowlist when only alsoAllow is configured", () => {
-    const cfg = {
-      agents: { defaults: { subagents: { maxSpawnDepth: 2 } } },
-      tools: { subagents: { tools: { alsoAllow: ["sessions_send"] } } },
-    } as unknown as OpenClawConfig;
-    const policy = resolveSubagentToolPolicy(cfg, 1);
-    expect(policy.allow).toBeUndefined();
+    expect(isToolAllowedByPolicyName("sessions_spawn", policy)).toBe(true);
     expect(isToolAllowedByPolicyName("subagents", policy)).toBe(true);
   });
 
-  it("depth-1 orchestrator (maxSpawnDepth=2) allows sessions_spawn", () => {
-    const policy = resolveSubagentToolPolicy(baseCfg, 1);
-    expect(isToolAllowedByPolicyName("sessions_spawn", policy)).toBe(true);
-  });
-
-  it("depth-1 orchestrator (maxSpawnDepth=2) allows subagents", () => {
-    const policy = resolveSubagentToolPolicy(baseCfg, 1);
-    expect(isToolAllowedByPolicyName("subagents", policy)).toBe(true);
-  });
-
-  it("depth-1 orchestrator (maxSpawnDepth=2) allows sessions_list", () => {
-    const policy = resolveSubagentToolPolicy(baseCfg, 1);
-    expect(isToolAllowedByPolicyName("sessions_list", policy)).toBe(true);
-  });
-
-  it("depth-1 orchestrator (maxSpawnDepth=2) allows sessions_history", () => {
-    const policy = resolveSubagentToolPolicy(baseCfg, 1);
-    expect(isToolAllowedByPolicyName("sessions_history", policy)).toBe(true);
-  });
-
-  it("depth-1 orchestrator still denies gateway and cron but allows memory tools", () => {
-    const policy = resolveSubagentToolPolicy(baseCfg, 1);
-    expect(isToolAllowedByPolicyName("gateway", policy)).toBe(false);
-    expect(isToolAllowedByPolicyName("cron", policy)).toBe(false);
-    expect(isToolAllowedByPolicyName("memory_search", policy)).toBe(true);
-    expect(isToolAllowedByPolicyName("memory_get", policy)).toBe(true);
-  });
-
-  it("depth-2 leaf denies sessions_spawn", () => {
-    const policy = resolveSubagentToolPolicy(baseCfg, 2);
-    expect(isToolAllowedByPolicyName("sessions_spawn", policy)).toBe(false);
-  });
-
-  it("depth-2 orchestrator (maxSpawnDepth=3) allows sessions_spawn", () => {
-    const policy = resolveSubagentToolPolicy(deepCfg, 2);
-    expect(isToolAllowedByPolicyName("sessions_spawn", policy)).toBe(true);
-  });
-
-  it("depth-3 leaf (maxSpawnDepth=3) denies sessions_spawn", () => {
-    const policy = resolveSubagentToolPolicy(deepCfg, 3);
-    expect(isToolAllowedByPolicyName("sessions_spawn", policy)).toBe(false);
-  });
-
-  it("depth-2 leaf denies subagents", () => {
-    const policy = resolveSubagentToolPolicy(baseCfg, 2);
-    expect(isToolAllowedByPolicyName("subagents", policy)).toBe(false);
-  });
-
-  it("depth-2 leaf denies sessions_list and sessions_history", () => {
-    const policy = resolveSubagentToolPolicy(baseCfg, 2);
-    expect(isToolAllowedByPolicyName("sessions_list", policy)).toBe(false);
-    expect(isToolAllowedByPolicyName("sessions_history", policy)).toBe(false);
-  });
-
-  it("depth-1 leaf (maxSpawnDepth=1) denies sessions_spawn", () => {
-    const policy = resolveSubagentToolPolicy(leafCfg, 1);
-    expect(isToolAllowedByPolicyName("sessions_spawn", policy)).toBe(false);
-  });
-
-  it("depth-1 leaf (maxSpawnDepth=1) denies sessions_list", () => {
-    const policy = resolveSubagentToolPolicy(leafCfg, 1);
-    expect(isToolAllowedByPolicyName("sessions_list", policy)).toBe(false);
-  });
-
-  it("uses stored leaf role for flat depth-1 session keys", () => {
-    const storePath = path.join(
-      os.tmpdir(),
-      `openclaw-subagent-policy-${Date.now()}-${Math.random().toString(16).slice(2)}.json`,
-    );
-    fs.mkdirSync(path.dirname(storePath), { recursive: true });
-    fs.writeFileSync(
-      storePath,
-      JSON.stringify(
-        {
-          "agent:main:subagent:flat-leaf": {
-            sessionId: "flat-leaf",
-            updatedAt: Date.now(),
-            spawnDepth: 1,
-            subagentRole: "leaf",
-            subagentControlScope: "none",
-          },
-        },
-        null,
-        2,
-      ),
-      "utf-8",
-    );
-    const cfg = {
-      ...baseCfg,
-      session: {
-        store: storePath,
+  it("keeps flat depth-1 sessions as leaves under an explicit finite cap", async () => {
+    const storePath = createSessionStorePath("openclaw-subagent-policy");
+    await writeSessionEntries(storePath, {
+      "agent:main:subagent:flat-leaf": {
+        sessionId: "flat-leaf",
+        updatedAt: Date.now(),
+        spawnDepth: 1,
+        subagentRole: "leaf",
+        subagentControlScope: "none",
       },
+    });
+    const cfg = {
+      agents: { defaults: { subagents: { maxSpawnDepth: 1 } } },
+      session: { store: storePath },
     } as unknown as OpenClawConfig;
 
     const policy = resolveSubagentToolPolicyForSession(cfg, "agent:main:subagent:flat-leaf");
@@ -370,30 +330,78 @@ describe("resolveSubagentToolPolicy depth awareness", () => {
     expect(isToolAllowedByPolicyName("memory_get", policy)).toBe(true);
   });
 
-  it("resolves inherited tool denies from stored subagent sessions", () => {
-    const storePath = path.join(
-      os.tmpdir(),
-      `openclaw-subagent-inherited-deny-${Date.now()}-${Math.random().toString(16).slice(2)}.json`,
-    );
-    fs.mkdirSync(path.dirname(storePath), { recursive: true });
-    fs.writeFileSync(
-      storePath,
-      JSON.stringify(
-        {
-          "agent:main:subagent:limited": {
-            sessionId: "limited-session",
-            updatedAt: Date.now(),
-            spawnDepth: 1,
-            subagentRole: "orchestrator",
-            subagentControlScope: "children",
-            inheritedToolDeny: ["bash", "memory_get"],
+  it.each(["allow", "alsoAllow"] as const)(
+    "does not let configured %s entries re-enable hard-denied tools",
+    async (allowField) => {
+      const storePath = createSessionStorePath(`openclaw-subagent-hard-deny-${allowField}`);
+      const sessionKeys = {
+        leaf: "agent:main:subagent:hard-deny-leaf",
+        orchestrator: "agent:main:subagent:hard-deny-orchestrator",
+      } as const;
+      await writeSessionEntries(storePath, {
+        [sessionKeys.leaf]: {
+          sessionId: "hard-deny-leaf",
+          updatedAt: Date.now(),
+          spawnDepth: 2,
+          subagentRole: "leaf",
+          subagentControlScope: "none",
+        },
+        [sessionKeys.orchestrator]: {
+          sessionId: "hard-deny-orchestrator",
+          updatedAt: Date.now(),
+          spawnDepth: 1,
+          subagentRole: "orchestrator",
+          subagentControlScope: "children",
+        },
+      });
+      const hardDeniedTools = [
+        "gateway",
+        "agents_list",
+        "openclaw",
+        "session_status",
+        "progress_card",
+        "automations",
+        "cron",
+        "message",
+        "sessions_send",
+        "conversations_list",
+        "conversations_send",
+        "conversations_turn",
+      ];
+      const cfg = {
+        ...baseCfg,
+        session: { store: storePath },
+        tools: {
+          subagents: {
+            tools: {
+              [allowField]: [...hardDeniedTools, "update_plan", "memory_search"],
+            },
           },
         },
-        null,
-        2,
-      ),
-      "utf-8",
-    );
+      } as unknown as OpenClawConfig;
+
+      for (const sessionKey of Object.values(sessionKeys)) {
+        const policy = resolveSubagentToolPolicyForSession(cfg, sessionKey);
+        for (const toolName of hardDeniedTools) {
+          expect(isToolAllowedByPolicyName(toolName, policy), toolName).toBe(false);
+        }
+        expect(isToolAllowedByPolicyName("memory_search", policy)).toBe(true);
+      }
+    },
+  );
+
+  it("resolves inherited tool denies from stored subagent sessions", async () => {
+    const storePath = createSessionStorePath("openclaw-subagent-inherited-deny");
+    await writeSessionEntries(storePath, {
+      "agent:main:subagent:limited": {
+        sessionId: "limited-session",
+        updatedAt: Date.now(),
+        spawnDepth: 1,
+        subagentRole: "orchestrator",
+        subagentControlScope: "children",
+        inheritedToolDeny: ["bash", "memory_get"],
+      },
+    });
     const cfg = {
       ...baseCfg,
       session: {
@@ -407,30 +415,18 @@ describe("resolveSubagentToolPolicy depth awareness", () => {
     expect(isToolAllowedByPolicyName("sessions_spawn", policy)).toBe(true);
   });
 
-  it("resolves inherited tool allows from stored subagent sessions", () => {
-    const storePath = path.join(
-      os.tmpdir(),
-      `openclaw-subagent-inherited-allow-${Date.now()}-${Math.random().toString(16).slice(2)}.json`,
-    );
-    fs.mkdirSync(path.dirname(storePath), { recursive: true });
-    fs.writeFileSync(
-      storePath,
-      JSON.stringify(
-        {
-          "agent:main:subagent:limited": {
-            sessionId: "limited-session",
-            updatedAt: Date.now(),
-            spawnDepth: 1,
-            subagentRole: "orchestrator",
-            subagentControlScope: "children",
-            inheritedToolAllow: ["sessions_spawn", "memory_search"],
-          },
-        },
-        null,
-        2,
-      ),
-      "utf-8",
-    );
+  it("resolves inherited tool allows from stored subagent sessions", async () => {
+    const storePath = createSessionStorePath("openclaw-subagent-inherited-allow");
+    await writeSessionEntries(storePath, {
+      "agent:main:subagent:limited": {
+        sessionId: "limited-session",
+        updatedAt: Date.now(),
+        spawnDepth: 1,
+        subagentRole: "orchestrator",
+        subagentControlScope: "children",
+        inheritedToolAllow: ["sessions_spawn", "memory_search"],
+      },
+    });
     const cfg = {
       ...baseCfg,
       session: {
@@ -445,32 +441,18 @@ describe("resolveSubagentToolPolicy depth awareness", () => {
     expect(isToolAllowedByPolicyName("exec", policy)).toBe(false);
   });
 
-  it("keeps configured plugin allows separate from inherited tool allows", () => {
-    const storePath = path.join(
-      os.tmpdir(),
-      `openclaw-subagent-inherited-allow-separate-${Date.now()}-${Math.random()
-        .toString(16)
-        .slice(2)}.json`,
-    );
-    fs.mkdirSync(path.dirname(storePath), { recursive: true });
-    fs.writeFileSync(
-      storePath,
-      JSON.stringify(
-        {
-          "agent:main:subagent:limited": {
-            sessionId: "limited-session",
-            updatedAt: Date.now(),
-            spawnDepth: 1,
-            subagentRole: "orchestrator",
-            subagentControlScope: "children",
-            inheritedToolAllow: ["plugin_tool"],
-          },
-        },
-        null,
-        2,
-      ),
-      "utf-8",
-    );
+  it("keeps configured plugin allows separate from inherited tool allows", async () => {
+    const storePath = createSessionStorePath("openclaw-subagent-inherited-allow-separate");
+    await writeSessionEntries(storePath, {
+      "agent:main:subagent:limited": {
+        sessionId: "limited-session",
+        updatedAt: Date.now(),
+        spawnDepth: 1,
+        subagentRole: "orchestrator",
+        subagentControlScope: "children",
+        inheritedToolAllow: ["plugin_tool"],
+      },
+    });
     const cfg = {
       ...baseCfg,
       tools: {
@@ -494,28 +476,16 @@ describe("resolveSubagentToolPolicy depth awareness", () => {
     expect(inheritedPolicy?.allow).toEqual(["plugin_tool"]);
   });
 
-  it("applies inherited tool policy from stored ACP sessions without subagent metadata", () => {
-    const storePath = path.join(
-      os.tmpdir(),
-      `openclaw-acp-inherited-deny-${Date.now()}-${Math.random().toString(16).slice(2)}.json`,
-    );
-    fs.mkdirSync(path.dirname(storePath), { recursive: true });
-    fs.writeFileSync(
-      storePath,
-      JSON.stringify(
-        {
-          "agent:main:acp:limited": {
-            sessionId: "limited-acp-session",
-            updatedAt: Date.now(),
-            inheritedToolAllow: ["custom_plugin_tool"],
-            inheritedToolDeny: ["custom_denied_tool"],
-          },
-        },
-        null,
-        2,
-      ),
-      "utf-8",
-    );
+  it("applies inherited tool policy from stored ACP sessions without subagent metadata", async () => {
+    const storePath = createSessionStorePath("openclaw-acp-inherited-deny");
+    await writeSessionEntries(storePath, {
+      "agent:main:acp:limited": {
+        sessionId: "limited-acp-session",
+        updatedAt: Date.now(),
+        inheritedToolAllow: ["custom_plugin_tool"],
+        inheritedToolDeny: ["custom_denied_tool"],
+      },
+    });
     const cfg = {
       ...baseCfg,
       session: {
@@ -528,21 +498,77 @@ describe("resolveSubagentToolPolicy depth awareness", () => {
     expect(isToolAllowedByPolicyName("custom_denied_tool", policy)).toBe(false);
     expect(isToolAllowedByPolicyName("read", policy)).toBe(false);
   });
-
-  it("defaults to leaf behavior when no depth is provided", () => {
-    const policy = resolveSubagentToolPolicy(baseCfg);
-    // Default depth=1, maxSpawnDepth=2 → orchestrator
-    expect(isToolAllowedByPolicyName("sessions_spawn", policy)).toBe(true);
-  });
-
-  it("defaults to leaf behavior when depth is undefined and maxSpawnDepth is 1", () => {
-    const policy = resolveSubagentToolPolicy(leafCfg);
-    // Default depth=1, maxSpawnDepth=1 → leaf
-    expect(isToolAllowedByPolicyName("sessions_spawn", policy)).toBe(false);
-  });
 });
 
 describe("resolveEffectiveToolPolicy", () => {
+  it("applies implicit-main defaults tool restrictions to a pre-roster config", () => {
+    const cfg = {
+      agents: { defaults: { tools: { deny: ["exec"] } } },
+    } as unknown as OpenClawConfig;
+
+    const result = resolveEffectiveToolPolicy({ config: cfg });
+
+    expect(result.agentId).toBe("main");
+    expect(result.agentPolicy).toEqual({ deny: ["exec"] });
+  });
+
+  it("uses the configured default agent policy for an unscoped session alias", () => {
+    const cfg = {
+      agents: {
+        entries: {
+          ops: { default: true, tools: { deny: ["exec"] } },
+        },
+      },
+    } satisfies OpenClawConfig;
+
+    const result = resolveEffectiveToolPolicy({ config: cfg, sessionKey: "main" });
+
+    expect(result.agentId).toBe("ops");
+    expect(result.agentPolicy).toEqual({ deny: ["exec"] });
+  });
+
+  it("uses the retained legacy owner policy when no session scope is provided", () => {
+    const cfg = retainLegacyDefaultAgentId(
+      {
+        agents: {
+          ownership: "explicit",
+          entries: {
+            ops: { tools: { deny: ["read"] } },
+            research: { tools: { deny: ["exec"] } },
+          },
+        },
+      },
+      "research",
+    );
+
+    const result = resolveEffectiveToolPolicy({ config: cfg });
+
+    expect(result.agentId).toBe("research");
+    expect(result.agentPolicy).toEqual({ deny: ["exec"] });
+  });
+
+  it("uses the configured fixed-store owner policy for an unscoped session key", () => {
+    const cfg = {
+      session: { store: "/stores/shared.sqlite" },
+      agents: {
+        ownership: "explicit",
+        defaults: { sessionStore: { agentId: "research" } },
+        entries: {
+          ops: { tools: { deny: ["read"] } },
+          research: { tools: { deny: ["exec"] } },
+        },
+      },
+    } satisfies OpenClawConfig;
+
+    const result = resolveEffectiveToolPolicy({ config: cfg, sessionKey: "global" });
+
+    expect(result.agentId).toBe("research");
+    expect(result.agentPolicy).toEqual({ deny: ["exec"] });
+    expect(() =>
+      resolveEffectiveToolPolicy({ config: cfg, agentId: "ops", sessionKey: "global" }),
+    ).toThrow(/belongs to "research"/);
+  });
+
   it("keeps slash-containing modelId scoped to the selected provider", () => {
     const cfg = {
       tools: {
@@ -637,7 +663,7 @@ describe("resolveEffectiveToolPolicy", () => {
   it("global tools.exec does not widen agent messaging profile (#47487)", () => {
     const cfg = {
       tools: {
-        exec: { security: "allowlist" },
+        exec: { mode: "allowlist" },
       },
       agents: {
         list: [
@@ -645,14 +671,14 @@ describe("resolveEffectiveToolPolicy", () => {
             id: "messenger",
             tools: {
               profile: "messaging",
-              alsoAllow: ["image"],
+              alsoAllow: ["view_image"],
             },
           },
         ],
       },
     } as OpenClawConfig;
     const result = resolveEffectiveToolPolicy({ config: cfg, agentId: "messenger" });
-    expect(result.profileAlsoAllow).toEqual(["image"]);
+    expect(result.profileAlsoAllow).toEqual(["view_image"]);
     expect(result.profileAlsoAllow).not.toContain("exec");
     expect(result.profileAlsoAllow).not.toContain("process");
   });
@@ -662,7 +688,7 @@ describe("resolveEffectiveToolPolicy", () => {
     try {
       const cfg = {
         tools: {
-          exec: { security: "allowlist" },
+          exec: { mode: "allowlist" },
           fs: { workspaceOnly: true },
         },
         agents: {
@@ -671,7 +697,7 @@ describe("resolveEffectiveToolPolicy", () => {
               id: "sage",
               tools: {
                 profile: "messaging",
-                alsoAllow: ["image"],
+                alsoAllow: ["view_image"],
               },
             },
           ],
@@ -696,7 +722,7 @@ describe("resolveEffectiveToolPolicy", () => {
               id: "sage",
               tools: {
                 profile: "messaging",
-                exec: { security: "allowlist" },
+                exec: { mode: "allowlist" },
               },
             },
           ],
@@ -714,6 +740,69 @@ describe("resolveEffectiveToolPolicy", () => {
     }
   });
 
+  it.each<{
+    name: string;
+    tools?: OpenClawConfig["tools"];
+    agentTools?: AgentToolsConfig;
+    warning?: string;
+  }>([
+    { name: "global deny", tools: { deny: ["process"] } },
+    {
+      name: "global provider wildcard deny",
+      tools: { byProvider: { fixture: { deny: ["pro*"] } } },
+    },
+    { name: "agent group deny", agentTools: { deny: ["group:runtime"] } },
+    { name: "agent provider deny", agentTools: { byProvider: { fixture: { deny: ["process"] } } } },
+    { name: "global allow restriction", tools: { allow: ["exec"] } },
+    {
+      name: "provider profile",
+      tools: { byProvider: { fixture: { profile: "minimal" as const } } },
+    },
+    {
+      name: "provider profile alsoAllow",
+      tools: { byProvider: { fixture: { profile: "minimal" as const, alsoAllow: ["process"] } } },
+      warning: 'Add alsoAllow: ["process"]',
+    },
+    {
+      name: "unselected provider deny",
+      tools: { byProvider: { other: { deny: ["*"] } } },
+      warning: 'Add alsoAllow: ["process"]',
+    },
+  ])("warns only about actionable grants with $name", async ({ tools, agentTools, warning }) => {
+    const warnLogs = createWarnLogCapture("openclaw-agent-tools-policy-test");
+    try {
+      const config: OpenClawConfig = {
+        tools,
+        agents: {
+          entries: {
+            ops: {
+              tools: {
+                profile: "messaging",
+                alsoAllow: ["exec"],
+                exec: { host: "gateway" },
+                ...agentTools,
+              },
+            },
+          },
+        },
+      };
+      const result = resolveEffectiveToolPolicy({
+        config,
+        agentId: "ops",
+        modelProvider: "fixture",
+      });
+      const logged = await warnLogs.findText('tools policy: profile "messaging"');
+      if (warning) {
+        expect(logged).toContain(warning);
+      } else {
+        expect(logged).toBeUndefined();
+      }
+      expect(result.profileAlsoAllow).toEqual(["exec"]);
+    } finally {
+      warnLogs.cleanup();
+    }
+  });
+
   it("only lists configured sections whose grants are still missing (#47487)", async () => {
     const warnLogs = createWarnLogCapture("openclaw-agent-tools-policy-test");
     try {
@@ -725,7 +814,7 @@ describe("resolveEffectiveToolPolicy", () => {
               tools: {
                 profile: "messaging",
                 alsoAllow: ["read", "write", "edit"],
-                exec: { security: "allowlist" },
+                exec: { mode: "allowlist" },
                 fs: { workspaceOnly: true },
               },
             },

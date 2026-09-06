@@ -1,3 +1,4 @@
+// Hook public types describe install specs and runtime hook metadata.
 export type HookInstallSpec = {
   id?: string;
   kind: "bundled" | "npm" | "git";
@@ -49,6 +50,10 @@ export type HookEntry = {
   frontmatter: ParsedHookFrontmatter;
   metadata?: OpenClawHookMetadata;
   invocation?: HookInvocationPolicy;
+};
+
+export type HookPolicyEntry = Pick<HookEntry, "metadata"> & {
+  hook: Pick<Hook, "name" | "source">;
 };
 
 export type HookEligibilityContext = {

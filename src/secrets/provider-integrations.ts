@@ -1,3 +1,4 @@
+/** Materializes trusted plugin secret-provider integrations into exec provider configs. */
 import fs from "node:fs";
 import path from "node:path";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
@@ -6,6 +7,7 @@ import type {
   ManualExecSecretProviderConfig,
   PluginIntegrationSecretProviderConfig,
 } from "../config/types.secrets.js";
+import { isPathInside } from "../infra/path-guards.js";
 import { normalizePluginsConfig, type NormalizedPluginsConfig } from "../plugins/config-state.js";
 import { shouldRejectHardlinkedPluginFiles } from "../plugins/hardlink-policy.js";
 import { isActivatedManifestOwner } from "../plugins/manifest-owner-policy.js";
@@ -13,6 +15,7 @@ import type { PluginManifestRecord, PluginManifestRegistry } from "../plugins/ma
 import type { PluginManifestSecretProviderIntegration } from "../plugins/manifest.js";
 import { isValidSecretProviderAlias } from "./ref-contract.js";
 
+/** Secret provider preset exposed by an active trusted plugin integration. */
 export type SecretProviderIntegrationPreset = {
   id: string;
   pluginId: string;
@@ -22,7 +25,8 @@ export type SecretProviderIntegrationPreset = {
   providerConfig: PluginIntegrationSecretProviderConfig;
 };
 
-export type SecretProviderIntegrationResolution =
+/** Result of materializing a plugin integration into a manual exec provider config. */
+type SecretProviderIntegrationResolution =
   | {
       ok: true;
       providerConfig: ManualExecSecretProviderConfig;
@@ -35,17 +39,9 @@ export type SecretProviderIntegrationResolution =
 const NODE_COMMAND_PLACEHOLDER = "${node}";
 const PLUGIN_INTEGRATION_PROVIDER_ID_MAX_LENGTH = 128;
 
-function isPathInsideOrEqual(rootDir: string, candidate: string): boolean {
-  const relative = path.relative(path.resolve(rootDir), path.resolve(candidate));
-  return (
-    relative === "" ||
-    (relative.length > 0 && !relative.startsWith("..") && !path.isAbsolute(relative))
-  );
-}
-
 function resolvePluginRelativePath(value: string, pluginRoot: string): string | undefined {
   const resolved = path.resolve(pluginRoot, value);
-  return isPathInsideOrEqual(pluginRoot, resolved) ? resolved : undefined;
+  return isPathInside(pluginRoot, resolved) ? resolved : undefined;
 }
 
 function isPluginRelativeEntrypoint(value: string): boolean {
@@ -60,6 +56,8 @@ function resolveArg(arg: string, pluginRoot: string): string | undefined {
 }
 
 function withNodeCommandTrustedDir(command: string, pluginRoot: string): string[] {
+  // The ${node} placeholder executes the current Node binary with a plugin-owned entrypoint.
+  // Trust both the Node binary dir and plugin root so resolver path checks accept that shape.
   return command === NODE_COMMAND_PLACEHOLDER
     ? [...new Set([path.dirname(process.execPath), pluginRoot])]
     : [pluginRoot];
@@ -80,12 +78,12 @@ function isSecurePosixPathStat(stat: fs.Stats): boolean {
 }
 
 function pathSegmentsBetween(rootDir: string, targetDir: string): string[] | undefined {
+  if (!isPathInside(rootDir, targetDir)) {
+    return undefined;
+  }
   const relative = path.relative(rootDir, targetDir);
   if (relative === "") {
     return [];
-  }
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    return undefined;
   }
   return relative.split(path.sep).filter(Boolean);
 }
@@ -95,9 +93,8 @@ function isSecurePluginEntrypointPath(params: {
   pluginRootRealpath: string;
   resolvedEntrypoint: string;
   entrypointRealpath: string;
-  allowInsecurePath: boolean;
 }): boolean {
-  if (params.allowInsecurePath || process.platform === "win32") {
+  if (process.platform === "win32") {
     return true;
   }
   const originalSegments = pathSegmentsBetween(
@@ -112,6 +109,8 @@ function isSecurePluginEntrypointPath(params: {
     return false;
   }
 
+  // Validate both lexical and realpath parent chains. The lexical chain catches symlink tricks
+  // inside the plugin tree; the realpath chain catches world-writable resolved directories.
   let originalDir = path.resolve(params.pluginRoot);
   for (const [index, segment] of ["", ...originalSegments].entries()) {
     if (segment) {
@@ -171,12 +170,12 @@ function resolveNodeEntrypointArg(params: {
   if (params.rejectHardlinks && stat.nlink > 1) {
     return undefined;
   }
-  if (params.integration.allowInsecurePath !== true && !isSecurePosixPathStat(stat)) {
+  if (!isSecurePosixPathStat(stat)) {
     return undefined;
   }
   try {
     const realpath = fs.realpathSync(resolved);
-    if (!isPathInsideOrEqual(pluginRootRealpath, realpath)) {
+    if (!isPathInside(pluginRootRealpath, realpath)) {
       return undefined;
     }
     if (
@@ -185,7 +184,6 @@ function resolveNodeEntrypointArg(params: {
         pluginRootRealpath,
         resolvedEntrypoint: resolved,
         entrypointRealpath: realpath,
-        allowInsecurePath: params.integration.allowInsecurePath === true,
       })
     ) {
       return undefined;
@@ -242,9 +240,6 @@ function materializeExecProviderConfig(
     ...(integration.env ? { env: integration.env } : {}),
     ...(integration.passEnv ? { passEnv: integration.passEnv } : {}),
     trustedDirs,
-    ...(integration.command === NODE_COMMAND_PLACEHOLDER || integration.allowInsecurePath
-      ? { allowInsecurePath: true }
-      : {}),
   };
 }
 
@@ -292,6 +287,7 @@ function isValidPluginIntegrationProviderId(value: string): boolean {
   return value.length > 0 && value.length <= PLUGIN_INTEGRATION_PROVIDER_ID_MAX_LENGTH;
 }
 
+/** Narrows a secret provider config to the plugin-integration exec shape. */
 export function isPluginIntegrationSecretProviderConfig(
   value: unknown,
 ): value is PluginIntegrationSecretProviderConfig {
@@ -312,6 +308,8 @@ export function isPluginIntegrationSecretProviderConfig(
   );
 }
 
+/** Materializes an active trusted plugin secret-provider integration into an exec provider. */
+/** Resolves a trusted plugin secret-provider integration into executable provider config. */
 export function resolveSecretProviderIntegrationConfig(params: {
   manifestRegistry: Pick<PluginManifestRegistry, "plugins">;
   providerAlias: string;
@@ -362,6 +360,7 @@ export function resolveSecretProviderIntegrationConfig(params: {
   };
 }
 
+/** Lists plugin secret-provider presets available to interactive configure flows. */
 export function listSecretProviderIntegrationPresets(params: {
   manifestRegistry: Pick<PluginManifestRegistry, "plugins">;
   config?: OpenClawConfig;

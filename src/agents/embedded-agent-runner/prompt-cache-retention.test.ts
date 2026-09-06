@@ -1,7 +1,19 @@
+// Coverage for prompt-cache retention resolution by provider and model API.
 import { describe, expect, it } from "vitest";
 import { isGooglePromptCacheEligible, resolveCacheRetention } from "./prompt-cache-retention.js";
 
 describe("prompt cache retention", () => {
+  it.each([undefined, "none", "short", "long"] as const)(
+    "honors explicit retention %s for Anthropic-marker completions without cache keys",
+    (cacheRetention) => {
+      expect(
+        resolveCacheRetention({ cacheRetention }, "custom", "openai-completions", "qwen-plus", {
+          cacheControlFormat: "anthropic",
+        }),
+      ).toBe(cacheRetention);
+    },
+  );
+
   it("passes explicit cacheRetention through for direct Google models", () => {
     expect(
       resolveCacheRetention(
@@ -31,18 +43,15 @@ describe("prompt cache retention", () => {
   });
 
   it("passes explicit cacheRetention through for openai-completions providers when supportsPromptCacheKey (issue #81281)", () => {
-    // Regression: openai-completions providers with prefix-caching backends
-    // (oMLX, llama.cpp, etc.) set compat.supportsPromptCacheKey: true and
-    // cacheRetention: "long" but the wrapper was silently dropping the
-    // user's explicit cacheRetention because the provider is neither in the
-    // anthropic family nor google-eligible.
+    // Regression: prefix-caching OpenAI-compatible backends opt in with
+    // supportsPromptCacheKey, so explicit user retention must pass through.
     expect(
       resolveCacheRetention(
         { cacheRetention: "long" },
         "omlx-local",
         "openai-completions",
         "local_model",
-        true,
+        { supportsPromptCacheKey: true },
       ),
     ).toBe("long");
     expect(
@@ -51,7 +60,7 @@ describe("prompt cache retention", () => {
         "omlx-local",
         "openai-completions",
         "local_model",
-        true,
+        { supportsPromptCacheKey: true },
       ),
     ).toBe("short");
     expect(
@@ -60,15 +69,25 @@ describe("prompt cache retention", () => {
         "omlx-local",
         "openai-completions",
         "local_model",
-        true,
+        { supportsPromptCacheKey: true },
       ),
     ).toBe("none");
   });
 
+  it("keeps undocumented cacheRetention values outside the Bedrock runtime contract", () => {
+    expect(
+      resolveCacheRetention(
+        { cacheRetention: "standard" },
+        "amazon-bedrock",
+        "openai-completions",
+        "us.anthropic.claude-sonnet-4-6",
+      ),
+    ).toBeUndefined();
+  });
+
   it("does not honor explicit cacheRetention for openai-completions without supportsPromptCacheKey", () => {
     // Providers that route via openai-completions but do not advertise prompt
-    // caching (e.g. amazon-bedrock proxying amazon.* nova models) must keep
-    // the explicit cacheRetention from leaking into the outgoing payload.
+    // caching must keep retention out of outgoing payloads.
     expect(
       resolveCacheRetention(
         { cacheRetention: "long" },
@@ -83,7 +102,7 @@ describe("prompt cache retention", () => {
         "omlx-local",
         "openai-completions",
         "local_model",
-        false,
+        { supportsPromptCacheKey: false },
       ),
     ).toBeUndefined();
   });
@@ -93,10 +112,14 @@ describe("prompt cache retention", () => {
     // to the transport-level default ("short") rather than receiving a
     // wrapper-injected value.
     expect(
-      resolveCacheRetention(undefined, "omlx-local", "openai-completions", "local_model", true),
+      resolveCacheRetention(undefined, "omlx-local", "openai-completions", "local_model", {
+        supportsPromptCacheKey: true,
+      }),
     ).toBeUndefined();
     expect(
-      resolveCacheRetention({}, "omlx-local", "openai-completions", "local_model", true),
+      resolveCacheRetention({}, "omlx-local", "openai-completions", "local_model", {
+        supportsPromptCacheKey: true,
+      }),
     ).toBeUndefined();
   });
 
@@ -110,7 +133,7 @@ describe("prompt cache retention", () => {
         "omlx-local",
         "openai-completions",
         "local_model",
-        true,
+        { supportsPromptCacheKey: true },
       ),
     ).toBeUndefined();
     expect(
@@ -119,7 +142,7 @@ describe("prompt cache retention", () => {
         "omlx-local",
         "openai-completions",
         "local_model",
-        true,
+        { supportsPromptCacheKey: true },
       ),
     ).toBeUndefined();
   });

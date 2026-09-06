@@ -1,73 +1,131 @@
+/**
+ * Loads model catalog views for browse/search UI surfaces.
+ */
 import {
   clampTimerTimeoutMs,
   resolveTimerTimeoutMs,
 } from "@openclaw/normalization-core/number-coercion";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import type { ModelCatalogEntry } from "./model-catalog.types.js";
-import { parseConfiguredModelVisibilityEntries } from "./model-selection-shared.js";
+import type { ModelCatalogEntry, ModelCatalogSnapshot } from "./model-catalog.types.js";
+import {
+  buildConfiguredModelCatalog,
+  LEGACY_MODEL_POLICY_ALLOW_CONFIG_PATH,
+  parseConfiguredModelVisibilityEntries,
+} from "./model-selection-shared.js";
 
-export const DEFAULT_MODEL_CATALOG_BROWSE_TIMEOUT_MS = 750;
+/**
+ * Loads the model catalog shape used by browse/list commands without letting optional
+ * provider discovery stall the CLI path.
+ */
+export const MODEL_CATALOG_BROWSE_TIMEOUT_MS = 750;
 
-export type ModelCatalogBrowseView = "default" | "configured" | "all";
+/** Visible model subset requested by model browse callers. */
+export type ModelCatalogBrowseView = "default" | "configured" | "provider-config" | "all";
 
-const modelCatalogBrowseDeps = {
-  setTimeout: globalThis.setTimeout,
-  clearTimeout: globalThis.clearTimeout,
-};
-
-export function setModelCatalogBrowseTestDeps(
-  overrides: Partial<typeof modelCatalogBrowseDeps>,
-): void {
-  Object.assign(modelCatalogBrowseDeps, overrides);
-}
-
-export function restoreModelCatalogBrowseTestDeps(): void {
-  modelCatalogBrowseDeps.setTimeout = globalThis.setTimeout;
-  modelCatalogBrowseDeps.clearTimeout = globalThis.clearTimeout;
-}
-
-function resolveModelCatalogBrowseTimeoutMs(value: number | undefined): number {
-  return (
-    clampTimerTimeoutMs(value, 1) ??
-    resolveTimerTimeoutMs(DEFAULT_MODEL_CATALOG_BROWSE_TIMEOUT_MS, 1)
+/** Source-authored provider rows for inventory UIs, independent of picker allowlists. */
+export function buildProviderConfigModelCatalogForBrowse(params: {
+  cfg: OpenClawConfig;
+  workspaceDir?: string;
+}): ModelCatalogEntry[] {
+  return buildConfiguredModelCatalog(params).toSorted(
+    (a, b) =>
+      a.provider.localeCompare(b.provider) ||
+      a.name.localeCompare(b.name) ||
+      a.id.localeCompare(b.id),
   );
 }
 
-export async function loadModelCatalogForBrowse(params: {
+/** True when a browse view requires the full published catalog generation. */
+export function modelCatalogBrowseRequiresFullDiscovery(params: {
   cfg: OpenClawConfig;
+  agentId?: string;
   view?: ModelCatalogBrowseView;
-  loadCatalog: (params: { readOnly: boolean }) => Promise<ModelCatalogEntry[]>;
-  timeoutMs?: number;
-  onTimeout?: (timeoutMs: number) => void;
-}): Promise<ModelCatalogEntry[]> {
+}): boolean {
   const view = params.view ?? "default";
   if (view === "all") {
-    return await params.loadCatalog({ readOnly: false });
+    return true;
   }
-  if (parseConfiguredModelVisibilityEntries({ cfg: params.cfg }).providerWildcards.size > 0) {
-    return await params.loadCatalog({ readOnly: false });
+  const visibility = parseConfiguredModelVisibilityEntries({
+    cfg: params.cfg,
+    agentId: params.agentId,
+  });
+  if (visibility.providerWildcards.size === 0) {
+    return false;
+  }
+  // An explicit modelPolicy.allow provider wildcard makes model pickers,
+  // configured views, and provider-config inventory resolve against the
+  // discovered catalog so key-scoped runtime rows appear without an explicit
+  // allowlist entry (see openclaw#115953). Legacy agents.defaults.models
+  // wildcard entries keep the historical read-only default path and only
+  // escalate the configured view, as before.
+  if (visibility.configPath === LEGACY_MODEL_POLICY_ALLOW_CONFIG_PATH) {
+    return view === "configured";
+  }
+  return true;
+}
+
+function resolveModelCatalogBrowseTimeoutMs(value: number | undefined): number {
+  return clampTimerTimeoutMs(value, 1) ?? resolveTimerTimeoutMs(MODEL_CATALOG_BROWSE_TIMEOUT_MS, 1);
+}
+
+/** Loads an explicit logical/physical catalog snapshot for route-aware browse surfaces. */
+export async function loadPreparedModelCatalogSnapshotForBrowse(params: {
+  cfg: OpenClawConfig;
+  agentId?: string;
+  view?: ModelCatalogBrowseView;
+  /** Never starts provider discovery; a completed generation cache may still be reused. */
+  preparedOnly?: boolean;
+  /** Replaces the completed full-catalog generation. */
+  refresh?: boolean;
+  loadCatalog: (params: { readOnly: boolean; refresh?: boolean }) => Promise<ModelCatalogSnapshot>;
+  timeoutFullDiscovery?: boolean;
+  timeoutMs?: number;
+  onTimeout?: (timeoutMs: number) => void;
+}): Promise<ModelCatalogSnapshot> {
+  const view = params.view ?? "default";
+  const requiresFullDiscovery =
+    params.preparedOnly !== true &&
+    (params.refresh === true ||
+      modelCatalogBrowseRequiresFullDiscovery({
+        cfg: params.cfg,
+        agentId: params.agentId,
+        view,
+      }));
+  // Implicit inventory reads stay bounded; explicit refreshes complete unless their caller
+  // explicitly requests a full-discovery deadline.
+  const shouldTimeoutFullDiscovery =
+    params.timeoutFullDiscovery === true ||
+    (params.refresh !== true &&
+      requiresFullDiscovery &&
+      (view === "default" || view === "provider-config"));
+  const catalogPromise = params.loadCatalog({
+    readOnly: !requiresFullDiscovery,
+    ...(requiresFullDiscovery && params.refresh ? { refresh: true } : {}),
+  });
+  if ((requiresFullDiscovery || params.refresh === true) && !shouldTimeoutFullDiscovery) {
+    return await catalogPromise;
   }
 
   let timeout: NodeJS.Timeout | undefined;
   const timeoutMs = resolveModelCatalogBrowseTimeoutMs(params.timeoutMs);
-  const timedOut = Symbol("model-catalog-browse-timeout");
-  const catalogPromise = params.loadCatalog({ readOnly: true });
-  const timeoutPromise = new Promise<typeof timedOut>((resolve) => {
-    timeout = modelCatalogBrowseDeps.setTimeout(() => resolve(timedOut), timeoutMs);
+  const catalogResult = catalogPromise.then((value) => ({ kind: "catalog" as const, value }));
+  const timeoutPromise = new Promise<{ kind: "timeout" }>((resolve) => {
+    timeout = globalThis.setTimeout(() => resolve({ kind: "timeout" }), timeoutMs);
     timeout.unref?.();
   });
 
   try {
-    const result = await Promise.race([catalogPromise, timeoutPromise]);
-    if (result === timedOut) {
+    const result = await Promise.race([catalogResult, timeoutPromise]);
+    if (result.kind === "timeout") {
+      // The browse path may return partial/empty results; keep late catalog failures off stderr.
       catalogPromise.catch(() => undefined);
       params.onTimeout?.(timeoutMs);
-      return [];
+      return { entries: [], routeVariants: [] };
     }
-    return result;
+    return result.value;
   } finally {
     if (timeout) {
-      modelCatalogBrowseDeps.clearTimeout(timeout);
+      globalThis.clearTimeout(timeout);
     }
   }
 }

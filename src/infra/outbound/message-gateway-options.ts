@@ -1,4 +1,6 @@
-import { resolveTimerTimeoutMs } from "../../shared/number-coercion.js";
+// Gateway option normalization hides transport URL details for backend/managed
+// gateway clients and clamps timeout values.
+import { resolveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
 import {
   GATEWAY_CLIENT_MODES,
   GATEWAY_CLIENT_NAMES,
@@ -14,6 +16,7 @@ export type OutboundMessageGatewayOptionsInput = {
   clientName?: GatewayClientName;
   clientDisplayName?: string;
   mode?: GatewayClientMode;
+  resolveAgentRuntimeIdentityToken?: () => Promise<string | undefined>;
 };
 
 /** Normalizes outbound gateway options and fills CLI defaults. */

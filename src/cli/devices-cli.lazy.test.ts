@@ -1,3 +1,4 @@
+// Devices CLI lazy tests cover lazy device command imports and registration.
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -18,6 +19,7 @@ describe("devices cli lazy runtime boundary", () => {
       return {
         runDevicesApproveCommand: vi.fn(),
         runDevicesClearCommand: vi.fn(),
+        runDevicesJoinCodeCommand: vi.fn(),
         runDevicesListCommand: vi.fn(),
         runDevicesRejectCommand: vi.fn(),
         runDevicesRemoveCommand: vi.fn(),
@@ -51,6 +53,7 @@ describe("devices cli lazy runtime boundary", () => {
       return {
         runDevicesApproveCommand: vi.fn(),
         runDevicesClearCommand: vi.fn(),
+        runDevicesJoinCodeCommand: vi.fn(),
         runDevicesListCommand,
         runDevicesRejectCommand: vi.fn(),
         runDevicesRemoveCommand: vi.fn(),

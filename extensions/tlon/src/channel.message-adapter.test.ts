@@ -1,3 +1,4 @@
+// Tlon tests cover channel.message adapter plugin behavior.
 import { verifyChannelMessageAdapterCapabilityProofs } from "openclaw/plugin-sdk/channel-outbound";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../runtime-api.js";
@@ -25,6 +26,15 @@ const cfg = {
     },
   },
 } as OpenClawConfig;
+
+describe("tlon target classification", () => {
+  it("distinguishes ships from group nests", () => {
+    expect(tlonPlugin.messaging?.inferTargetChatType?.({ to: "~sampel-palnet" })).toBe("direct");
+    expect(
+      tlonPlugin.messaging?.inferTargetChatType?.({ to: "chat/~sampel-palnet/operators" }),
+    ).toBe("group");
+  });
+});
 
 describe("tlon channel message adapter", () => {
   beforeEach(() => {

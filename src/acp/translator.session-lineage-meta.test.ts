@@ -1,3 +1,4 @@
+/** Tests ACP session lineage metadata in list/load session responses. */
 import type { ListSessionsRequest, LoadSessionRequest } from "@agentclientprotocol/sdk";
 import { createInMemorySessionStore } from "@openclaw/acp-core/session";
 import { describe, expect, it, vi } from "vitest";
@@ -148,8 +149,6 @@ describe("acp session lineage metadata", () => {
         },
       },
     });
-
-    sessionStore.clearAllSessionsForTest();
   });
 
   it("keeps snapshot lineage in the Gateway session key namespace", async () => {
@@ -215,7 +214,5 @@ describe("acp session lineage metadata", () => {
         },
       },
     });
-
-    sessionStore.clearAllSessionsForTest();
   });
 });

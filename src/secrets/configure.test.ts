@@ -1,3 +1,4 @@
+/** Tests interactive and noninteractive secrets configure flows. */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -26,7 +27,7 @@ vi.mock("../agents/auth-profiles/persisted.js", () => ({
 }));
 
 vi.mock("../plugins/manifest-registry.js", () => ({
-  loadPluginManifestRegistry: (...args: unknown[]) => loadPluginManifestRegistryMock(...args),
+  loadPluginManifestRegistryCore: (...args: unknown[]) => loadPluginManifestRegistryMock(...args),
 }));
 
 vi.mock("./apply.js", () => ({

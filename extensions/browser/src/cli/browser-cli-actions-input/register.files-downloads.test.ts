@@ -1,5 +1,7 @@
+// Browser tests cover register.files downloads plugin behavior.
 import { Command } from "commander";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as browserPathsModule from "../../browser/paths.js";
 import * as browserCliSharedModule from "../browser-cli-shared.js";
 import {
   createBrowserProgram,
@@ -30,6 +32,10 @@ vi.spyOn(cliCoreApiModule.defaultRuntime, "writeJson").mockImplementation(
 );
 vi.spyOn(cliCoreApiModule.defaultRuntime, "error").mockImplementation(browserCliRuntime.error);
 vi.spyOn(cliCoreApiModule.defaultRuntime, "exit").mockImplementation(browserCliRuntime.exit);
+vi.spyOn(browserPathsModule, "resolveExistingUploadPaths").mockResolvedValue({
+  ok: true,
+  paths: ["/tmp/openclaw/uploads/a.pdf", "/tmp/openclaw/uploads/b.pdf"],
+});
 
 const { registerBrowserActionInputCommands } = await import("./register.js");
 
@@ -46,8 +52,49 @@ function getLastRequestOptions(): { timeoutMs?: number } | undefined {
 describe("browser action input file/download commands", () => {
   beforeEach(() => {
     mocks.callBrowserRequest.mockClear();
+    vi.mocked(browserPathsModule.resolveExistingUploadPaths).mockClear();
     getBrowserCliRuntimeCapture().resetRuntimeCapture();
     getBrowserCliRuntime().exit.mockImplementation(() => {});
+  });
+
+  it("arms uploads with normalized paths and element targeting options", async () => {
+    const program = createActionInputProgram();
+
+    await program.parseAsync(
+      [
+        "browser",
+        "upload",
+        "/tmp/openclaw/uploads/a.pdf",
+        "media://inbound/b",
+        "--input-ref",
+        "file-input",
+        "--element",
+        "input[type=file]",
+        "--target-id",
+        "tab-1",
+        "--timeout-ms",
+        "45000",
+      ],
+      { from: "user" },
+    );
+
+    expect(browserPathsModule.resolveExistingUploadPaths).toHaveBeenCalledWith({
+      requestedPaths: ["/tmp/openclaw/uploads/a.pdf", "media://inbound/b"],
+    });
+    const request = mocks.callBrowserRequest.mock.calls.at(-1)?.[1] as
+      | { path?: string; body?: Record<string, unknown> }
+      | undefined;
+    expect(request).toMatchObject({
+      path: "/hooks/file-chooser",
+      body: {
+        paths: ["/tmp/openclaw/uploads/a.pdf", "/tmp/openclaw/uploads/b.pdf"],
+        inputRef: "file-input",
+        element: "input[type=file]",
+        targetId: "tab-1",
+        timeoutMs: 45000,
+      },
+    });
+    expect(getLastRequestOptions()?.timeoutMs).toBe(50000);
   });
 
   it("keeps the outer waitfordownload request open for the advertised default wait", async () => {
@@ -55,7 +102,7 @@ describe("browser action input file/download commands", () => {
 
     await program.parseAsync(["browser", "waitfordownload"], { from: "user" });
 
-    expect(getLastRequestOptions()?.timeoutMs).toBeGreaterThan(120000);
+    expect(getLastRequestOptions()?.timeoutMs).toBe(125000);
   });
 
   it("accepts signed and zero-padded download timeouts", async () => {
@@ -65,7 +112,7 @@ describe("browser action input file/download commands", () => {
       from: "user",
     });
 
-    expect(getLastRequestOptions()?.timeoutMs).toBeGreaterThan(25_000);
+    expect(getLastRequestOptions()?.timeoutMs).toBe(30000);
   });
 
   it("uses custom download timeouts as the inner wait plus outer slack", async () => {
@@ -78,7 +125,7 @@ describe("browser action input file/download commands", () => {
       },
     );
 
-    expect(getLastRequestOptions()?.timeoutMs).toBeGreaterThan(25000);
+    expect(getLastRequestOptions()?.timeoutMs).toBe(30000);
   });
 
   it("rejects non-decimal file and download timeouts before dispatch", async () => {

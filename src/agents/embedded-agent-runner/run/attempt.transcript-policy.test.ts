@@ -1,12 +1,18 @@
+// Coverage for resolving transcript replay policy for embedded attempts.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProviderRuntimeModel } from "../../../plugins/provider-runtime-model.types.js";
 import type { AgentRuntimePlan } from "../../runtime-plan/types.js";
-import { resolveAttemptTranscriptPolicy } from "./attempt.transcript-policy.js";
+import { resolveAttemptTranscriptPolicy } from "./attempt-history.js";
 
 const resolveProviderRuntimePluginMock = vi.hoisted(() => vi.fn());
 
+// Explicit factory (no importOriginal): loading the real module would pull the
+// provider registry/loader graph into this focused test. Export every binding
+// the attempt-history import graph links, stubbing the ones this test never calls.
 vi.mock("../../../plugins/provider-hook-runtime.js", () => ({
   resolveProviderRuntimePlugin: resolveProviderRuntimePluginMock,
+  resolveProviderRuntimePluginHandle: vi.fn(),
+  clearProviderRuntimePluginCacheForTest: vi.fn(),
 }));
 
 describe("resolveAttemptTranscriptPolicy", () => {
@@ -16,6 +22,8 @@ describe("resolveAttemptTranscriptPolicy", () => {
   });
 
   it("uses RuntimePlan transcript policy when available", () => {
+    // RuntimePlan owns provider/plugin transcript policy; legacy fallbacks only
+    // run when a plan is unavailable.
     const plannedPolicy = {
       sanitizeMode: "full",
       sanitizeToolCallIds: true,
@@ -23,7 +31,6 @@ describe("resolveAttemptTranscriptPolicy", () => {
       preserveNativeAnthropicToolUseIds: false,
       repairToolUseResultPairing: true,
       preserveSignatures: true,
-      sanitizeThinkingSignatures: false,
       dropThinkingBlocks: true,
       applyGoogleTurnOrdering: false,
       validateGeminiTurns: false,
@@ -65,6 +72,8 @@ describe("resolveAttemptTranscriptPolicy", () => {
   });
 
   it("keeps the legacy provider transcript fallback when no RuntimePlan is available", () => {
+    // Legacy fallback remains for older runner paths and tests provider runtime
+    // plugin discovery with the same workspace/env context.
     const env = { OPENCLAW_TEST_TRANSCRIPT_POLICY: "1" } as NodeJS.ProcessEnv;
     const policy = resolveAttemptTranscriptPolicy({
       runtimePlanModelContext: {

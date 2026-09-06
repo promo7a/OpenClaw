@@ -1,9 +1,9 @@
+// Discord tests cover inbound context plugin behavior.
 import { describe, expect, it } from "vitest";
 import {
   createDiscordSupplementalContextAccessChecker,
   buildDiscordGroupSystemPrompt,
   buildDiscordInboundAccessContext,
-  buildDiscordUntrustedContext,
 } from "./inbound-context.js";
 
 describe("Discord inbound context helpers", () => {
@@ -26,7 +26,7 @@ describe("Discord inbound context helpers", () => {
 
     expect(accessContext.groupSystemPrompt).toBe("Use the runbook.");
     expect(accessContext.ownerAllowFrom).toEqual(["user-1"]);
-    expect(accessContext.untrustedContext).toEqual([
+    expect(accessContext.channelStructuredContext).toEqual([
       {
         label: "Discord channel metadata",
         source: "discord",
@@ -47,18 +47,19 @@ describe("Discord inbound context helpers", () => {
       }),
     ).toEqual({
       groupSystemPrompt: undefined,
-      untrustedContext: undefined,
+      channelStructuredContext: undefined,
       ownerAllowFrom: undefined,
     });
   });
 
   it("keeps direct helper behavior consistent", () => {
     expect(buildDiscordGroupSystemPrompt({ allowed: true, systemPrompt: "  hi  " })).toBe("hi");
-    const untrustedContext = buildDiscordUntrustedContext({
+    const channelStructuredContext = buildDiscordInboundAccessContext({
+      sender: { id: "user-1" },
       isGuild: true,
       channelTopic: "topic",
-    });
-    expect(untrustedContext).toEqual([
+    }).channelStructuredContext;
+    expect(channelStructuredContext).toEqual([
       {
         label: "Discord channel metadata",
         source: "discord",

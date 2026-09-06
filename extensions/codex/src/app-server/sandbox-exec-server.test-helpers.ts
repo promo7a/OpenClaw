@@ -1,15 +1,23 @@
+/**
+ * Test helpers for standing up fake sandbox contexts and driving the Codex
+ * sandbox exec-server JSON-RPC/WebSocket protocol.
+ */
 import type { SandboxContext } from "openclaw/plugin-sdk/sandbox";
 import { vi } from "vitest";
-import WebSocket from "ws";
+import type { RawData, WebSocket } from "ws";
+import { websocket } from "./sandbox-exec-server.websocket.js";
+import { CODEX_APP_SERVER_VERSION } from "./version.js";
 
 type RpcResponse = {
   id: number;
   result?: unknown;
-  error?: { message: string };
+  error?: { code: number; message: string };
 };
 
+/** Builds a minimal enabled sandbox context with overridable backend and fs bridge hooks. */
 export function createSandboxContext(overrides: {
   buildExecSpec?: NonNullable<SandboxContext["backend"]>["buildExecSpec"];
+  copyFile?: NonNullable<SandboxContext["fsBridge"]>["copyFile"];
   finalizeExec?: NonNullable<SandboxContext["backend"]>["finalizeExec"];
   mkdirp?: NonNullable<SandboxContext["fsBridge"]>["mkdirp"];
   readFile?: NonNullable<SandboxContext["fsBridge"]>["readFile"];
@@ -56,6 +64,7 @@ export function createSandboxContext(overrides: {
         relativePath: filePath,
         containerPath: filePath,
       }),
+      copyFile: overrides.copyFile ?? (async () => undefined),
       readFile: overrides.readFile ?? (async () => Buffer.alloc(0)),
       writeFile: overrides.writeFile ?? (async () => undefined),
       mkdirp: overrides.mkdirp ?? (async () => undefined),
@@ -72,13 +81,15 @@ export function createSandboxContext(overrides: {
   } as unknown as SandboxContext;
 }
 
+/** Creates a fake Codex app-server client with a configurable server version. */
 export function createClient(options: { serverVersion?: string } = {}) {
   return {
-    getServerVersion: vi.fn(() => options.serverVersion ?? "0.132.0"),
+    getServerVersion: vi.fn(() => options.serverVersion ?? CODEX_APP_SERVER_VERSION),
     request: vi.fn(async (_method: string, _params?: unknown) => ({})),
   };
 }
 
+/** Reads the registered exec-server URL from a fake client's environment/add call. */
 export function execServerUrlFromClient(
   client: ReturnType<typeof createClient>,
   callIndex = 0,
@@ -94,6 +105,7 @@ export function execServerUrlFromClient(
   return execServerUrl;
 }
 
+/** Builds a Codex-style managed filesystem sandbox context for RPC params. */
 export function codexFsSandboxContext(params: {
   entries: Array<{ path: unknown; access: "read" | "write" | "none" | "deny" }>;
   cwd?: string;
@@ -107,13 +119,14 @@ export function codexFsSandboxContext(params: {
       },
       network: "restricted",
     },
-    cwd: params.cwd ?? "/workspace",
+    cwd: params.cwd ?? "file:///workspace",
     windowsSandboxLevel: "disabled",
     windowsSandboxPrivateDesktop: false,
     useLegacyLandlock: false,
   };
 }
 
+/** Builds a Codex filesystem special-path selector for tests. */
 export function specialPath(kind: string, subpath?: string): unknown {
   return {
     type: "special",
@@ -124,6 +137,7 @@ export function specialPath(kind: string, subpath?: string): unknown {
   };
 }
 
+/** Builds a Codex filesystem glob-path selector for tests. */
 export function globPath(pattern: string): unknown {
   return {
     type: "glob_pattern",
@@ -131,14 +145,16 @@ export function globPath(pattern: string): unknown {
   };
 }
 
+/** Opens a WebSocket connection and resolves only after the socket is ready. */
 export function openSocket(url: string): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url);
+    const socket = new websocket.WebSocket(url);
     socket.once("open", () => resolve(socket));
     socket.once("error", reject);
   });
 }
 
+/** Collects server-originated JSON-RPC notifications seen by a WebSocket. */
 export function collectNotifications(
   socket: WebSocket,
 ): Array<{ method: string; params?: unknown }> {
@@ -156,6 +172,7 @@ export function collectNotifications(
   return notifications;
 }
 
+/** Polls process/read until the managed sandbox process reports closed. */
 export async function readUntilClosed(
   socket: WebSocket,
   processId: string,
@@ -189,17 +206,20 @@ export async function readUntilClosed(
   throw new Error(`process ${processId} did not close`);
 }
 
+/** Resolves with the WebSocket close code once the socket closes. */
 export function waitForSocketClose(socket: WebSocket): Promise<{ code: number }> {
   return new Promise((resolve) => {
     socket.once("close", (code) => resolve({ code }));
   });
 }
 
+/** Waits until the requested number of streaming HTTP body-delta notifications arrive. */
 export async function waitForHttpBodyDeltas(
   notifications: Array<{ method: string; params?: unknown }>,
   count: number,
 ): Promise<unknown[]> {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+  // Preserve the 500 ms failure budget while checking completed streams sooner.
+  for (let attempt = 0; attempt < 100; attempt += 1) {
     const deltas = notifications
       .filter((notification) => notification.method === "http/request/bodyDelta")
       .map((notification) => notification.params);
@@ -207,27 +227,24 @@ export async function waitForHttpBodyDeltas(
       return deltas;
     }
     await new Promise((resolve) => {
-      setTimeout(resolve, 25);
+      setTimeout(resolve, 5);
     });
   }
   throw new Error(`expected ${count} http body deltas`);
 }
 
-export function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", `'"'"'`)}'`;
-}
-
+/** Sends one JSON-RPC request and resolves/rejects from the matching response id. */
 export function rpc(socket: WebSocket, method: string, params: unknown): Promise<unknown> {
   const id = Math.floor(Math.random() * 1_000_000);
   return new Promise((resolve, reject) => {
-    const onMessage = (data: WebSocket.RawData) => {
+    const onMessage = (data: RawData) => {
       const response = JSON.parse(Buffer.from(data as Buffer).toString("utf8")) as RpcResponse;
       if (response.id !== id) {
         return;
       }
       socket.off("message", onMessage);
       if (response.error) {
-        reject(new Error(response.error.message));
+        reject(Object.assign(new Error(response.error.message), { code: response.error.code }));
         return;
       }
       resolve(response.result);

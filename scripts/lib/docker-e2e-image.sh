@@ -33,6 +33,50 @@ docker_e2e_resolve_image() {
   printf '%s\n' "$default_image"
 }
 
+docker_e2e_read_nonnegative_decimal_env() {
+  local name="${1:?missing environment variable name}"
+  local fallback="${2:?missing fallback value}"
+  local value="${!name-}"
+  if [ -z "${!name+x}" ]; then
+    value="$fallback"
+  fi
+  if [[ ! "$value" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]]; then
+    echo "invalid $name: $value" >&2
+    return 2
+  fi
+  local integer_part="${value%%.*}"
+  local fractional_part=""
+  if [[ "$value" == *.* ]]; then
+    fractional_part="${value#*.}"
+  fi
+  # These suite knobs are human-authored resource/time ceilings. Reject
+  # pathological decimal strings before Docker setup instead of failing later.
+  if [ "${#integer_part}" -gt 9 ] || [ "${#fractional_part}" -gt 6 ]; then
+    echo "invalid $name: $value" >&2
+    return 2
+  fi
+  printf '%s\n' "$value"
+}
+
+docker_e2e_read_tcp_port_env() {
+  local name="${1:?missing environment variable name}"
+  local fallback="${2:?missing fallback value}"
+  local value="${!name-}"
+  if [ -z "${!name+x}" ]; then
+    value="$fallback"
+  fi
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    echo "invalid $name: $value" >&2
+    return 2
+  fi
+  local decimal_value=$((10#$value))
+  if [ "$decimal_value" -lt 1 ] || [ "$decimal_value" -gt 65535 ]; then
+    echo "invalid $name: $value" >&2
+    return 2
+  fi
+  printf '%s\n' "$value"
+}
+
 docker_e2e_build_or_reuse() {
   local image_name="$1"
   local label="$2"
@@ -49,6 +93,10 @@ docker_e2e_build_or_reuse() {
   if [ "${OPENCLAW_SKIP_DOCKER_BUILD:-0}" = "1" ] || [ "$skip_build" = "1" ]; then
     echo "Reusing Docker image: $image_name"
     if ! docker_e2e_docker_cmd image inspect "$image_name" >/dev/null 2>&1; then
+      if [ "${OPENCLAW_DOCKER_E2E_REQUIRE_LOCAL_IMAGE:-0}" = "1" ]; then
+        echo "Required local Docker E2E image not found: $image_name" >&2
+        return 1
+      fi
       echo "Docker image not found locally; pulling: $image_name"
       if docker_e2e_docker_cmd pull "$image_name"; then
         return 0
@@ -102,10 +150,30 @@ docker_e2e_build_or_reuse() {
   return "$build_status"
 }
 
+docker_e2e_test_state_entrypoint() {
+  local extension entrypoint
+  for extension in mts mjs; do
+    entrypoint="$ROOT_DIR/scripts/lib/openclaw-test-state.$extension"
+    if [ -f "$entrypoint" ]; then
+      printf '%s\n' "$entrypoint"
+      return 0
+    fi
+  done
+
+  echo "OpenClaw test-state entrypoint not found under $ROOT_DIR/scripts/lib" >&2
+  return 1
+}
+
+docker_e2e_run_test_state() {
+  local entrypoint
+  entrypoint="$(docker_e2e_test_state_entrypoint)" || return
+  node "$entrypoint" "$@"
+}
+
 docker_e2e_test_state_shell_b64() {
   local label="${1:?missing test-state label}"
   local scenario="${2:-empty}"
-  node "$ROOT_DIR/scripts/lib/openclaw-test-state.mjs" shell \
+  docker_e2e_run_test_state shell \
     --label "$label" \
     --scenario "$scenario" |
     base64 |
@@ -113,7 +181,7 @@ docker_e2e_test_state_shell_b64() {
 }
 
 docker_e2e_test_state_function_b64() {
-  node "$ROOT_DIR/scripts/lib/openclaw-test-state.mjs" shell-function |
+  docker_e2e_run_test_state shell-function |
     base64 |
     tr -d '\n'
 }
@@ -131,6 +199,7 @@ docker_e2e_sample_stats_until_exit() {
   if ! [[ "$heartbeat_seconds" =~ ^[0-9]+$ ]] || [ "$heartbeat_seconds" -lt 1 ]; then
     heartbeat_seconds="30"
   fi
+  heartbeat_seconds="$((10#$heartbeat_seconds))"
 
   while kill -0 "$docker_pid" 2>/dev/null; do
     if docker_e2e_docker_cmd inspect "$container_name" >/dev/null 2>&1; then

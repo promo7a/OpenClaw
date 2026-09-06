@@ -1,22 +1,27 @@
+/**
+ * Resolves terminal attempt trajectory status and assistant-visible text.
+ */
 import {
   hasAcceptedSessionSpawn,
   type AcceptedSessionSpawn,
 } from "../../accepted-session-spawn.js";
+import { hasAnyNonEmptyString as hasAnyNonBlankString } from "../../delivery-evidence-values.js";
 
-export type AttemptTrajectoryTerminalStatus = "success" | "error" | "interrupted";
+type AttemptTrajectoryTerminalStatus = "success" | "error" | "interrupted";
 
-export const NON_DELIVERABLE_TERMINAL_TURN_REASON = "non_deliverable_terminal_turn";
+/** Terminal error marker for runs that produced no user-visible delivery or durable progress. */
+const NON_DELIVERABLE_TERMINAL_TURN_REASON = "non_deliverable_terminal_turn";
 
-export type AttemptTrajectoryTerminal = {
+/** Normalized terminal status recorded for an embedded run attempt trajectory. */
+type AttemptTrajectoryTerminal = {
   status: AttemptTrajectoryTerminalStatus;
   terminalError?: typeof NON_DELIVERABLE_TERMINAL_TURN_REASON;
 };
 
-export type ResolveAttemptTrajectoryTerminalParams = {
-  promptError?: unknown;
-  aborted: boolean;
-  externalAbort: boolean;
-  timedOut: boolean;
+/** Signals that decide whether a completed run attempt has deliverable output. */
+type ResolveAttemptTrajectoryTerminalParams = {
+  failed: boolean;
+  interrupted: boolean;
   assistantTexts: string[];
   toolMetas: Array<{
     toolName: string;
@@ -40,8 +45,14 @@ export type ResolveAttemptTrajectoryTerminalParams = {
   silentExpected?: boolean;
   emptyAssistantReplyIsSilent?: boolean;
   lastAssistantStopReason?: string;
+  hasTerminalOutput?: boolean;
 };
 
+/**
+ * Chooses assistant text that can safely count as terminal output. Provider error
+ * and abort stop reasons cannot fall back to the raw last visible text because
+ * that text may describe an interrupted generation rather than a completed reply.
+ */
 export function resolveTerminalAssistantTexts(params: {
   assistantTexts: string[];
   lastAssistantStopReason?: string;
@@ -61,10 +72,6 @@ function hasNonEmptyAssistantText(texts: string[]): boolean {
   return texts.some((text) => text.trim().length > 0);
 }
 
-function hasNonEmptyString(values: string[]): boolean {
-  return values.some((value) => value.trim().length > 0);
-}
-
 function hasCommittedMessagingDeliveryEvidence(
   params: Pick<
     ResolveAttemptTrajectoryTerminalParams,
@@ -72,8 +79,8 @@ function hasCommittedMessagingDeliveryEvidence(
   >,
 ): boolean {
   return (
-    hasNonEmptyString(params.messagingToolSentTexts) ||
-    hasNonEmptyString(params.messagingToolSentMediaUrls) ||
+    hasAnyNonBlankString(params.messagingToolSentTexts) ||
+    hasAnyNonBlankString(params.messagingToolSentMediaUrls) ||
     params.messagingToolSentTargets.length > 0
   );
 }
@@ -82,23 +89,31 @@ function hasAsyncStartedToolActivity(toolMetas?: readonly { asyncStarted?: boole
   return (toolMetas ?? []).some((entry) => entry.asyncStarted === true);
 }
 
+/**
+ * Classifies the final attempt trajectory from visible output, durable side
+ * effects, and interruption state. Empty terminal turns are errors unless a
+ * caller proves a silent success, message delivery, spawned session, async task,
+ * or other durable progress.
+ */
 export function resolveAttemptTrajectoryTerminal(
   params: ResolveAttemptTrajectoryTerminalParams,
 ): AttemptTrajectoryTerminal {
-  if (params.promptError) {
-    return { status: "error" };
-  }
-  if ((params.aborted && params.externalAbort) || params.timedOut) {
+  if (params.interrupted) {
     return { status: "interrupted" };
   }
+  if (params.failed) {
+    return { status: "error" };
+  }
 
+  // Messaging/tool-use attempts may not have assistant text; only committed
+  // delivery evidence or durable side effects can make those terminal turns
+  // successful.
   const hasExplicitTerminalDelivery =
     params.silentExpected === true ||
     params.emptyAssistantReplyIsSilent === true ||
     params.didSendDeterministicApprovalPrompt ||
     hasCommittedMessagingDeliveryEvidence(params) ||
     hasAcceptedSessionSpawn(params.acceptedSessionSpawns) ||
-    params.synthesizedPayloadCount > 0 ||
     params.heartbeatToolResponse !== undefined ||
     (params.clientToolCalls?.length ?? 0) > 0 ||
     params.yieldDetected === true ||
@@ -111,10 +126,31 @@ export function resolveAttemptTrajectoryTerminal(
       terminalError: NON_DELIVERABLE_TERMINAL_TURN_REASON,
     };
   }
+  // A length stop with visible assistant text is delivered as a partial reply by
+  // the terminal owner, so recording it as non-deliverable here would contradict
+  // what the user received. Visible text is the canonical fact to key on:
+  // finalization runs before terminal preparation turns assistant text into
+  // payloads, so synthesizedPayloadCount is still 0 for an ordinary text-only
+  // reply and cannot stand in for "nothing was delivered".
+  const hasVisibleAssistantOutput =
+    hasNonEmptyAssistantText(params.assistantTexts) || params.synthesizedPayloadCount > 0;
+
+  if (
+    params.lastAssistantStopReason === "length" &&
+    !params.hasTerminalOutput &&
+    !hasExplicitTerminalDelivery &&
+    !hasVisibleAssistantOutput
+  ) {
+    return {
+      status: "error",
+      terminalError: NON_DELIVERABLE_TERMINAL_TURN_REASON,
+    };
+  }
 
   const hasDeliverableOrProgress =
     hasExplicitTerminalDelivery ||
-    hasNonEmptyAssistantText(params.assistantTexts) ||
+    params.hasTerminalOutput ||
+    hasVisibleAssistantOutput ||
     params.successfulCronAdds > 0;
 
   if (hasDeliverableOrProgress) {

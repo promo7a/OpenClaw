@@ -1,7 +1,9 @@
+// Skill index helpers map normalized skill names to loaded skill entries.
 import { resolveSkillKey } from "../loading/frontmatter.js";
 import { resolveSkillSource } from "../loading/source.js";
 import type { SkillEntry } from "../types.js";
 
+/** Indexed skill metadata used for runtime visibility and command lookup. */
 export type SkillIndexEntry = {
   entry: SkillEntry;
   name: string;
@@ -16,20 +18,11 @@ export type SkillIndexEntry = {
   userInvocable: boolean;
 };
 
-export type SkillIndex = {
-  entries: SkillIndexEntry[];
-  runtimeEntries: SkillEntry[];
-  promptVisibleEntries: SkillEntry[];
-  userInvocableEntries: SkillEntry[];
-  byName: ReadonlyMap<string, SkillIndexEntry>;
-  byNormalizedName: ReadonlyMap<string, readonly SkillIndexEntry[]>;
-};
-
-export type BuildSkillIndexOptions = {
-  bundledNames?: ReadonlySet<string>;
+type BuildSkillIndexOptions = {
   agentSkillFilter?: readonly string[];
 };
 
+/** Normalizes a skill name to the comparable key used by filters and commands. */
 export function normalizeSkillIndexName(value: string): string {
   return value
     .trim()
@@ -40,7 +33,7 @@ export function normalizeSkillIndexName(value: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
-export function isSkillRuntimeVisible(entry: SkillEntry): boolean {
+function isSkillRuntimeVisible(entry: SkillEntry): boolean {
   return entry.exposure?.includeInRuntimeRegistry ?? true;
 }
 
@@ -54,7 +47,7 @@ export function isSkillPromptVisible(entry: SkillEntry): boolean {
   return !entry.skill.disableModelInvocation;
 }
 
-export function isSkillUserInvocable(entry: SkillEntry): boolean {
+function isSkillUserInvocable(entry: SkillEntry): boolean {
   if (entry.exposure) {
     return entry.exposure.userInvocable ?? true;
   }
@@ -78,48 +71,11 @@ export function buildSkillIndexEntries(
 ): SkillIndexEntry[] {
   const agentSkillSet =
     opts?.agentSkillFilter === undefined ? undefined : new Set(opts.agentSkillFilter);
-  return entries.map((entry) => createSkillIndexEntry(entry, opts, agentSkillSet));
-}
-
-export function buildSkillIndex(
-  entries: readonly SkillEntry[],
-  opts?: BuildSkillIndexOptions,
-): SkillIndex {
-  const byName = new Map<string, SkillIndexEntry>();
-  const normalized = new Map<string, SkillIndexEntry[]>();
-  const indexedEntries = buildSkillIndexEntries(entries, opts);
-  const runtimeEntries: SkillEntry[] = [];
-  const promptVisibleEntries: SkillEntry[] = [];
-  const userInvocableEntries: SkillEntry[] = [];
-
-  for (const indexed of indexedEntries) {
-    byName.set(indexed.name, indexed);
-    addNormalizedEntry(normalized, indexed.normalizedName, indexed);
-    addNormalizedEntry(normalized, indexed.normalizedSkillKey, indexed);
-    if (indexed.runtimeVisible) {
-      runtimeEntries.push(indexed.entry);
-    }
-    if (indexed.promptVisible) {
-      promptVisibleEntries.push(indexed.entry);
-    }
-    if (indexed.userInvocable) {
-      userInvocableEntries.push(indexed.entry);
-    }
-  }
-
-  return {
-    entries: indexedEntries,
-    runtimeEntries,
-    promptVisibleEntries,
-    userInvocableEntries,
-    byName,
-    byNormalizedName: normalized,
-  };
+  return entries.map((entry) => createSkillIndexEntry(entry, agentSkillSet));
 }
 
 function createSkillIndexEntry(
   entry: SkillEntry,
-  opts: BuildSkillIndexOptions | undefined,
   agentSkillSet: ReadonlySet<string> | undefined,
 ): SkillIndexEntry {
   const name = entry.skill.name;
@@ -132,30 +88,11 @@ function createSkillIndexEntry(
     skillKey,
     normalizedSkillKey: normalizeSkillIndexName(skillKey),
     source,
-    bundled:
-      source === "openclaw-bundled" ||
-      (source === "unknown" && opts?.bundledNames?.has(name) === true),
+    // Loader provenance owns bundled status; a matching name cannot establish source.
+    bundled: source === "openclaw-bundled" || source === "openclaw-custodian",
     agentAllowed: agentSkillSet === undefined || agentSkillSet.has(name),
     runtimeVisible: isSkillRuntimeVisible(entry),
     promptVisible: isSkillPromptVisible(entry),
     userInvocable: isSkillUserInvocable(entry),
   };
-}
-
-function addNormalizedEntry(
-  normalized: Map<string, SkillIndexEntry[]>,
-  key: string,
-  entry: SkillIndexEntry,
-) {
-  if (!key) {
-    return;
-  }
-  const existing = normalized.get(key);
-  if (existing) {
-    if (!existing.includes(entry)) {
-      existing.push(entry);
-    }
-    return;
-  }
-  normalized.set(key, [entry]);
 }

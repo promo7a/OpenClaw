@@ -1,5 +1,9 @@
+/**
+ * Browser CLI form fill, wait, and evaluate commands.
+ */
 import type { Command } from "commander";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import type { BrowserActRequest } from "../../browser/client-actions.types.js";
 import {
   BROWSER_TAB_REFERENCE_HELP,
   parseBrowserNonNegativeIntegerOption,
@@ -14,7 +18,6 @@ import {
   resolveBrowserActionContext,
 } from "./shared.js";
 
-const DEFAULT_WAIT_CONDITION_TIMEOUT_MS = 20000;
 type BrowserWaitLoadState = "load" | "domcontentloaded" | "networkidle";
 
 function parseBrowserWaitLoadState(value: unknown): BrowserWaitLoadState | undefined {
@@ -31,6 +34,7 @@ function parseBrowserWaitLoadState(value: unknown): BrowserWaitLoadState | undef
   }
 }
 
+/** Registers Browser fill, wait, and evaluate commands. */
 export function registerBrowserFormWaitEvalCommands(
   browser: Command,
   parentOpts: (cmd: Command) => BrowserParentOpts,
@@ -93,26 +97,22 @@ export function registerBrowserFormWaitEvalCommands(
         const textGone = normalizeOptionalString(opts.textGone);
         const url = normalizeOptionalString(opts.url);
         const fn = normalizeOptionalString(opts.fn);
-        const waitConditionCount = [text, textGone, sel, url, load, fn].filter(Boolean).length;
-        const outerTimeoutBaseMs =
-          (timeMs ?? 0) + waitConditionCount * (timeoutMs ?? DEFAULT_WAIT_CONDITION_TIMEOUT_MS) ||
-          undefined;
+        const request: BrowserActRequest = {
+          kind: "wait",
+          timeMs,
+          text,
+          textGone,
+          selector: sel,
+          url,
+          loadState: load,
+          fn,
+          targetId: normalizeOptionalString(opts.targetId),
+          timeoutMs,
+        };
         const result = await callBrowserAct<{ result?: unknown }>({
           parent,
           profile,
-          body: {
-            kind: "wait",
-            timeMs,
-            text,
-            textGone,
-            selector: sel,
-            url,
-            loadState: load,
-            fn,
-            targetId: normalizeOptionalString(opts.targetId),
-            timeoutMs,
-          },
-          timeoutMs: outerTimeoutBaseMs,
+          body: request,
         });
         logBrowserActionResult(parent, result, "wait complete");
       } catch (err) {
@@ -123,8 +123,11 @@ export function registerBrowserFormWaitEvalCommands(
 
   browser
     .command("evaluate")
-    .description("Evaluate a function against the page or a ref")
-    .option("--fn <code>", "Function source, e.g. (el) => el.textContent")
+    .description("Evaluate JavaScript against the page or a ref")
+    .option(
+      "--fn <code>",
+      "Function source, expression, or statement body, e.g. const text = el.textContent; return text;",
+    )
     .option("--ref <id>", "Ref from snapshot")
     .option(
       "--timeout-ms <ms>",
@@ -151,7 +154,6 @@ export function registerBrowserFormWaitEvalCommands(
             targetId: normalizeOptionalString(opts.targetId),
             timeoutMs,
           },
-          timeoutMs,
         });
         if (parent?.json) {
           defaultRuntime.writeJson(result);

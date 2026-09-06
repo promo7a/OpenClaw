@@ -1,3 +1,4 @@
+// Runtime model auth tests cover provider auth resolution inside plugin runtime loading.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const hoisted = vi.hoisted(() => ({
@@ -7,8 +8,8 @@ const hoisted = vi.hoisted(() => ({
 }));
 
 vi.mock("../../agents/model-auth.js", () => ({
-  getApiKeyForModel: hoisted.getApiKeyForModel,
-  resolveApiKeyForProvider: hoisted.resolveApiKeyForProvider,
+  getApiKeyForModelCore: hoisted.getApiKeyForModel,
+  resolveApiKeyForProviderCore: hoisted.resolveApiKeyForProvider,
 }));
 
 vi.mock("../provider-runtime.runtime.js", () => ({
@@ -16,8 +17,8 @@ vi.mock("../provider-runtime.runtime.js", () => ({
 }));
 
 let getApiKeyForModel: typeof import("./runtime-model-auth.runtime.js").getApiKeyForModel;
-let getRuntimeAuthForModel: typeof import("./runtime-model-auth.runtime.js").getRuntimeAuthForModel;
-let resolveApiKeyForProvider: typeof import("./runtime-model-auth.runtime.js").resolveApiKeyForProvider;
+let getRuntimeAuthForModelCore: typeof import("./runtime-model-auth.runtime.js").getRuntimeAuthForModelCore;
+let resolveProviderRuntimeApiKey: typeof import("./runtime-model-auth.runtime.js").resolveProviderRuntimeApiKey;
 
 const MODEL = {
   id: "github-copilot/gpt-4o",
@@ -28,7 +29,7 @@ const MODEL = {
 
 describe("runtime-model-auth.runtime", () => {
   beforeAll(async () => {
-    ({ getApiKeyForModel, getRuntimeAuthForModel, resolveApiKeyForProvider } =
+    ({ getApiKeyForModel, getRuntimeAuthForModelCore, resolveProviderRuntimeApiKey } =
       await import("./runtime-model-auth.runtime.js"));
   });
 
@@ -52,7 +53,7 @@ describe("runtime-model-auth.runtime", () => {
     });
 
     await expect(
-      getRuntimeAuthForModel({
+      getRuntimeAuthForModelCore({
         model: MODEL as never,
       }),
     ).resolves.toEqual({
@@ -91,7 +92,7 @@ describe("runtime-model-auth.runtime", () => {
     hoisted.prepareProviderRuntimeAuth.mockResolvedValue(undefined);
 
     await expect(
-      getRuntimeAuthForModel({
+      getRuntimeAuthForModelCore({
         model: {
           ...MODEL,
           id: "openai/gpt-5.4",
@@ -112,7 +113,7 @@ describe("runtime-model-auth.runtime", () => {
     });
 
     await expect(
-      getRuntimeAuthForModel({
+      getRuntimeAuthForModelCore({
         model: {
           ...MODEL,
           id: "bedrock/claude-sonnet",
@@ -143,7 +144,7 @@ describe("runtime-model-auth.runtime", () => {
       source: "env:OPENAI_API_KEY",
       mode: "api-key",
     });
-    await expect(resolveApiKeyForProvider({ provider: "openai" })).resolves.toEqual({
+    await expect(resolveProviderRuntimeApiKey({ provider: "openai" })).resolves.toEqual({
       apiKey: "provider-key",
       source: "env:OPENAI_API_KEY",
       mode: "api-key",

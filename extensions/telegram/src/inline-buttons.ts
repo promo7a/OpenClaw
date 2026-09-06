@@ -1,5 +1,8 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import type { TelegramInlineButtonsScope } from "openclaw/plugin-sdk/config-contracts";
+// Telegram plugin module implements inline buttons behavior.
+import type {
+  OpenClawConfig,
+  TelegramInlineButtonsScope,
+} from "openclaw/plugin-sdk/config-contracts";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalLowercaseString,
@@ -46,6 +49,9 @@ export function resolveTelegramInlineButtonsScopeFromCapabilities(
     return DEFAULT_INLINE_BUTTONS_SCOPE;
   }
   if (Array.isArray(capabilities)) {
+    if (capabilities.length === 0) {
+      return DEFAULT_INLINE_BUTTONS_SCOPE;
+    }
     const enabled = capabilities.some(
       (entry) => normalizeLowercaseStringOrEmpty(String(entry)) === "inlinebuttons",
     );

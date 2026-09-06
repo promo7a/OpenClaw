@@ -1,9 +1,17 @@
+/**
+ * Playwright page-scoped CDP helpers.
+ *
+ * Opens a CDP session through Playwright pages and marks backend DOM nodes with
+ * temporary browser refs for role-snapshot interactions.
+ */
 import { uniqueValues } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { CDPSession, Page } from "playwright-core";
+import { readCdpMainFrameDocumentIdentity } from "./cdp-page-session.js";
+import { bindPlaywrightCdpSend } from "./pw-cdp-send.js";
 
-type PageCdpSend = (method: string, params?: Record<string, unknown>) => Promise<unknown>;
 type MarkBackendDomRef = { ref: string; backendDOMNodeId: number };
 
+/** Attribute used to mark DOM nodes that correspond to generated browser refs. */
 export const BROWSER_REF_MARKER_ATTRIBUTE = "data-openclaw-browser-ref";
 
 async function withPlaywrightPageCdpSession<T>(
@@ -18,24 +26,29 @@ async function withPlaywrightPageCdpSession<T>(
   }
 }
 
+/** Run a function with a CDP send helper scoped to one Playwright page. */
 export async function withPageScopedCdpClient<T>(opts: {
   cdpUrl: string;
   page: Page;
   targetId?: string;
-  fn: (send: PageCdpSend) => Promise<T>;
+  fn: (send: ReturnType<typeof bindPlaywrightCdpSend>) => Promise<T>;
 }): Promise<T> {
   return await withPlaywrightPageCdpSession(opts.page, async (session) => {
-    return await opts.fn((method, params) =>
-      (
-        session.send as unknown as (
-          method: string,
-          params?: Record<string, unknown>,
-        ) => Promise<unknown>
-      )(method, params),
-    );
+    return await opts.fn(bindPlaywrightCdpSend(session));
   });
 }
 
+/** Read the browser-owned loader identity for a Playwright page's main frame. */
+export async function readMainFrameDocumentIdentityForPage(
+  page: Page,
+): Promise<string | undefined> {
+  return await withPlaywrightPageCdpSession(
+    page,
+    async (session) => await readCdpMainFrameDocumentIdentity(bindPlaywrightCdpSend(session)),
+  );
+}
+
+/** Mark backend DOM node ids on the page with browser ref attributes. */
 export async function markBackendDomRefsOnPage(opts: {
   page: Page;
   refs: MarkBackendDomRef[];
@@ -53,7 +66,7 @@ export async function markBackendDomRefsOnPage(opts: {
 
   const refs = opts.refs.filter(
     (entry) =>
-      /^ax\d+$/.test(entry.ref) &&
+      /^(?:e|ax)\d+$/.test(entry.ref) &&
       Number.isFinite(entry.backendDOMNodeId) &&
       Math.floor(entry.backendDOMNodeId) > 0,
   );
@@ -71,7 +84,9 @@ export async function markBackendDomRefsOnPage(opts: {
         ) => Promise<unknown>
       )(method, params);
 
-    await send("DOM.enable").catch(() => {});
+    // Backend-id pushes require a bound document in this fresh session.
+    // getDocument also enables DOM; depth zero avoids fetching the subtree.
+    await send("DOM.getDocument", { depth: 0 }).catch(() => {});
 
     const backendNodeIds = uniqueValues(refs.map((entry) => Math.floor(entry.backendDOMNodeId)));
     const pushed = (await send("DOM.pushNodesByBackendIdsToFrontend", {

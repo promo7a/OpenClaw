@@ -1,3 +1,4 @@
+/** Private command reply routing for sensitive owner-only command output. */
 import { resolveExpiresAtMsFromDurationMs } from "@openclaw/normalization-core/number-coercion";
 import {
   normalizeLowercaseStringOrEmpty,
@@ -14,6 +15,7 @@ import type { ReplyPayload } from "../types.js";
 import type { HandleCommandsParams } from "./commands-types.js";
 import { routeReply } from "./route-reply.js";
 
+/** Resolved private delivery target for command replies and approvals. */
 export type PrivateCommandRouteTarget = {
   channel: string;
   to: string;
@@ -24,13 +26,37 @@ export type PrivateCommandRouteTarget = {
 const PRIVATE_COMMAND_APPROVAL_ROUTE_TTL_MS = 5 * 60_000;
 const EXPIRED_PRIVATE_COMMAND_APPROVAL_ROUTE_EXPIRES_AT_MS = 0;
 
-export function resolvePrivateCommandApprovalRouteExpiresAtMs(nowMs = Date.now()): number {
-  return (
-    resolveExpiresAtMsFromDurationMs(PRIVATE_COMMAND_APPROVAL_ROUTE_TTL_MS, { nowMs }) ??
-    EXPIRED_PRIVATE_COMMAND_APPROVAL_ROUTE_EXPIRES_AT_MS
-  );
+export function buildPrivateCommandApprovalRequest(params: {
+  commandParams: HandleCommandsParams;
+  id: string;
+  command: string;
+  commandArgv?: string[];
+  agentId: string | undefined;
+  createdAtMs: number;
+}): ExecApprovalRequest {
+  const { commandParams } = params;
+  return {
+    approvalKind: "exec",
+    id: params.id,
+    request: {
+      command: params.command,
+      ...(params.commandArgv === undefined ? {} : { commandArgv: params.commandArgv }),
+      agentId: params.agentId,
+      ...(commandParams.sessionKey ? { sessionKey: commandParams.sessionKey } : {}),
+      turnSourceChannel: commandParams.command.channel,
+      turnSourceTo: readCommandDeliveryTarget(commandParams) ?? null,
+      turnSourceAccountId: commandParams.ctx.AccountId ?? null,
+      turnSourceThreadId: readCommandMessageThreadId(commandParams) ?? null,
+    },
+    createdAtMs: params.createdAtMs,
+    expiresAtMs:
+      resolveExpiresAtMsFromDurationMs(PRIVATE_COMMAND_APPROVAL_ROUTE_TTL_MS, {
+        nowMs: params.createdAtMs,
+      }) ?? EXPIRED_PRIVATE_COMMAND_APPROVAL_ROUTE_EXPIRES_AT_MS,
+  };
 }
 
+/** Finds private owner DM routes that can receive sensitive command replies. */
 export async function resolvePrivateCommandRouteTargets(params: {
   commandParams: HandleCommandsParams;
   request: ExecApprovalRequest;
@@ -80,44 +106,89 @@ export async function resolvePrivateCommandRouteTargets(params: {
   });
 }
 
+/** Tries private targets in priority order until delivery stops or owns further recovery. */
 export async function deliverPrivateCommandReply(params: {
   commandParams: HandleCommandsParams;
   targets: PrivateCommandRouteTarget[];
   reply: ReplyPayload;
-}): Promise<boolean> {
-  const results = await Promise.allSettled(
-    params.targets.map((target) =>
-      routeReply({
-        payload: params.reply,
-        channel: target.channel as OriginatingChannelType,
-        to: target.to,
-        accountId: target.accountId ?? undefined,
-        threadId: target.threadId ?? undefined,
-        cfg: params.commandParams.cfg,
-        sessionKey: params.commandParams.sessionKey,
-        policyConversationType: "direct",
-        mirror: false,
-        isGroup: false,
-        replyKind: "final",
-      }),
-    ),
-  );
-  return results.some((result) => result.status === "fulfilled" && result.value.ok);
+}): Promise<"delivered" | "pending" | "suppressed" | "failed"> {
+  for (const target of params.targets) {
+    const result = await routeReply({
+      payload: params.reply,
+      channel: target.channel as OriginatingChannelType,
+      to: target.to,
+      accountId: target.accountId ?? undefined,
+      threadId: target.threadId ?? undefined,
+      cfg: params.commandParams.cfg,
+      agentId: params.commandParams.agentId,
+      sessionKey: params.commandParams.sessionKey,
+      policyConversationType: "direct",
+      mirror: false,
+      isGroup: false,
+      replyKind: "final",
+    }).catch(() => undefined);
+    // Transport failures resolve with custody; rejection is a pre-send preparation failure.
+    if (!result) {
+      continue;
+    }
+    if (result.queueCustody === "held" || result.ambiguous) {
+      return "pending";
+    }
+    if (result.delivered) {
+      return "delivered";
+    }
+    if (result.suppressed) {
+      return "suppressed";
+    }
+  }
+  return "failed";
 }
 
-export function readCommandMessageThreadId(params: HandleCommandsParams): string | undefined {
+/** Reads the command message thread id from command context. */
+function readCommandMessageThreadId(params: HandleCommandsParams): string | undefined {
   return typeof params.ctx.MessageThreadId === "string" ||
     typeof params.ctx.MessageThreadId === "number"
     ? String(params.ctx.MessageThreadId)
     : undefined;
 }
 
-export function readCommandDeliveryTarget(params: HandleCommandsParams): string | undefined {
+/** Reads the best delivery target for command route resolution. */
+function readCommandDeliveryTarget(params: HandleCommandsParams): string | undefined {
   return (
     normalizeOptionalString(params.ctx.OriginatingTo) ??
     normalizeOptionalString(params.command.to) ??
     normalizeOptionalString(params.command.from)
   );
+}
+
+/**
+ * Resolves where an exec approval prompt for a command should be delivered:
+ * the private owner-DM target when one was resolved, else the originating
+ * command surface. Keeps the fallback ternaries in one place so private and
+ * origin routing cannot drift between command handlers.
+ */
+export function resolveCommandExecApprovalRoute(params: {
+  commandParams: HandleCommandsParams;
+  privateApprovalTarget?: PrivateCommandRouteTarget;
+}): {
+  messageProvider: string;
+  currentChannelId: string | undefined;
+  currentThreadTs: string | undefined;
+  accountId: string | undefined;
+} {
+  const target = params.privateApprovalTarget;
+  return {
+    messageProvider: target?.channel ?? params.commandParams.command.channel,
+    currentChannelId: target?.to ?? readCommandDeliveryTarget(params.commandParams),
+    currentThreadTs: target
+      ? target.threadId == null
+        ? undefined
+        : String(target.threadId)
+      : readCommandMessageThreadId(params.commandParams),
+    accountId: target
+      ? (target.accountId ?? undefined)
+      : (params.commandParams.ctx.AccountId ?? undefined),
+  };
 }
 
 function listPrivateCommandRouteCandidateChannels(originChannel: string) {
@@ -163,8 +234,11 @@ function buildPrivateCommandRouteOwnerKeys(target: PrivateCommandRouteTarget): S
   }
   if (channel && to) {
     keys.add(`${channel}:${to}`);
-    if (channel === "telegram") {
-      keys.add(`tg:${to}`);
+    for (const prefix of getLoadedChannelPlugin(channel)?.messaging?.targetPrefixes ?? []) {
+      const normalizedPrefix = normalizeLowercaseStringOrEmpty(prefix);
+      if (normalizedPrefix) {
+        keys.add(`${normalizedPrefix}:${to}`);
+      }
     }
   }
   return keys;

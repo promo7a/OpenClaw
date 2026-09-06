@@ -1,3 +1,5 @@
+// Deepgram runner tests cover provider options, headers, baseUrl overrides, and
+// request transport merging.
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.js";
 import { buildProviderRegistry, runCapability } from "./runner.js";
@@ -76,34 +78,34 @@ describe("runCapability deepgram provider options", () => {
                   punctuate: true,
                 },
               },
-              deepgram: { smartFormat: true },
-              models: [
-                {
-                  provider: "deepgram",
-                  model: "nova-3",
-                  baseUrl: "https://entry.example",
+            },
+            models: [
+              {
+                provider: "deepgram",
+                model: "nova-3",
+                capabilities: ["audio"],
+                baseUrl: "https://entry.example",
+                headers: {
+                  "X-Entry": "3",
+                  "X-Entry-Managed": "secretref-managed",
+                },
+                request: {
                   headers: {
-                    "X-Entry": "3",
-                    "X-Entry-Managed": "secretref-managed",
+                    "X-Entry-Request": "entry",
                   },
-                  request: {
-                    headers: {
-                      "X-Entry-Request": "entry",
-                    },
-                    tls: {
-                      serverName: "deepgram.internal",
-                    },
-                  },
-                  providerOptions: {
-                    deepgram: {
-                      detectLanguage: false,
-                      punctuate: false,
-                      smart_format: true,
-                    },
+                  tls: {
+                    serverName: "deepgram.internal",
                   },
                 },
-              ],
-            },
+                providerOptions: {
+                  deepgram: {
+                    detectLanguage: false,
+                    punctuate: false,
+                    smart_format: true,
+                  },
+                },
+              },
+            ],
           },
         },
       } as unknown as OpenClawConfig;

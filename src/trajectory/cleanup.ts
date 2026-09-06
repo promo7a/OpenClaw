@@ -1,15 +1,21 @@
+// Trajectory cleanup helpers remove old trajectory files by retention policy.
 import fs from "node:fs";
 import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import { resolveSessionFilePath } from "../config/sessions/paths.js";
+import { parseSqliteSessionFileMarker } from "../config/sessions/legacy-sqlite-marker.js";
+import { resolveSessionFilePathCore } from "../config/sessions/paths.js";
+import { resolveRealpathOrAbsolute as canonicalizePathForComparison } from "../infra/boundary-path.js";
+import { readFileWindowFullySync } from "../infra/file-read.js";
 import { isPathInside } from "../infra/path-guards.js";
+import { readRegularFileSync } from "../infra/regular-file.js";
 import {
+  TRAJECTORY_POINTER_FILE_MAX_BYTES,
   resolveTrajectoryFilePath,
   resolveTrajectoryPointerFilePath,
   safeTrajectorySessionFileName,
 } from "./paths.js";
 
-export type RemovedTrajectoryArtifact = {
+type RemovedTrajectoryArtifact = {
   kind: "pointer" | "runtime";
   path: string;
 };
@@ -17,15 +23,6 @@ export type RemovedTrajectoryArtifact = {
 type TrajectoryPointer = {
   runtimeFile: string;
 };
-
-function canonicalizePathForComparison(filePath: string): string {
-  const resolved = path.resolve(filePath);
-  try {
-    return fs.realpathSync(resolved);
-  } catch {
-    return resolved;
-  }
-}
 
 function isPathWithinDir(parentDir: string, filePath: string): boolean {
   const resolvedParent = canonicalizePathForComparison(parentDir);
@@ -49,11 +46,12 @@ function readTrajectoryPointerFile(
   pointerPath: string,
   sessionId: string,
 ): TrajectoryPointer | null {
-  if (!isRegularNonSymlinkFile(pointerPath)) {
-    return null;
-  }
   try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(pointerPath, "utf8"));
+    const { buffer } = readRegularFileSync({
+      filePath: pointerPath,
+      maxBytes: TRAJECTORY_POINTER_FILE_MAX_BYTES,
+    });
+    const parsed: unknown = JSON.parse(buffer.toString("utf8"));
     if (!isRecord(parsed)) {
       return null;
     }
@@ -77,7 +75,7 @@ function readFirstNonEmptyLine(filePath: string): string | null {
   try {
     fd = fs.openSync(filePath, "r");
     const buffer = Buffer.alloc(64 * 1024);
-    const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    const bytesRead = readFileWindowFullySync(fd, buffer, 0);
     if (bytesRead <= 0) {
       return null;
     }
@@ -140,7 +138,7 @@ function resolveRemovedSessionFile(params: {
   storePath: string;
 }): string | null {
   try {
-    return resolveSessionFilePath(
+    return resolveSessionFilePathCore(
       params.sessionId,
       params.sessionFile ? { sessionFile: params.sessionFile } : undefined,
       { sessionsDir: path.dirname(params.storePath) },
@@ -185,8 +183,16 @@ export async function removeSessionTrajectoryArtifacts(params: {
   const storeDir = path.dirname(path.resolve(params.storePath));
   const restrictToStoreDir = params.restrictToStoreDir === true;
   const removed: RemovedTrajectoryArtifact[] = [];
-  const pointerPath = resolveTrajectoryPointerFilePath(sessionFile);
-  const pointer = readTrajectoryPointerFile(pointerPath, params.sessionId);
+  const sqliteMarker = parseSqliteSessionFileMarker(sessionFile);
+  if (
+    sqliteMarker &&
+    (sqliteMarker.sessionId !== params.sessionId ||
+      path.resolve(sqliteMarker.storePath) !== path.resolve(params.storePath))
+  ) {
+    return [];
+  }
+  const pointerPath = sqliteMarker ? undefined : resolveTrajectoryPointerFilePath(sessionFile);
+  const pointer = pointerPath ? readTrajectoryPointerFile(pointerPath, params.sessionId) : null;
   const defaultRuntimePath = resolveTrajectoryFilePath({
     env: {},
     sessionFile,
@@ -215,7 +221,7 @@ export async function removeSessionTrajectoryArtifacts(params: {
     }
   }
 
-  if (!restrictToStoreDir || isPathWithinDir(storeDir, pointerPath)) {
+  if (pointerPath && (!restrictToStoreDir || isPathWithinDir(storeDir, pointerPath))) {
     const deletedPointer = await removeRegularFile(pointerPath, "pointer");
     if (deletedPointer) {
       removed.push(deletedPointer);

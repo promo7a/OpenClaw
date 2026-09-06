@@ -1,9 +1,15 @@
 import type { AddressInfo } from "node:net";
 import net from "node:net";
+import { rawDataToString } from "@openclaw/gateway-client/websocket-data";
 import { afterEach, describe, expect, it } from "vitest";
-import { WebSocketServer, type RawData, type WebSocket } from "ws";
+import { WebSocketServer, type WebSocket } from "ws";
 import { installGatewayTestHooks, startServer } from "../../../src/gateway/test-helpers.js";
-import { emitAgentEvent, registerAgentRunContext } from "../../../src/infra/agent-events.js";
+import { emitAgentEvent } from "../../../src/infra/agent-events.js";
+import {
+  clearAgentRunContext,
+  registerAgentRunContext,
+} from "../../../src/infra/agent-run-registry.js";
+import { withTimeout } from "../../../src/utils/with-timeout.js";
 import { GatewayClientTransport, OpenClaw } from "./index.js";
 
 type JsonObject = Record<string, unknown>;
@@ -29,19 +35,6 @@ function sendJson(socket: WebSocket, payload: JsonObject): void {
   socket.send(JSON.stringify(payload));
 }
 
-function readRawMessage(raw: RawData): string {
-  if (typeof raw === "string") {
-    return raw;
-  }
-  if (Buffer.isBuffer(raw)) {
-    return raw.toString("utf8");
-  }
-  if (raw instanceof ArrayBuffer) {
-    return Buffer.from(raw).toString("utf8");
-  }
-  return Buffer.concat(raw).toString("utf8");
-}
-
 async function reservePort(): Promise<number> {
   const server = net.createServer();
   await new Promise<void>((resolve) => {
@@ -54,22 +47,6 @@ async function reservePort(): Promise<number> {
   return port;
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
-  }
-}
-
 async function createFakeGateway(port = 0): Promise<FakeGateway> {
   const server = new WebSocketServer({ host: "127.0.0.1", port });
   servers.push(server);
@@ -78,20 +55,17 @@ async function createFakeGateway(port = 0): Promise<FakeGateway> {
   });
   let seq = 1;
   const requests: FakeGatewayRequest[] = [];
-  const sockets = new Set<WebSocket>();
-
   server.on("connection", (socket) => {
-    sockets.add(socket);
-    socket.once("close", () => sockets.delete(socket));
+    socket.binaryType = "nodebuffer";
     sendJson(socket, {
       type: "event",
       event: "connect.challenge",
       seq: seq++,
-      payload: { nonce: "sdk-e2e-nonce" },
+      payload: { nonce: "sdk-e2e-nonce", ts: Date.now() },
     });
 
     socket.on("message", (raw) => {
-      const frame = JSON.parse(readRawMessage(raw)) as FakeGatewayRequest;
+      const frame = JSON.parse(rawDataToString(raw)) as FakeGatewayRequest;
       requests.push(frame);
       const reply = (payload: JsonObject): void => {
         sendJson(socket, { type: "res", id: frame.id, ok: true, payload });
@@ -331,6 +305,7 @@ async function createFakeGateway(port = 0): Promise<FakeGateway> {
       }
 
       if (frame.method === "exec.approval.resolve") {
+        expect(frame.params).toMatchObject({ id: "approval-1", decision: "allow-once" });
         reply({ ok: true, params: frame.params as JsonObject | undefined });
         return;
       }
@@ -353,10 +328,9 @@ async function createFakeGateway(port = 0): Promise<FakeGateway> {
       if (index >= 0) {
         servers.splice(index, 1);
       }
-      for (const socket of sockets) {
+      for (const socket of server.clients) {
         socket.terminate();
       }
-      sockets.clear();
       return new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
       });
@@ -408,7 +382,7 @@ describe("OpenClaw SDK websocket e2e", () => {
       })();
 
       const [seen, result] = await Promise.all([
-        withTimeout(seenPromise, 2_000, "timed out waiting for SDK run events"),
+        withTimeout(seenPromise, 2_000, { message: "timed out waiting for SDK run events" }),
         run.wait({ timeoutMs: 2_000 }),
       ]);
 
@@ -444,14 +418,23 @@ describe("OpenClaw SDK websocket e2e", () => {
       const identity = expectJsonObject(await agent.identity({ sessionKey: "sdk-session" }));
       expect(identity.agentId).toBe("main");
       expect(identity.sessionKey).toBe("sdk-session");
-      const createAgent = expectJsonObject(await oc.agents.create({ id: "sdk-agent" }));
+      const createAgent = expectJsonObject(
+        await oc.agents.create({ name: "SDK Agent", workspace: "/tmp/sdk-agent" }),
+      );
       expect(createAgent.method).toBe("agents.create");
+      expect(createAgent.params).toEqual({ name: "SDK Agent", workspace: "/tmp/sdk-agent" });
       const updateAgent = expectJsonObject(
-        await oc.agents.update({ id: "sdk-agent", label: "SDK Agent" }),
+        await oc.agents.update({ agentId: "sdk-agent", name: "Renamed SDK Agent" }),
       );
       expect(updateAgent.method).toBe("agents.update");
-      const deleteAgent = expectJsonObject(await oc.agents.delete({ id: "sdk-agent" }));
+      expect(updateAgent.params).toEqual({ agentId: "sdk-agent", name: "Renamed SDK Agent" });
+      const clearAgentModel = expectJsonObject(
+        await oc.agents.update({ agentId: "sdk-agent", model: null }),
+      );
+      expect(clearAgentModel.params).toEqual({ agentId: "sdk-agent", model: null });
+      const deleteAgent = expectJsonObject(await oc.agents.delete({ agentId: "sdk-agent" }));
       expect(deleteAgent.method).toBe("agents.delete");
+      expect(deleteAgent.params).toEqual({ agentId: "sdk-agent" });
 
       const sessions = expectJsonObject(await oc.sessions.list());
       expect(sessions.sessions).toEqual([{ key: "sdk-session" }]);
@@ -507,7 +490,7 @@ describe("OpenClaw SDK websocket e2e", () => {
       const approvals = expectJsonObject(await oc.approvals.list());
       expect(approvals.approvals).toEqual([]);
       const approvalResult = expectJsonObject(
-        await oc.approvals.respond("approval-1", { decision: "approve" }),
+        await oc.approvals.respond("approval-1", { decision: "allow-once" }),
       );
       expect(approvalResult.ok).toBe(true);
 
@@ -516,6 +499,7 @@ describe("OpenClaw SDK websocket e2e", () => {
         "agents.list",
         "agent.identity.get",
         "agents.create",
+        "agents.update",
         "agents.update",
         "agents.delete",
         "sessions.list",
@@ -536,6 +520,14 @@ describe("OpenClaw SDK websocket e2e", () => {
         "exec.approval.list",
         "exec.approval.resolve",
       ]);
+      const requestParams = new Map(
+        gateway.requests.map((request) => [request.method, request.params]),
+      );
+      expect(requestParams.get("agents.list")).toEqual({});
+      expect(requestParams.get("sessions.list")).toEqual({});
+      expect(requestParams.get("models.list")).toEqual({});
+      expect(requestParams.get("tools.catalog")).toEqual({});
+      expect(requestParams.get("exec.approval.list")).toEqual({});
     } finally {
       await oc.close();
       await gateway.close();
@@ -570,7 +562,7 @@ describe("OpenClaw SDK websocket e2e", () => {
 describe("OpenClaw SDK real Gateway e2e", () => {
   installGatewayTestHooks({ scope: "test" });
 
-  it("streams real Gateway agent events", async () => {
+  it("streams real Gateway agent events and preserves late replay order", async () => {
     const token = "sdk-real-gateway-token";
     const started = await startServer(token, { controlUiEnabled: false });
     const transport = new GatewayClientTransport({
@@ -581,6 +573,7 @@ describe("OpenClaw SDK real Gateway e2e", () => {
     });
     const oc = new OpenClaw({ transport });
     const runId = "sdk-real-gateway-run";
+    const replayRunId = "sdk-real-gateway-replay";
 
     try {
       await oc.connect();
@@ -620,18 +613,68 @@ describe("OpenClaw SDK real Gateway e2e", () => {
         data: { phase: "end", endedAt: 222 },
       });
 
-      const { seen, sessionKeys } = await withTimeout(
-        eventsPromise,
-        2_000,
-        "timed out waiting for real Gateway SDK events",
-      );
+      const { seen, sessionKeys } = await withTimeout(eventsPromise, 2_000, {
+        message: "timed out waiting for real Gateway SDK events",
+      });
       expect(seen).toEqual(["run.started", "assistant.delta", "run.completed"]);
       expect(sessionKeys).toEqual([
         "agent:main:dashboard:sdk-real-gateway",
         "agent:main:dashboard:sdk-real-gateway",
         "agent:main:dashboard:sdk-real-gateway",
       ]);
+
+      registerAgentRunContext(replayRunId, {
+        sessionKey: "agent:main:dashboard:sdk-real-gateway",
+        verboseLevel: "off",
+      });
+      const observedReplay = (async () => {
+        for await (const event of oc.events((eventLocal) => eventLocal.runId === replayRunId)) {
+          if (expectJsonObject(event.raw?.payload).seq === 600) {
+            return;
+          }
+        }
+        throw new Error("Gateway stream ended before the replay tail arrived");
+      })();
+      emitAgentEvent({
+        runId: replayRunId,
+        stream: "lifecycle",
+        data: { phase: "start", startedAt: 333 },
+      });
+      for (let seq = 2; seq <= 600; seq += 1) {
+        emitAgentEvent({
+          runId: replayRunId,
+          stream: "plan",
+          data: { phase: "update", steps: [], explanation: `step ${seq}` },
+        });
+      }
+      await withTimeout(observedReplay, 2_000, {
+        message: "timed out waiting for real Gateway replay setup",
+      });
+
+      const replayRun = await oc.runs.get(replayRunId);
+      const replayed = (async () => {
+        const sequences: unknown[] = [];
+        for await (const event of replayRun.events()) {
+          sequences.push(expectJsonObject(event.raw?.payload).seq);
+          if (sequences.length === 1) {
+            emitAgentEvent({
+              runId: replayRunId,
+              stream: "lifecycle",
+              data: { phase: "end", endedAt: 444 },
+            });
+          }
+          if (event.type === "run.completed") {
+            return sequences;
+          }
+        }
+        throw new Error("Gateway stream ended before the live completion arrived");
+      })();
+      await expect(
+        withTimeout(replayed, 2_000, { message: "timed out draining real Gateway SDK replay" }),
+      ).resolves.toEqual(Array.from({ length: 501 }, (_, index) => index + 101));
     } finally {
+      clearAgentRunContext(runId);
+      clearAgentRunContext(replayRunId);
       await oc.close();
       await started.server.close();
       started.envSnapshot.restore();
@@ -706,11 +749,9 @@ liveGatewayDescribe("OpenClaw SDK live Gateway e2e", () => {
       })();
 
       const result = await run.wait({ timeoutMs: 180_000 });
-      const events = await withTimeout(
-        eventsPromise,
-        5_000,
-        "timed out waiting for live SDK run events",
-      );
+      const events = await withTimeout(eventsPromise, 5_000, {
+        message: "timed out waiting for live SDK run events",
+      });
 
       expect(result.status).toBe("completed");
       expect(events.terminal).toBe("run.completed");

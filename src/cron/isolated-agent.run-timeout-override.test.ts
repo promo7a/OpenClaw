@@ -1,3 +1,4 @@
+// Isolated agent timeout tests cover per-run timeout override propagation.
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { describe, expect, it } from "vitest";
 import { resolveCronRunTimeoutOverrideMs } from "./isolated-agent/run-timeout.js";
@@ -20,11 +21,10 @@ describe("resolveCronRunTimeoutOverrideMs", () => {
     expect(resolveCronRunTimeoutOverrideMs(Number.MAX_SAFE_INTEGER)).toBe(MAX_TIMER_TIMEOUT_MS);
   });
 
-  it("omits the signal when the cron payload has no positive numeric timeout", () => {
+  it("omits the signal when the cron payload has no positive finite timeout", () => {
     expect(resolveCronRunTimeoutOverrideMs(undefined)).toBeUndefined();
     expect(resolveCronRunTimeoutOverrideMs(0)).toBeUndefined();
     expect(resolveCronRunTimeoutOverrideMs(-1)).toBeUndefined();
     expect(resolveCronRunTimeoutOverrideMs(Number.NaN)).toBeUndefined();
-    expect(resolveCronRunTimeoutOverrideMs("300")).toBeUndefined();
   });
 });

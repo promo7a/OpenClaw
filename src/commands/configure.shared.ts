@@ -1,13 +1,14 @@
+// Shared prompt wrappers and section metadata for the configure wizard.
 import {
   confirm as clackConfirm,
   intro as clackIntro,
   outro as clackOutro,
+  password as clackPassword,
   select as clackSelect,
   text as clackText,
 } from "@clack/prompts";
-import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
+import { styleSelectParams } from "../../packages/terminal-core/src/prompt-select-styled-params.js";
 import {
-  stylePromptHint,
   stylePromptMessage,
   stylePromptTitle,
 } from "../../packages/terminal-core/src/prompt-style.js";
@@ -26,11 +27,12 @@ export const CONFIGURE_WIZARD_SECTIONS = [
 
 export type WizardSection = (typeof CONFIGURE_WIZARD_SECTIONS)[number];
 
+/** Parse repeated `--section` values into known configure wizard sections and invalid entries. */
 export function parseConfigureWizardSections(raw: unknown): {
   sections: WizardSection[];
   invalid: string[];
 } {
-  const sectionsRaw: string[] = Array.isArray(raw) ? normalizeStringEntries(raw) : [];
+  const sectionsRaw = Array.isArray(raw) ? raw.map((section) => String(section).trim()) : [];
   if (sectionsRaw.length === 0) {
     return { sections: [], invalid: [] };
   }
@@ -77,23 +79,28 @@ export const CONFIGURE_SECTION_OPTIONS: Array<{
   },
 ];
 
+/** Styled configure wizard intro wrapper. */
 export const intro = (message: string) => clackIntro(stylePromptTitle(message) ?? message);
+/** Styled configure wizard outro wrapper. */
 export const outro = (message: string) => clackOutro(stylePromptTitle(message) ?? message);
+/** Styled text prompt wrapper. */
 export const text = (params: Parameters<typeof clackText>[0]) =>
   clackText({
     ...params,
     message: stylePromptMessage(params.message),
   });
+/** Styled password prompt wrapper. Echoes bullets so secrets never appear in cleartext. */
+export const password = (params: Parameters<typeof clackPassword>[0]) =>
+  clackPassword({
+    ...params,
+    message: stylePromptMessage(params.message),
+  });
+/** Styled confirm prompt wrapper. */
 export const confirm = (params: Parameters<typeof clackConfirm>[0]) =>
   clackConfirm({
     ...params,
     message: stylePromptMessage(params.message),
   });
+/** Styled select prompt wrapper that also normalizes option hints. */
 export const select = <T>(params: Parameters<typeof clackSelect<T>>[0]) =>
-  clackSelect({
-    ...params,
-    message: stylePromptMessage(params.message),
-    options: params.options.map((opt) =>
-      opt.hint === undefined ? opt : { ...opt, hint: stylePromptHint(opt.hint) },
-    ),
-  });
+  clackSelect(styleSelectParams(params));

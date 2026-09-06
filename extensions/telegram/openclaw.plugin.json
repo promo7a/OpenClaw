@@ -1,12 +1,15 @@
 {
   "id": "telegram",
+  "name": "Telegram",
+  "description": "OpenClaw Telegram channel plugin.",
+  "doctorContract": {
+    "configRepair": true,
+    "stateMigrations": [{ "id": "telegram-legacy-state" }]
+  },
   "activation": {
     "onStartup": false
   },
   "channels": ["telegram"],
-  "channelEnvVars": {
-    "telegram": ["TELEGRAM_BOT_TOKEN"]
-  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

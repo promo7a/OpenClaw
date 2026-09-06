@@ -1,3 +1,4 @@
+// Diffs plugin module implements language hints behavior.
 import { resolveLanguage } from "@pierre/diffs";
 import type { FileContents, FileDiffMetadata, SupportedLanguages } from "@pierre/diffs";
 import {
@@ -7,12 +8,11 @@ import {
 } from "./shiki-curated-languages.js";
 import type { DiffViewerPayload } from "./types.js";
 
-export const BASE_DIFF_VIEWER_LANGUAGE_HINTS = [
+const BASE_DIFF_VIEWER_LANGUAGE_HINTS = [
   ...Object.keys(bundledLanguagesBase),
   "text",
   "ansi",
 ] as const satisfies readonly SupportedLanguages[];
-export type DiffViewerBaseLanguage = (typeof BASE_DIFF_VIEWER_LANGUAGE_HINTS)[number];
 
 const BASE_LANGUAGE_HINTS = new Set<SupportedLanguages>(BASE_DIFF_VIEWER_LANGUAGE_HINTS);
 const BASE_LANGUAGE_ALIASES = new Map<string, SupportedLanguages>(
@@ -22,19 +22,20 @@ const BASE_LANGUAGE_ALIASES = new Map<string, SupportedLanguages>(
 );
 type DiffPayloadFile = FileContents | FileDiffMetadata;
 
-function normalizeOptionalString(value: unknown): string | undefined {
+// The curated viewer bundles this module outside Plugin SDK package resolution.
+function normalizeLanguageHint(value: unknown): string | undefined {
   if (typeof value !== "string") {
     return undefined;
   }
-  const trimmed = value.trim();
-  return trimmed ? trimmed : undefined;
+  const normalized = value.trim().toLowerCase();
+  return normalized || undefined;
 }
 
 export async function normalizeSupportedLanguageHint(
   value?: string,
   options: { languagePackAvailable?: boolean } = {},
 ): Promise<SupportedLanguages | undefined> {
-  const normalized = normalizeOptionalString(value);
+  const normalized = normalizeLanguageHint(value);
   if (!normalized) {
     return undefined;
   }
@@ -54,13 +55,6 @@ export async function normalizeSupportedLanguageHint(
   } catch {
     return undefined;
   }
-}
-
-export async function filterSupportedLanguageHints(
-  values: Iterable<string>,
-  options: { languagePackAvailable?: boolean } = {},
-): Promise<SupportedLanguages[]> {
-  return normalizeSupportedLanguageHints(values, { fallbackToText: true, ...options });
 }
 
 async function normalizeSupportedLanguageHints(

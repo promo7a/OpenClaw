@@ -1,13 +1,10 @@
+/**
+ * Safe file resolution helpers for Canvas-hosted static assets.
+ */
 import path from "node:path";
 import { root as fsRoot, FsSafeError } from "openclaw/plugin-sdk/security-runtime";
 
 type CanvasOpenResult = Awaited<ReturnType<Awaited<ReturnType<typeof fsRoot>>["open"]>>;
-
-export function normalizeUrlPath(rawPath: string): string {
-  const decoded = decodeURIComponent(rawPath || "/");
-  const normalized = path.posix.normalize(decoded);
-  return normalized.startsWith("/") ? normalized : `/${normalized}`;
-}
 
 function pathEscapesRoot(decodedPath: string): boolean {
   let depth = 0;
@@ -41,6 +38,7 @@ function tryNormalizeUrlPath(rawPath: string): string | null {
   return normalized.startsWith("/") ? normalized : `/${normalized}`;
 }
 
+/** Opens a Canvas-hosted file only when the request stays inside the root. */
 export async function resolveFileWithinRoot(
   rootReal: string,
   urlPath: string,

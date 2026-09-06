@@ -1,3 +1,4 @@
+// Session chat type helpers classify chat surfaces from session metadata.
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { getBootstrapChannelPlugin } from "../channels/plugins/bootstrap-registry.js";
 import {
@@ -6,15 +7,8 @@ import {
 } from "./session-chat-type-shared.js";
 import { parseAgentSessionKey } from "./session-key-utils.js";
 
-export {
-  deriveSessionChatTypeFromKey,
-  type SessionKeyChatType,
-} from "./session-chat-type-shared.js";
-
-type LegacySessionChatTypeDeriver = NonNullable<
-  NonNullable<ReturnType<typeof getBootstrapChannelPlugin>>["messaging"]
->["deriveLegacySessionChatType"];
-
+// Session chat-type derivation first uses generic key parsing, then falls back
+// to bootstrap channel plugins for legacy platform-specific session keys.
 function resolveScopedSessionKey(sessionKey: string | undefined | null): string {
   const raw = normalizeLowercaseStringOrEmpty(sessionKey);
   if (!raw) {
@@ -29,20 +23,11 @@ function collectLegacyChatTypeCandidatePluginIds(scopedSessionKey: string): stri
   if (firstToken) {
     ids.add(firstToken);
   }
+  // Historical WhatsApp group keys can be bare JIDs without a channel prefix.
   if (scopedSessionKey.includes("@g.us")) {
     ids.add("whatsapp");
   }
   return Array.from(ids);
-}
-
-function derivePluginLegacySessionChatType(
-  scopedSessionKey: string,
-  deriveLegacySessionChatType: LegacySessionChatTypeDeriver,
-): SessionKeyChatType | undefined {
-  if (!deriveLegacySessionChatType) {
-    return undefined;
-  }
-  return deriveLegacySessionChatType(scopedSessionKey);
 }
 
 export function deriveSessionChatType(sessionKey: string | undefined | null): SessionKeyChatType {
@@ -53,10 +38,9 @@ export function deriveSessionChatType(sessionKey: string | undefined | null): Se
 
   const scopedSessionKey = resolveScopedSessionKey(sessionKey);
   for (const pluginId of collectLegacyChatTypeCandidatePluginIds(scopedSessionKey)) {
-    const derived = derivePluginLegacySessionChatType(
-      scopedSessionKey,
-      getBootstrapChannelPlugin(pluginId)?.messaging?.deriveLegacySessionChatType,
-    );
+    const deriveLegacySessionChatType =
+      getBootstrapChannelPlugin(pluginId)?.messaging?.deriveLegacySessionChatType;
+    const derived = deriveLegacySessionChatType?.(scopedSessionKey);
     if (derived) {
       return derived;
     }

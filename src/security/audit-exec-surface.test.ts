@@ -1,10 +1,13 @@
+// Covers exec-surface security audit findings.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { saveExecApprovals } from "../infra/exec-approvals.js";
-import { collectExecRuntimeFindings } from "./audit.js";
+import { captureEnv } from "../test-utils/env.js";
+import { collectSecurityAuditFindings } from "./audit.test-support.js";
+import type { SecurityAuditFinding } from "./audit.types.js";
 
 function hasFinding(
   checkId:
@@ -12,17 +15,16 @@ function hasFinding(
     | "tools.exec.allowlist_interpreter_without_strict_inline_eval"
     | "security.exposure.open_channels_with_exec"
     | "tools.exec.security_full_configured"
-    | "tools.exec.fs_tools_disabled_but_exec_enabled"
-    | "agents.claude_cli.permission_mode_overridden_by_yolo",
+    | "tools.exec.fs_tools_disabled_but_exec_enabled",
   severity: "warn" | "critical",
-  findings: ReturnType<typeof collectExecRuntimeFindings>,
+  findings: SecurityAuditFinding[],
 ) {
   return findings.some((finding) => finding.checkId === checkId && finding.severity === severity);
 }
 
 function requireFinding(
   checkId: "tools.exec.fs_tools_disabled_but_exec_enabled",
-  findings: ReturnType<typeof collectExecRuntimeFindings>,
+  findings: SecurityAuditFinding[],
 ) {
   const finding = findings.find((entry) => entry.checkId === checkId);
   if (!finding) {
@@ -36,9 +38,7 @@ describe("security audit exec surface findings", () => {
   // `resolveRawHomeDir`) to a per-test tempdir so `saveExecApprovals` never
   // touches the real `~/.openclaw/exec-approvals.json` on the host running
   // the suite.
-  let previousOpenClawHome: string | undefined;
-  let previousHome: string | undefined;
-  let previousUserProfile: string | undefined;
+  let envSnapshot: ReturnType<typeof captureEnv> | undefined;
   let tempRoot = "";
   let tempCaseIndex = 0;
 
@@ -47,9 +47,7 @@ describe("security audit exec surface findings", () => {
   });
 
   beforeEach(async () => {
-    previousOpenClawHome = process.env.OPENCLAW_HOME;
-    previousHome = process.env.HOME;
-    previousUserProfile = process.env.USERPROFILE;
+    envSnapshot = captureEnv(["OPENCLAW_HOME", "HOME", "USERPROFILE"]);
     const tempDir = path.join(tempRoot, `case-${++tempCaseIndex}`);
     await fs.mkdir(path.join(tempDir, ".openclaw"), { recursive: true });
     // OPENCLAW_HOME takes precedence over HOME/USERPROFILE in resolveRawHomeDir,
@@ -63,21 +61,8 @@ describe("security audit exec surface findings", () => {
 
   afterEach(() => {
     saveExecApprovals({ version: 1, agents: {} });
-    if (previousOpenClawHome === undefined) {
-      delete process.env.OPENCLAW_HOME;
-    } else {
-      process.env.OPENCLAW_HOME = previousOpenClawHome;
-    }
-    if (previousHome === undefined) {
-      delete process.env.HOME;
-    } else {
-      process.env.HOME = previousHome;
-    }
-    if (previousUserProfile === undefined) {
-      delete process.env.USERPROFILE;
-    } else {
-      process.env.USERPROFILE = previousUserProfile;
-    }
+    envSnapshot?.restore();
+    envSnapshot = undefined;
   });
 
   afterAll(async () => {
@@ -86,7 +71,7 @@ describe("security audit exec surface findings", () => {
     }
   });
 
-  it("warns when exec approvals enable autoAllowSkills", () => {
+  it("warns when exec approvals enable autoAllowSkills", async () => {
     saveExecApprovals({
       version: 1,
       defaults: {
@@ -96,143 +81,15 @@ describe("security audit exec surface findings", () => {
     });
 
     expect(
-      hasFinding("tools.exec.auto_allow_skills_enabled", "warn", collectExecRuntimeFindings({})),
+      hasFinding(
+        "tools.exec.auto_allow_skills_enabled",
+        "warn",
+        await collectSecurityAuditFindings({}),
+      ),
     ).toBe(true);
   });
 
-  it("warns when YOLO exec overrides restrictive Claude permission mode", () => {
-    const findings = collectExecRuntimeFindings({
-      agents: {
-        defaults: {
-          cliBackends: {
-            "claude-cli": {
-              command: "claude",
-              args: ["-p", "--permission-mode", "default"],
-              resumeArgs: ["-p", "--permission-mode=acceptEdits", "--resume", "{sessionId}"],
-            },
-          },
-        },
-      },
-    } satisfies OpenClawConfig);
-
-    const finding = findings.find(
-      (entry) => entry.checkId === "agents.claude_cli.permission_mode_overridden_by_yolo",
-    );
-    expect(finding).toEqual(
-      expect.objectContaining({
-        severity: "warn",
-        detail: expect.stringContaining("args=default"),
-        remediation: expect.stringContaining("tools.exec.security"),
-      }),
-    );
-    expect(finding?.detail).toContain("resumeArgs=acceptEdits");
-    expect(finding?.detail).toContain("OpenClaw exec is YOLO");
-  });
-
-  it("warns for normalized Claude backend keys", () => {
-    const findings = collectExecRuntimeFindings({
-      agents: {
-        defaults: {
-          cliBackends: {
-            "Anthropic-CLI": {
-              command: "claude",
-              args: ["-p", "--permission-mode", "default"],
-            },
-          },
-        },
-      },
-    } satisfies OpenClawConfig);
-
-    expect(
-      hasFinding("agents.claude_cli.permission_mode_overridden_by_yolo", "warn", findings),
-    ).toBe(true);
-  });
-
-  it("prefers exact Claude backend config over duplicate normalized aliases", () => {
-    const findings = collectExecRuntimeFindings({
-      agents: {
-        defaults: {
-          cliBackends: {
-            "Anthropic-CLI": {
-              command: "claude",
-              args: ["-p", "--permission-mode", "default"],
-            },
-            "claude-cli": {
-              command: "claude",
-              args: ["-p"],
-            },
-          },
-        },
-      },
-    } satisfies OpenClawConfig);
-
-    expect(
-      hasFinding("agents.claude_cli.permission_mode_overridden_by_yolo", "warn", findings),
-    ).toBe(false);
-  });
-
-  it("does not warn for restrictive Claude permission mode when OpenClaw exec is restrictive", () => {
-    const findings = collectExecRuntimeFindings({
-      tools: { exec: { security: "allowlist", ask: "on-miss" } },
-      agents: {
-        defaults: {
-          cliBackends: {
-            "claude-cli": {
-              command: "claude",
-              args: ["-p", "--permission-mode", "default"],
-            },
-          },
-        },
-      },
-    } satisfies OpenClawConfig);
-
-    expect(
-      hasFinding("agents.claude_cli.permission_mode_overridden_by_yolo", "warn", findings),
-    ).toBe(false);
-  });
-
-  it("does not warn when sandbox host defaults make exec restrictive", () => {
-    const findings = collectExecRuntimeFindings({
-      tools: { exec: { host: "sandbox" } },
-      agents: {
-        defaults: {
-          cliBackends: {
-            "claude-cli": {
-              command: "claude",
-              args: ["-p", "--permission-mode", "default"],
-            },
-          },
-        },
-      },
-    } satisfies OpenClawConfig);
-
-    expect(
-      hasFinding("agents.claude_cli.permission_mode_overridden_by_yolo", "warn", findings),
-    ).toBe(false);
-  });
-
-  it("does not warn for restrictive Claude permission mode on non-live backend configs", () => {
-    const findings = collectExecRuntimeFindings({
-      agents: {
-        defaults: {
-          cliBackends: {
-            "claude-cli": {
-              command: "claude",
-              output: "json",
-              input: "arg",
-              args: ["--permission-mode", "default"],
-            },
-          },
-        },
-      },
-    } satisfies OpenClawConfig);
-
-    expect(
-      hasFinding("agents.claude_cli.permission_mode_overridden_by_yolo", "warn", findings),
-    ).toBe(false);
-  });
-
-  it("warns when interpreter allowlists are present without strictInlineEval", () => {
+  it("warns when interpreter allowlists are present without strictInlineEval", async () => {
     saveExecApprovals({
       version: 1,
       agents: {
@@ -249,16 +106,16 @@ describe("security audit exec surface findings", () => {
       hasFinding(
         "tools.exec.allowlist_interpreter_without_strict_inline_eval",
         "warn",
-        collectExecRuntimeFindings({
+        await collectSecurityAuditFindings({
           agents: {
-            list: [{ id: "ops" }],
+            entries: { ops: {} },
           },
         } satisfies OpenClawConfig),
       ),
     ).toBe(true);
   });
 
-  it("suppresses interpreter allowlist warnings when strictInlineEval is enabled", () => {
+  it("suppresses interpreter allowlist warnings when strictInlineEval is enabled", async () => {
     saveExecApprovals({
       version: 1,
       agents: {
@@ -272,7 +129,7 @@ describe("security audit exec surface findings", () => {
       hasFinding(
         "tools.exec.allowlist_interpreter_without_strict_inline_eval",
         "warn",
-        collectExecRuntimeFindings({
+        await collectSecurityAuditFindings({
           tools: {
             exec: {
               strictInlineEval: true,
@@ -283,8 +140,68 @@ describe("security audit exec surface findings", () => {
     ).toBe(false);
   });
 
-  it("flags open channel access combined with exec-enabled scopes", () => {
-    const findings = collectExecRuntimeFindings({
+  it("honors global strictInlineEval for a named default agent approval scope", async () => {
+    saveExecApprovals({
+      version: 1,
+      agents: {
+        ops: {
+          allowlist: [{ pattern: "/usr/bin/python3" }],
+        },
+      },
+    });
+
+    expect(
+      hasFinding(
+        "tools.exec.allowlist_interpreter_without_strict_inline_eval",
+        "warn",
+        await collectSecurityAuditFindings({
+          agents: {
+            entries: {
+              ops: { default: true },
+            },
+          },
+          tools: {
+            exec: {
+              strictInlineEval: true,
+            },
+          },
+        } satisfies OpenClawConfig),
+      ),
+    ).toBe(false);
+  });
+
+  it("honors a named default agent strictInlineEval override", async () => {
+    saveExecApprovals({
+      version: 1,
+      agents: {
+        ops: {
+          allowlist: [{ pattern: "/usr/bin/python3" }],
+        },
+      },
+    });
+
+    expect(
+      hasFinding(
+        "tools.exec.allowlist_interpreter_without_strict_inline_eval",
+        "warn",
+        await collectSecurityAuditFindings({
+          agents: {
+            entries: {
+              ops: { default: true, tools: { exec: { strictInlineEval: false } } },
+            },
+          },
+          tools: {
+            exec: {
+              strictInlineEval: true,
+            },
+          },
+        } satisfies OpenClawConfig),
+      ),
+    ).toBe(true);
+  });
+
+  it("flags open channel access combined with exec-enabled scopes", async () => {
+    const findings = await collectSecurityAuditFindings({
       channels: {
         discord: {
           groupPolicy: "open",
@@ -292,7 +209,7 @@ describe("security audit exec surface findings", () => {
       },
       tools: {
         exec: {
-          security: "allowlist",
+          mode: "allowlist",
           host: "gateway",
         },
       },
@@ -301,8 +218,8 @@ describe("security audit exec surface findings", () => {
     expect(hasFinding("security.exposure.open_channels_with_exec", "warn", findings)).toBe(true);
   });
 
-  it("escalates open channel exec exposure when full exec is configured", () => {
-    const findings = collectExecRuntimeFindings({
+  it("escalates open channel exec exposure when full exec is configured", async () => {
+    const findings = await collectSecurityAuditFindings({
       channels: {
         slack: {
           dmPolicy: "open",
@@ -310,7 +227,7 @@ describe("security audit exec surface findings", () => {
       },
       tools: {
         exec: {
-          security: "full",
+          mode: "full",
         },
       },
     } satisfies OpenClawConfig);
@@ -321,8 +238,8 @@ describe("security audit exec surface findings", () => {
     );
   });
 
-  it("warns when filesystem tools are disabled but exec remains available", () => {
-    const findings = collectExecRuntimeFindings({
+  it("warns when filesystem tools are disabled but exec remains available", async () => {
+    const findings = await collectSecurityAuditFindings({
       tools: {
         allow: ["read", "exec", "process"],
         deny: ["write", "edit", "apply_patch"],
@@ -336,8 +253,27 @@ describe("security audit exec surface findings", () => {
     expect(finding.remediation).toContain("deny exec and process");
   });
 
-  it("does not warn when sandbox filesystem policy constrains exec", () => {
-    const findings = collectExecRuntimeFindings({
+  it("reports canonical agent paths for filesystem policy drift", async () => {
+    const findings = await collectSecurityAuditFindings({
+      agents: {
+        entries: {
+          ops: {
+            default: true,
+            tools: {
+              allow: ["read", "exec", "process"],
+              deny: ["write", "edit", "apply_patch"],
+            },
+          },
+        },
+      },
+    } satisfies OpenClawConfig);
+
+    const finding = requireFinding("tools.exec.fs_tools_disabled_but_exec_enabled", findings);
+    expect(finding.detail).toContain("agents.entries.ops.tools");
+  });
+
+  it("does not warn when sandbox filesystem policy constrains exec", async () => {
+    const findings = await collectSecurityAuditFindings({
       agents: {
         defaults: {
           sandbox: {

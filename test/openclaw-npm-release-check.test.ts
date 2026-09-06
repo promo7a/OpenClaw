@@ -1,9 +1,15 @@
+// OpenClaw npm release check tests validate package release checks.
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { WORKSPACE_TEMPLATE_PACK_PATHS } from "../scripts/lib/workspace-bootstrap-smoke.mjs";
+import {
+  LOCAL_BUILD_METADATA_DIST_PATHS,
+  PACKAGE_DIST_INVENTORY_RELATIVE_PATH,
+} from "../scripts/lib/package-dist-inventory.ts";
+import { WORKSPACE_TEMPLATE_PACK_PATHS } from "../scripts/lib/workspace-bootstrap-smoke.mts";
+import { assertPreparedOpenClawAiDependency } from "../scripts/openclaw-npm-prepublish-verify.ts";
 import {
   compareReleaseVersions,
   collectControlUiPackErrors,
@@ -21,74 +27,102 @@ import {
   resolveNpmReleaseCheckCommandTimeoutMs,
   runNpmReleaseCheckCommand,
   shouldSkipPackedTarballValidation,
-  utcCalendarDayDistance,
 } from "../scripts/openclaw-npm-release-check.ts";
-import {
-  LOCAL_BUILD_METADATA_DIST_PATHS,
-  PACKAGE_DIST_INVENTORY_RELATIVE_PATH,
-} from "../src/infra/package-dist-inventory.ts";
 
 const REQUIRED_PACKED_PATHS = [
-  "npm-shrinkwrap.json",
   PACKAGE_DIST_INVENTORY_RELATIVE_PATH,
   ...WORKSPACE_TEMPLATE_PACK_PATHS,
 ] as const;
 
+describe("prepared OpenClaw AI dependency", () => {
+  it("requires the packed root to depend on the exact prepared AI version", () => {
+    expect(() =>
+      assertPreparedOpenClawAiDependency({
+        aiManifest: { name: "@openclaw/ai", version: "2026.7.2" },
+        rootManifest: {
+          name: "openclaw",
+          version: "2026.7.1",
+          dependencies: { "@openclaw/ai": "2026.7.2" },
+        },
+      }),
+    ).toThrow("Prepared root and @openclaw/ai tarballs must both be version 2026.7.2.");
+
+    expect(() =>
+      assertPreparedOpenClawAiDependency({
+        aiManifest: { name: "@openclaw/ai", version: "2026.7.2" },
+        rootManifest: {
+          name: "openclaw",
+          version: "2026.7.2",
+          dependencies: { "@openclaw/ai": "2026.7.1" },
+        },
+      }),
+    ).toThrow("Prepared root tarball must depend on exact @openclaw/ai@2026.7.2.");
+
+    expect(() =>
+      assertPreparedOpenClawAiDependency({
+        aiManifest: { name: "@openclaw/ai", version: "2026.7.2" },
+        rootManifest: {
+          name: "openclaw",
+          version: "2026.7.2",
+          dependencies: { "@openclaw/ai": "2026.7.2" },
+        },
+      }),
+    ).not.toThrow();
+  });
+});
+
 describe("workspace template package paths", () => {
-  it("keeps the runtime heartbeat template in the npm pack guard", () => {
-    expect(WORKSPACE_TEMPLATE_PACK_PATHS).toContain("src/agents/templates/HEARTBEAT.md");
+  it("does not require the retired heartbeat file in the npm pack guard", () => {
+    expect(WORKSPACE_TEMPLATE_PACK_PATHS).not.toContain("src/agents/templates/HEARTBEAT.md");
     expect(WORKSPACE_TEMPLATE_PACK_PATHS).not.toContain("docs/reference/templates/HEARTBEAT.md");
   });
 
-  it("keeps runtime heartbeat templates allowlisted in package.json", () => {
+  it("does not package retired runtime heartbeat templates", () => {
     const packageJson = JSON.parse(readFileSync("package.json", "utf-8")) as {
       files?: unknown;
     };
 
-    expect(packageJson.files).toContain("src/agents/templates/");
+    expect(packageJson.files).not.toContain("src/agents/templates/");
   });
 });
 
 describe("parseReleaseVersion", () => {
-  it("parses stable CalVer releases", () => {
+  it("parses stable monthly patch releases", () => {
     expect(parseReleaseVersion("2026.3.10")).toStrictEqual({
       version: "2026.3.10",
       baseVersion: "2026.3.10",
       channel: "stable",
       year: 2026,
       month: 3,
-      day: 10,
+      patch: 10,
       alphaNumber: undefined,
       betaNumber: undefined,
-      date: new Date(Date.UTC(2026, 2, 10)),
     });
   });
 
-  it("parses beta CalVer releases", () => {
+  it("parses beta monthly patch releases", () => {
     expect(parseReleaseVersion("2026.3.10-beta.2")).toStrictEqual({
       version: "2026.3.10-beta.2",
       baseVersion: "2026.3.10",
       channel: "beta",
       year: 2026,
       month: 3,
-      day: 10,
+      patch: 10,
       alphaNumber: undefined,
       betaNumber: 2,
-      date: new Date(Date.UTC(2026, 2, 10)),
     });
   });
 
-  it("parses alpha CalVer releases", () => {
+  it("parses alpha monthly patch releases", () => {
     expect(parseReleaseVersion("2026.3.10-alpha.2")).toStrictEqual({
       version: "2026.3.10-alpha.2",
       baseVersion: "2026.3.10",
       channel: "alpha",
       year: 2026,
       month: 3,
-      day: 10,
+      patch: 10,
       alphaNumber: 2,
       betaNumber: undefined,
-      date: new Date(Date.UTC(2026, 2, 10)),
     });
   });
 
@@ -99,19 +133,39 @@ describe("parseReleaseVersion", () => {
       channel: "stable",
       year: 2026,
       month: 3,
-      day: 10,
+      patch: 10,
       alphaNumber: undefined,
       betaNumber: undefined,
-      date: new Date(Date.UTC(2026, 2, 10)),
       correctionNumber: 1,
+    });
+  });
+
+  it("accepts patch numbers that are not calendar days", () => {
+    expect(parseReleaseVersion("2026.2.30")).toMatchObject({
+      version: "2026.2.30",
+      baseVersion: "2026.2.30",
+      channel: "stable",
+      patch: 30,
+    });
+    expect(parseReleaseVersion("2026.6.32-beta.1")).toMatchObject({
+      version: "2026.6.32-beta.1",
+      baseVersion: "2026.6.32",
+      channel: "beta",
+      patch: 32,
+      betaNumber: 1,
     });
   });
 
   it("rejects legacy and malformed release formats", () => {
     expect(parseReleaseVersion("2026.03.09")).toBeNull();
     expect(parseReleaseVersion("v2026.3.10")).toBeNull();
-    expect(parseReleaseVersion("2026.2.30")).toBeNull();
+    expect(parseReleaseVersion("2026.13.1")).toBeNull();
+    expect(parseReleaseVersion("2026.3.0")).toBeNull();
     expect(parseReleaseVersion("2026.3.10-0")).toBeNull();
+    expect(parseReleaseVersion("2026.3.9007199254740993")).toBeNull();
+    expect(parseReleaseVersion("2026.3.10-beta.9007199254740993")).toBeNull();
+    expect(parseReleaseVersion("2026.3.10-alpha.9007199254740993")).toBeNull();
+    expect(parseReleaseVersion("2026.3.10-9007199254740993")).toBeNull();
     expect(parseReleaseVersion("2.0.0-beta2")).toBeNull();
   });
 });
@@ -123,7 +177,6 @@ describe("parseReleaseTagVersion", () => {
       packageVersion: "2026.3.10-2",
       baseVersion: "2026.3.10",
       channel: "stable",
-      date: new Date(Date.UTC(2026, 2, 10)),
       correctionNumber: 2,
     });
   });
@@ -268,15 +321,15 @@ describe("shouldSkipPackedTarballValidation", () => {
 });
 
 describe("compareReleaseVersions", () => {
-  it("treats stable as newer than same-day beta", () => {
+  it("treats stable as newer than same-patch beta", () => {
     expect(compareReleaseVersions("2026.3.29", "2026.3.29-beta.2")).toBe(1);
   });
 
-  it("orders alpha before beta on the same day", () => {
+  it("orders alpha before beta on the same patch", () => {
     expect(compareReleaseVersions("2026.3.29-alpha.2", "2026.3.29-beta.1")).toBe(-1);
   });
 
-  it("treats a newer beta day as newer than an older stable day", () => {
+  it("treats a newer beta patch as newer than an older stable patch", () => {
     expect(compareReleaseVersions("2026.4.1-beta.1", "2026.3.29")).toBe(1);
   });
 
@@ -286,14 +339,6 @@ describe("compareReleaseVersions", () => {
 
   it("returns null when either version is not release-shaped", () => {
     expect(compareReleaseVersions("latest", "2026.3.29")).toBeNull();
-  });
-});
-
-describe("utcCalendarDayDistance", () => {
-  it("compares UTC calendar days rather than wall-clock hours", () => {
-    const left = new Date("2026-03-09T23:59:59Z");
-    const right = new Date("2026-03-11T00:00:01Z");
-    expect(utcCalendarDayDistance(left, right)).toBe(2);
   });
 });
 
@@ -332,6 +377,21 @@ describe("resolveNpmCommandInvocation", () => {
         comSpec: "C:\\Windows\\System32\\cmd.exe",
         npmArgs: ["view", "openclaw@beta", "version"],
         npmExecPath: "",
+        platform: "win32",
+      }),
+    ).toEqual({
+      command: "C:\\Windows\\System32\\cmd.exe",
+      args: ["/d", "/s", "/c", "npm.cmd view openclaw@beta version"],
+      windowsVerbatimArguments: true,
+    });
+  });
+
+  it("wraps bare Windows npm_execpath through npm.cmd", () => {
+    expect(
+      resolveNpmCommandInvocation({
+        comSpec: "C:\\Windows\\System32\\cmd.exe",
+        npmArgs: ["view", "openclaw@beta", "version"],
+        npmExecPath: "npm",
         platform: "win32",
       }),
     ).toEqual({
@@ -406,7 +466,7 @@ describe("resolveNpmCommandInvocation", () => {
             PATH: `${dir}${delimiter}${process.env.PATH ?? ""}`,
           },
           windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-        });
+        } as { cwd: string; env: NodeJS.ProcessEnv });
 
         expect(JSON.parse(readFileSync(outputPath, "utf8"))).toEqual([
           "view",
@@ -457,25 +517,61 @@ describe("runNpmReleaseCheckCommand", () => {
 
 describe("resolveNpmReleaseCheckCommandTimeoutMs", () => {
   it("parses only positive integer environment timeouts", () => {
-    for (const [raw, expected] of [
-      ["1234", 1234],
-      ["nope", 10 * 60 * 1000],
-      ["10m", 10 * 60 * 1000],
-    ] as const) {
-      expect(
+    expect(resolveNpmReleaseCheckCommandTimeoutMs({})).toBe(10 * 60 * 1000);
+    expect(
+      resolveNpmReleaseCheckCommandTimeoutMs({ OPENCLAW_NPM_RELEASE_CHECK_COMMAND_TIMEOUT_MS: "" }),
+    ).toBe(10 * 60 * 1000);
+    expect(
+      resolveNpmReleaseCheckCommandTimeoutMs({
+        OPENCLAW_NPM_RELEASE_CHECK_COMMAND_TIMEOUT_MS: "1234",
+      }),
+    ).toBe(1234);
+
+    for (const raw of ["nope", "10m", "1e3", "0", "-1", "9007199254740992"]) {
+      expect(() =>
         resolveNpmReleaseCheckCommandTimeoutMs({
           OPENCLAW_NPM_RELEASE_CHECK_COMMAND_TIMEOUT_MS: raw,
         }),
-      ).toBe(expected);
+      ).toThrow(`invalid OPENCLAW_NPM_RELEASE_CHECK_COMMAND_TIMEOUT_MS: ${raw}`);
     }
   });
 });
 
 describe("parseNpmPackJsonOutput", () => {
+  it("preserves filename-only pnpm receipts and npm size metadata", () => {
+    const receipt = { filename: "openclaw.tgz", unpackedSize: 120_354_302 };
+    expect(parseNpmPackJsonOutput(JSON.stringify(receipt))).toEqual([receipt]);
+    expect(parseNpmPackJsonOutput(JSON.stringify({ filename: receipt.filename }))).toEqual([
+      { filename: receipt.filename },
+    ]);
+  });
+
   it("parses a plain npm pack JSON array", () => {
     expect(parseNpmPackJsonOutput('[{"filename":"openclaw.tgz","files":[]}]')).toEqual([
       { filename: "openclaw.tgz", files: [] },
     ]);
+  });
+
+  it("parses npm 12 name-keyed pack output", () => {
+    expect(
+      parseNpmPackJsonOutput(
+        '{"openclaw":{"filename":"openclaw.tgz","files":[{"path":"dist/control-ui/index.html"}]}}',
+      ),
+    ).toEqual([
+      {
+        filename: "openclaw.tgz",
+        files: [{ path: "dist/control-ui/index.html" }],
+      },
+    ]);
+  });
+
+  it("parses trailing npm 12 output after lifecycle logs", () => {
+    const stdout = [
+      "> openclaw@2026.7.2 prepack",
+      '{"openclaw":{"filename":"openclaw.tgz","files":[]}}',
+    ].join("\n");
+
+    expect(parseNpmPackJsonOutput(stdout)).toEqual([{ filename: "openclaw.tgz", files: [] }]);
   });
 
   it("parses the trailing JSON payload after npm lifecycle logs", () => {
@@ -499,6 +595,16 @@ describe("parseNpmPackJsonOutput", () => {
 
   it("returns null when no JSON payload is present", () => {
     expect(parseNpmPackJsonOutput("> openclaw@2026.3.23 prepack")).toBeNull();
+  });
+
+  it.each([{}, { path: 42 }])("rejects incomplete packed file inventories: %j", (file) => {
+    expect(
+      parseNpmPackJsonOutput(
+        JSON.stringify([
+          { filename: "openclaw.tgz", files: [{ path: "dist/control-ui/index.html" }, file] },
+        ]),
+      ),
+    ).toBeNull();
   });
 });
 
@@ -551,6 +657,8 @@ describe("collectForbiddenPackedPathErrors", () => {
   it("rejects private qa artifacts in npm pack output", () => {
     expect(
       collectForbiddenPackedPathErrors([
+        "dist-runtime/extensions/example/runtime.js",
+        "dist/OpenClaw.app/Contents/MacOS/OpenClaw",
         "dist/extensions/qa-channel/runtime-api.js",
         "dist/extensions/qa-channel/package.json",
         "dist/extensions/qa-lab/runtime-api.js",
@@ -559,11 +667,15 @@ describe("collectForbiddenPackedPathErrors", () => {
         "dist/plugin-sdk/extensions/qa-lab/cli.d.ts",
         "dist/plugin-sdk/qa-channel.js",
         "dist/plugin-sdk/qa-channel-protocol.d.ts",
+        "dist/plugin-sdk/qa-lab.js",
+        "dist/plugin-sdk/qa-runtime.d.ts",
         "dist/qa-runtime-B9LDtssJ.js",
         "docs/channels/qa-channel.md",
-        "qa/scenarios/index.md",
+        "qa/scenarios/index.yaml",
       ]),
     ).toEqual([
+      'npm package must not include local application build output "dist/OpenClaw.app/Contents/MacOS/OpenClaw".',
+      'npm package must not include local runtime build output "dist-runtime/extensions/example/runtime.js".',
       'npm package must not include private QA channel artifact "dist/extensions/qa-channel/package.json".',
       'npm package must not include private QA channel artifact "dist/extensions/qa-channel/runtime-api.js".',
       'npm package must not include private QA channel docs "docs/channels/qa-channel.md".',
@@ -572,9 +684,11 @@ describe("collectForbiddenPackedPathErrors", () => {
       'npm package must not include private QA channel type artifact "dist/plugin-sdk/extensions/qa-channel/api.d.ts".',
       'npm package must not include private QA lab artifact "dist/extensions/qa-lab/runtime-api.js".',
       'npm package must not include private QA lab artifact "dist/extensions/qa-lab/src/cli.js".',
+      'npm package must not include private QA lab SDK artifact "dist/plugin-sdk/qa-lab.js".',
       'npm package must not include private QA lab type artifact "dist/plugin-sdk/extensions/qa-lab/cli.d.ts".',
       'npm package must not include private QA runtime chunk "dist/qa-runtime-B9LDtssJ.js".',
-      'npm package must not include private QA suite artifact "qa/scenarios/index.md".',
+      'npm package must not include private QA runtime SDK artifact "dist/plugin-sdk/qa-runtime.d.ts".',
+      'npm package must not include private QA suite artifact "qa/scenarios/index.yaml".',
     ]);
   });
 
@@ -691,26 +805,55 @@ describe("collectPackedTestCargoErrors", () => {
 });
 
 describe("collectReleaseTagErrors", () => {
-  it("accepts versions within the two-day CalVer window", () => {
+  it("accepts monthly patch versions beyond calendar day ranges", () => {
     expect(
       collectReleaseTagErrors({
-        packageVersion: "2026.3.10",
-        releaseTag: "v2026.3.10",
-        now: new Date("2026-03-11T12:00:00Z"),
+        packageVersion: "2026.3.40",
+        releaseTag: "v2026.3.40",
       }),
     ).toStrictEqual([]);
   });
 
-  it("rejects versions outside the two-day CalVer window", () => {
+  it("rejects malformed monthly patch versions", () => {
     expect(
       collectReleaseTagErrors({
-        packageVersion: "2026.3.10",
-        releaseTag: "v2026.3.10",
-        now: new Date("2026-03-13T00:00:00Z"),
+        packageVersion: "2026.3.0",
+        releaseTag: "v2026.3.0",
       }),
     ).toStrictEqual([
-      "Release version 2026.3.10 is 3 days away from current UTC date 2026-03-13; release CalVer date 2026-03-10 must be within 2 days.",
+      'package.json version must match YYYY.M.PATCH, YYYY.M.PATCH-N, YYYY.M.PATCH-alpha.N, or YYYY.M.PATCH-beta.N; found "2026.3.0".',
+      'Release tag must match vYYYY.M.PATCH, vYYYY.M.PATCH-alpha.N, vYYYY.M.PATCH-beta.N, or fallback correction tag vYYYY.M.PATCH-N; found "v2026.3.0".',
+      "Release tag v2026.3.0 does not match package.json version 2026.3.0; expected v2026.3.0.",
     ]);
+  });
+
+  it("rejects new June 2026 stable and beta trains below the transition floor", () => {
+    expect(
+      collectReleaseTagErrors({
+        packageVersion: "2026.6.4",
+        releaseTag: "v2026.6.4",
+      }),
+    ).toStrictEqual([
+      'June 2026 stable and beta release trains must use patch 5 or higher because 2026.6.5-beta.1 is already published; found "2026.6.4".',
+    ]);
+
+    expect(
+      collectReleaseTagErrors({
+        packageVersion: "2026.6.4-beta.1",
+        releaseTag: "v2026.6.4-beta.1",
+      }),
+    ).toStrictEqual([
+      'June 2026 stable and beta release trains must use patch 5 or higher because 2026.6.5-beta.1 is already published; found "2026.6.4-beta.1".',
+    ]);
+  });
+
+  it("keeps pre-transition June alpha tags parseable for compatibility", () => {
+    expect(
+      collectReleaseTagErrors({
+        packageVersion: "2026.6.4-alpha.1",
+        releaseTag: "v2026.6.4-alpha.1",
+      }),
+    ).toStrictEqual([]);
   });
 
   it("accepts fallback correction tags for stable package versions", () => {
@@ -718,7 +861,6 @@ describe("collectReleaseTagErrors", () => {
       collectReleaseTagErrors({
         packageVersion: "2026.3.10",
         releaseTag: "v2026.3.10-1",
-        now: new Date("2026-03-10T00:00:00Z"),
       }),
     ).toStrictEqual([]);
   });
@@ -728,7 +870,6 @@ describe("collectReleaseTagErrors", () => {
       collectReleaseTagErrors({
         packageVersion: "2026.3.10-1",
         releaseTag: "v2026.3.10-1",
-        now: new Date("2026-03-10T00:00:00Z"),
       }),
     ).toStrictEqual([]);
   });
@@ -738,7 +879,6 @@ describe("collectReleaseTagErrors", () => {
       collectReleaseTagErrors({
         packageVersion: "2026.3.10-beta.1",
         releaseTag: "v2026.3.10-1",
-        now: new Date("2026-03-10T00:00:00Z"),
       }),
     ).toStrictEqual([
       "Release tag v2026.3.10-1 does not match package.json version 2026.3.10-beta.1; expected v2026.3.10-beta.1.",
@@ -759,36 +899,6 @@ describe("collectReleasePackageMetadataErrors", () => {
     ).toStrictEqual([]);
   });
 
-  it("rejects node-llama-cpp as a peer dependency", () => {
-    expect(
-      collectReleasePackageMetadataErrors({
-        name: "openclaw",
-        description: "Multi-channel AI gateway with extensible messaging integrations",
-        license: "MIT",
-        repository: { url: "git+https://github.com/openclaw/openclaw.git" },
-        bin: { openclaw: "openclaw.mjs" },
-        peerDependencies: { "node-llama-cpp": "3.18.1" },
-        peerDependenciesMeta: { "node-llama-cpp": { optional: true } },
-      }),
-    ).toEqual([
-      'package.json peerDependencies["node-llama-cpp"] must be omitted; keep it optional.',
-      'package.json peerDependenciesMeta["node-llama-cpp"] must be omitted; keep it optional.',
-    ]);
-  });
-
-  it("rejects node-llama-cpp as a direct runtime dependency", () => {
-    expect(
-      collectReleasePackageMetadataErrors({
-        name: "openclaw",
-        description: "Multi-channel AI gateway with extensible messaging integrations",
-        license: "MIT",
-        repository: { url: "git+https://github.com/openclaw/openclaw.git" },
-        bin: { openclaw: "openclaw.mjs" },
-        dependencies: { "node-llama-cpp": "3.18.1" },
-      }),
-    ).toContain('package.json dependencies["node-llama-cpp"] must be omitted; keep it optional.');
-  });
-
   it("rejects local fs-safe dependency specs for npm release", () => {
     expect(
       collectReleasePackageMetadataErrors({
@@ -801,21 +911,6 @@ describe("collectReleasePackageMetadataErrors", () => {
       }),
     ).toContain(
       'package.json dependencies["@openclaw/fs-safe"] must use a published semver range before npm release; found "link:../fs-safe".',
-    );
-  });
-
-  it("rejects node-llama-cpp as an optional dependency", () => {
-    expect(
-      collectReleasePackageMetadataErrors({
-        name: "openclaw",
-        description: "Multi-channel AI gateway with extensible messaging integrations",
-        license: "MIT",
-        repository: { url: "git+https://github.com/openclaw/openclaw.git" },
-        bin: { openclaw: "openclaw.mjs" },
-        optionalDependencies: { "node-llama-cpp": "3.18.1" },
-      }),
-    ).toContain(
-      'package.json optionalDependencies["node-llama-cpp"] must be omitted; keep it operator-installed.',
     );
   });
 });

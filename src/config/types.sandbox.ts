@@ -1,3 +1,4 @@
+// Defines sandbox execution configuration types.
 import type { SecretInput } from "./types.secrets.js";
 
 export type SandboxDockerSettings = {
@@ -75,6 +76,8 @@ export type SandboxBrowserSettings = {
   vncPort?: number;
   noVncPort?: number;
   headless?: boolean;
+  noVncEnabled?: boolean;
+  /** @deprecated Doctor-only legacy input. */
   enableNoVnc?: boolean;
   /**
    * Allow sandboxed sessions to target the host browser control server.

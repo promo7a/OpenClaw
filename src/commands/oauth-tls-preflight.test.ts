@@ -1,23 +1,25 @@
+// OAuth TLS preflight tests cover timeout handling, TLS diagnostics, and suggested fixes.
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   formatOpenAIOAuthTlsPreflightFix,
   runOpenAIOAuthTlsPreflight,
   shouldRunOpenAIOAuthTlsPrerequisites,
-} from "./oauth-tls-preflight.js";
+} from "../plugins/provider-openai-chatgpt-oauth-tls.js";
+import { withEnv } from "../test-utils/env.js";
 
 describe("runOpenAIOAuthTlsPreflight", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.unstubAllEnvs();
   });
 
   it("returns ok when OpenAI auth endpoint is reachable", async () => {
-    const fetchImpl = vi.fn(
-      async () => new Response("", { status: 400 }),
-    ) as unknown as typeof fetch;
+    const response = new Response("reachable", { status: 400 });
+    const cancel = vi.spyOn(response.body!, "cancel").mockResolvedValue(undefined);
+    const fetchImpl = vi.fn(async () => response) as unknown as typeof fetch;
     const result = await runOpenAIOAuthTlsPreflight({ fetchImpl, timeoutMs: 20 });
     expect(result).toEqual({ ok: true });
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it("caps oversized probe timeouts before creating abort signals", async () => {
@@ -52,6 +54,28 @@ describe("runOpenAIOAuthTlsPreflight", () => {
     }
     expect(result.kind).toBe("tls-cert");
     expect(result.code).toBe("UNABLE_TO_GET_ISSUER_CERT_LOCALLY");
+    expect(result.message).toBe("unable to get local issuer certificate");
+  });
+
+  it("classifies a deeply wrapped hostname mismatch", async () => {
+    const tlsFetchImpl = vi.fn(async () => {
+      throw new TypeError("fetch failed", {
+        cause: {
+          cause: {
+            code: "ERR_TLS_CERT_ALTNAME_INVALID",
+            message: "Hostname/IP does not match certificate's altnames",
+          },
+        },
+      });
+    }) as unknown as typeof fetch;
+    await expect(
+      runOpenAIOAuthTlsPreflight({ fetchImpl: tlsFetchImpl, timeoutMs: 20 }),
+    ).resolves.toEqual({
+      ok: false,
+      kind: "tls-cert",
+      code: "ERR_TLS_CERT_ALTNAME_INVALID",
+      message: "Hostname/IP does not match certificate's altnames",
+    });
   });
 
   it("keeps generic TLS transport failures in network classification", async () => {
@@ -76,23 +100,24 @@ describe("runOpenAIOAuthTlsPreflight", () => {
 
 describe("formatOpenAIOAuthTlsPreflightFix", () => {
   it("includes remediation commands for TLS failures", () => {
-    vi.stubEnv("HOMEBREW_PREFIX", "");
-    const text = formatOpenAIOAuthTlsPreflightFix({
-      ok: false,
-      kind: "tls-cert",
-      code: "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
-      message: "unable to get local issuer certificate",
+    withEnv({ HOMEBREW_PREFIX: "" }, () => {
+      const text = formatOpenAIOAuthTlsPreflightFix({
+        ok: false,
+        kind: "tls-cert",
+        code: "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+        message: "unable to get local issuer certificate",
+      });
+      expect(text).toContain(
+        "OpenAI OAuth prerequisites check failed: Node/OpenSSL cannot validate TLS certificates.",
+      );
+      expect(text).toContain(
+        "Cause: UNABLE_TO_GET_ISSUER_CERT_LOCALLY (unable to get local issuer certificate)",
+      );
+      expect(text).toContain("Fix (Homebrew Node/OpenSSL):");
+      expect(text).toContain("- brew postinstall ca-certificates");
+      expect(text).toContain("- brew postinstall openssl@3");
+      expect(text).toContain("- Retry the OAuth login flow.");
     });
-    expect(text).toContain(
-      "OpenAI OAuth prerequisites check failed: Node/OpenSSL cannot validate TLS certificates.",
-    );
-    expect(text).toContain(
-      "Cause: UNABLE_TO_GET_ISSUER_CERT_LOCALLY (unable to get local issuer certificate)",
-    );
-    expect(text).toContain("Fix (Homebrew Node/OpenSSL):");
-    expect(text).toContain("- brew postinstall ca-certificates");
-    expect(text).toContain("- brew postinstall openssl@3");
-    expect(text).toContain("- Retry the OAuth login flow.");
   });
 });
 

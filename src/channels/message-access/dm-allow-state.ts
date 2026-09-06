@@ -1,6 +1,7 @@
+/** Merges configured and persisted allowFrom entries for channel security audit. */
 import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
 import type { ChannelId } from "../plugins/types.public.js";
-import { readChannelIngressStoreAllowFromForDmPolicy } from "./runtime.js";
+import { readChannelIngressStoreAllowFromForDmPolicy } from "./store-allow-from.js";
 
 export async function resolveDmAllowAuditState(params: {
   provider: ChannelId;
@@ -9,12 +10,7 @@ export async function resolveDmAllowAuditState(params: {
   dmPolicy?: string | null;
   normalizeEntry?: (raw: string) => string;
   readStore?: (provider: ChannelId, accountId: string) => Promise<string[]>;
-}): Promise<{
-  configAllowFrom: string[];
-  hasWildcard: boolean;
-  allowCount: number;
-  isMultiUserDm: boolean;
-}> {
+}) {
   const configAllowFrom = normalizeStringEntries(
     Array.isArray(params.allowFrom) ? params.allowFrom : undefined,
   );
@@ -32,11 +28,9 @@ export async function resolveDmAllowAuditState(params: {
   const normalizedStore = normalizeStringEntries(
     storeAllowFrom.map((value) => normalizeEntry(value)),
   );
-  const allowCount = new Set([...normalizedCfg, ...normalizedStore]).size;
+  const admittedPrincipals = Array.from(new Set([...normalizedCfg, ...normalizedStore]));
   return {
-    configAllowFrom,
     hasWildcard,
-    allowCount,
-    isMultiUserDm: hasWildcard || allowCount > 1,
+    admittedPrincipals,
   };
 }

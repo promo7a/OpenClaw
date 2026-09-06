@@ -1,19 +1,26 @@
+/** Public repair utilities for model-emitted plain-text tool calls. */
 export {
   parseStandalonePlainTextToolCallBlocks,
   stripPlainTextToolCallBlocks,
   type PlainTextToolCallBlock,
-  type PlainTextToolCallParseOptions,
 } from "./payload.js";
 export {
-  normalizePlainTextToolCallStreamEvents,
-  scrubOverCapPlainTextToolCallMessage,
-  type PlainTextToolCallMessageNormalization,
   type PlainTextToolCallNameMatcher,
+  type PlainTextToolCallParseOptions,
+  type PlainTextToolCallProtectedRange,
+  type PlainTextToolCallProtectedRangeResolver,
+} from "./contracts.js";
+export {
+  normalizePlainTextToolCallStreamEvents,
+  projectScrubbedPlainTextToolCallMessage,
+  type PlainTextToolCallMessageNormalization,
   type PlainTextToolCallStreamNormalizerOptions,
 } from "./stream-normalizer.js";
 export {
-  extractStandalonePlainTextToolCallText,
-  promoteStandalonePlainTextToolCallMessage,
+  createPromotedPlainTextToolCallBlock,
+  createPromotedPlainTextToolCallEvents,
+  projectStandalonePlainTextToolCallMessage,
+  type PlainTextToolCallMessageProjection,
   type PlainTextToolCallPromotionOptions,
   type PromotedPlainTextToolCallBlockFactory,
   type ToolCallRepairNameResolver,

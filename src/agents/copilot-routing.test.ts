@@ -1,21 +1,29 @@
+// Covers when model selection should install the Copilot runtime plugin.
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { modelSelectionShouldEnsureCopilotRuntimePlugin } from "./copilot-routing.js";
 
-const emptyCfg = {} as OpenClawConfig;
+function withDefaultRoster(config: OpenClawConfig = {}): OpenClawConfig {
+  return {
+    ...config,
+    agents: { entries: { main: { default: true } }, ...config.agents },
+  };
+}
+
+const emptyCfg = withDefaultRoster();
 
 function cfgWithProviderRuntime(id: string): OpenClawConfig {
-  return {
+  return withDefaultRoster({
     models: {
       providers: {
         "github-copilot": { agentRuntime: { id } },
       },
     },
-  } as unknown as OpenClawConfig;
+  } as unknown as OpenClawConfig);
 }
 
 function cfgWithModelRuntime(modelId: string, id: string): OpenClawConfig {
-  return {
+  return withDefaultRoster({
     models: {
       providers: {
         "github-copilot": {
@@ -23,7 +31,7 @@ function cfgWithModelRuntime(modelId: string, id: string): OpenClawConfig {
         },
       },
     },
-  } as unknown as OpenClawConfig;
+  } as unknown as OpenClawConfig);
 }
 
 describe("modelSelectionShouldEnsureCopilotRuntimePlugin", () => {
@@ -81,7 +89,9 @@ describe("modelSelectionShouldEnsureCopilotRuntimePlugin", () => {
   });
 
   it("model-scope override takes precedence over provider scope", () => {
-    const cfg = {
+    // A model override can intentionally opt out even when the provider default
+    // opts into the Copilot runtime plugin.
+    const cfg = withDefaultRoster({
       models: {
         providers: {
           "github-copilot": {
@@ -90,7 +100,7 @@ describe("modelSelectionShouldEnsureCopilotRuntimePlugin", () => {
           },
         },
       },
-    } as unknown as OpenClawConfig;
+    } as unknown as OpenClawConfig);
     expect(
       modelSelectionShouldEnsureCopilotRuntimePlugin({
         model: "github-copilot/gpt-4o",
@@ -107,13 +117,13 @@ describe("modelSelectionShouldEnsureCopilotRuntimePlugin", () => {
   });
 
   it("returns false for other providers regardless of agentRuntime config", () => {
-    const cfg = {
+    const cfg = withDefaultRoster({
       models: {
         providers: {
           openai: { agentRuntime: { id: "copilot" } },
         },
       },
-    } as unknown as OpenClawConfig;
+    } as unknown as OpenClawConfig);
     expect(
       modelSelectionShouldEnsureCopilotRuntimePlugin({ model: "openai/gpt-4o", config: cfg }),
     ).toBe(false);

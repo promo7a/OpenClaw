@@ -1,70 +1,122 @@
+// Moonshot thinking wrapper normalizes reasoning output from Moonshot streams.
+import { asOptionalRecord as asPayloadRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import type { StreamFn } from "../../../agents/runtime/index.js";
 import type { ThinkLevel } from "../../../auto-reply/thinking.js";
-import { createLazyImportLoader } from "../../../shared/lazy-promise.js";
-import { streamWithPayloadPatch } from "./stream-payload-utils.js";
+import { createLazyRuntimeModule } from "../../../shared/lazy-runtime.js";
+
+const loadDefaultStream = createLazyRuntimeModule(() => import("../../stream.js"));
 
 type MoonshotThinkingType = "enabled" | "disabled";
 type MoonshotThinkingKeep = "all";
-const MOONSHOT_THINKING_KEEP_MODEL_ID = "kimi-k2.6";
-const llmRuntimeLoader = createLazyImportLoader(() => import("openclaw/plugin-sdk/llm"));
-
-async function loadDefaultStreamFn(): Promise<StreamFn> {
-  const runtime = await llmRuntimeLoader.load();
-  return runtime.streamSimple;
-}
+type MoonshotPayloadFinalizer = (result: unknown, payload: Record<string, unknown>) => unknown;
+const MOONSHOT_ALWAYS_THINKING = {
+  "kimi-k2.7-code": "low",
+  "kimi-k2.7-code-highspeed": "low",
+  "kimi-k3": "max",
+} as const;
+const FIXED_SAMPLING_FIELDS = "temperature top_p n presence_penalty frequency_penalty".split(" ");
+type MoonshotAlwaysThinkingEffort = "low" | "max";
 
 function normalizeMoonshotThinkingType(value: unknown): MoonshotThinkingType | undefined {
-  if (typeof value === "boolean") {
-    return value ? "enabled" : "disabled";
+  const type = asPayloadRecord(value)?.type ?? value;
+  if (typeof type === "boolean") {
+    return type ? "enabled" : "disabled";
   }
-  if (typeof value === "string") {
-    const normalized = normalizeOptionalLowercaseString(value);
-    if (!normalized) {
-      return undefined;
-    }
-    if (["enabled", "enable", "on", "true"].includes(normalized)) {
-      return "enabled";
-    }
-    if (["disabled", "disable", "off", "false"].includes(normalized)) {
-      return "disabled";
-    }
-    return undefined;
+  const normalized = normalizeOptionalLowercaseString(type);
+  if (["enabled", "enable", "on", "true"].includes(normalized ?? "")) {
+    return "enabled";
   }
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    return normalizeMoonshotThinkingType((value as Record<string, unknown>).type);
+  if (["disabled", "disable", "off", "false"].includes(normalized ?? "")) {
+    return "disabled";
   }
   return undefined;
 }
 
-function normalizeMoonshotThinkingKeep(value: unknown): MoonshotThinkingKeep | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return undefined;
-  }
-  const keepValue = (value as Record<string, unknown>).keep;
-  if (typeof keepValue !== "string") {
-    return undefined;
-  }
-  return normalizeOptionalLowercaseString(keepValue) === "all" ? "all" : undefined;
-}
-
 function isMoonshotToolChoiceCompatible(toolChoice: unknown): boolean {
-  if (toolChoice == null || toolChoice === "auto" || toolChoice === "none") {
-    return true;
-  }
-  if (typeof toolChoice === "object" && !Array.isArray(toolChoice)) {
-    const typeValue = (toolChoice as Record<string, unknown>).type;
-    return typeValue === "auto" || typeValue === "none";
-  }
-  return false;
+  const type = asPayloadRecord(toolChoice)?.type ?? toolChoice;
+  return type == null || type === "auto" || type === "none";
 }
 
-function isPinnedToolChoice(toolChoice: unknown): boolean {
-  if (!toolChoice || typeof toolChoice !== "object" || Array.isArray(toolChoice)) {
-    return false;
+function ensureMoonshotToolCallReasoningContent(payload: Record<string, unknown>): void {
+  const messages = Array.isArray(payload.messages) ? payload.messages : [];
+  for (const message of messages) {
+    const record = asPayloadRecord(message);
+    if (record?.role !== "assistant" || !Array.isArray(record.tool_calls)) {
+      continue;
+    }
+    if (record.tool_calls.length > 0 && !("reasoning_content" in record)) {
+      record.reasoning_content = "";
+    }
   }
-  const typeValue = (toolChoice as Record<string, unknown>).type;
-  return typeValue === "tool" || typeValue === "function";
+}
+
+function resolveAlwaysThinkingEffort(
+  modelId: string,
+  directMoonshotModel: boolean,
+): MoonshotAlwaysThinkingEffort | undefined {
+  const effort = MOONSHOT_ALWAYS_THINKING[modelId as keyof typeof MOONSHOT_ALWAYS_THINKING];
+  return effort && (modelId !== "kimi-k3" || directMoonshotModel) ? effort : undefined;
+}
+
+function sanitizeAlwaysThinkingPayload(
+  payload: Record<string, unknown>,
+  effort: MoonshotAlwaysThinkingEffort,
+): void {
+  delete payload.thinking;
+  delete payload.reasoningEffort;
+  FIXED_SAMPLING_FIELDS.forEach((field) => Reflect.deleteProperty(payload, field));
+  if (effort === "max") {
+    payload.reasoning_effort = effort;
+  } else {
+    delete payload.reasoning_effort;
+    if (!isMoonshotToolChoiceCompatible(payload.tool_choice)) {
+      payload.tool_choice = "auto";
+    }
+  }
+}
+
+function prepareThinkingPayload(
+  payload: Record<string, unknown>,
+  modelId: string,
+  directMoonshotModel: boolean,
+  thinkingType?: MoonshotThinkingType,
+  thinkingKeep?: MoonshotThinkingKeep,
+) {
+  const payloadModelId =
+    typeof payload.model === "string" ? payload.model.trim().toLowerCase() : modelId;
+  let effectiveThinkingType = normalizeMoonshotThinkingType(payload.thinking);
+  if (thinkingType) {
+    payload.thinking = { type: thinkingType };
+    effectiveThinkingType = thinkingType;
+  }
+  const effort = resolveAlwaysThinkingEffort(payloadModelId, directMoonshotModel);
+  if (effort) {
+    sanitizeAlwaysThinkingPayload(payload, effort);
+    return (finalPayload: Record<string, unknown>) => {
+      sanitizeAlwaysThinkingPayload(finalPayload, effort);
+      ensureMoonshotToolCallReasoningContent(finalPayload);
+    };
+  }
+  if (effectiveThinkingType === "enabled" && !isMoonshotToolChoiceCompatible(payload.tool_choice)) {
+    const toolChoiceType = asPayloadRecord(payload.tool_choice)?.type;
+    if (payload.tool_choice === "required") {
+      payload.tool_choice = "auto";
+    } else if (toolChoiceType === "tool" || toolChoiceType === "function") {
+      payload.thinking = { type: "disabled" };
+      effectiveThinkingType = "disabled";
+    }
+  }
+  const thinking = asPayloadRecord(payload.thinking);
+  const preserveKeep =
+    payloadModelId === "kimi-k2.6" && effectiveThinkingType === "enabled" && thinkingKeep === "all";
+  if (thinking) {
+    delete thinking.keep;
+    Object.assign(thinking, preserveKeep ? { keep: "all" } : {});
+  }
+  return effectiveThinkingType === "enabled"
+    ? ensureMoonshotToolCallReasoningContent
+    : () => undefined;
 }
 
 /** @deprecated Moonshot provider-owned stream helper; do not use from third-party plugins. */
@@ -72,21 +124,18 @@ export function resolveMoonshotThinkingType(params: {
   configuredThinking: unknown;
   thinkingLevel?: ThinkLevel;
 }): MoonshotThinkingType | undefined {
-  const configured = normalizeMoonshotThinkingType(params.configuredThinking);
-  if (configured) {
-    return configured;
-  }
-  if (!params.thinkingLevel) {
-    return undefined;
-  }
-  return params.thinkingLevel === "off" ? "disabled" : "enabled";
+  return (
+    normalizeMoonshotThinkingType(params.configuredThinking) ??
+    (params.thinkingLevel ? (params.thinkingLevel === "off" ? "disabled" : "enabled") : undefined)
+  );
 }
 
 /** @deprecated Moonshot provider-owned stream helper; do not use from third-party plugins. */
 export function resolveMoonshotThinkingKeep(params: {
   configuredThinking: unknown;
 }): MoonshotThinkingKeep | undefined {
-  return normalizeMoonshotThinkingKeep(params.configuredThinking);
+  const keep = normalizeOptionalLowercaseString(asPayloadRecord(params.configuredThinking)?.keep);
+  return keep === "all" ? "all" : undefined;
 }
 
 /** @deprecated Moonshot provider-owned stream helper; do not use from third-party plugins. */
@@ -94,40 +143,44 @@ export function createMoonshotThinkingWrapper(
   baseStreamFn: StreamFn | undefined,
   thinkingType?: MoonshotThinkingType,
   thinkingKeep?: MoonshotThinkingKeep,
+  finalizePayload?: MoonshotPayloadFinalizer,
 ): StreamFn {
-  return async (model, context, options) => {
-    const underlying = baseStreamFn ?? (await loadDefaultStreamFn());
-    return streamWithPayloadPatch(underlying, model, context, options, (payloadObj) => {
-      let effectiveThinkingType = normalizeMoonshotThinkingType(payloadObj.thinking);
-
-      if (thinkingType) {
-        payloadObj.thinking = { type: thinkingType };
-        effectiveThinkingType = thinkingType;
-      }
-
-      if (
-        effectiveThinkingType === "enabled" &&
-        !isMoonshotToolChoiceCompatible(payloadObj.tool_choice)
-      ) {
-        if (payloadObj.tool_choice === "required") {
-          payloadObj.tool_choice = "auto";
-        } else if (isPinnedToolChoice(payloadObj.tool_choice)) {
-          payloadObj.thinking = { type: "disabled" };
-          effectiveThinkingType = "disabled";
+  // Catalog imports need only the policy. Resolve the default transport when a stream starts;
+  // an explicitly supplied stream keeps its synchronous invocation contract.
+  const underlying: StreamFn =
+    baseStreamFn ?? (async (...args) => (await loadDefaultStream()).streamSimple(...args));
+  return function moonshotThinkingStream(model, context, options) {
+    const modelId = model.id.trim().toLowerCase();
+    const directMoonshotModel = normalizeOptionalLowercaseString(model.provider) === "moonshot";
+    const alwaysThinkingEffort = resolveAlwaysThinkingEffort(modelId, directMoonshotModel);
+    const streamModel = alwaysThinkingEffort ? { ...model, reasoning: true } : model;
+    const streamOptions = alwaysThinkingEffort
+      ? { ...options, reasoning: alwaysThinkingEffort }
+      : options;
+    return underlying(streamModel, context, {
+      ...streamOptions,
+      onPayload(payload, payloadModel) {
+        const record = asPayloadRecord(payload);
+        if (!record) {
+          return streamOptions?.onPayload?.(payload, payloadModel);
         }
-      }
-
-      // thinking.keep is only valid on kimi-k2.6 when thinking is enabled. Gate
-      // by the final payload.model and final type so stray config never leaks.
-      const isKeepCapableModel = payloadObj.model === MOONSHOT_THINKING_KEEP_MODEL_ID;
-      if (payloadObj.thinking && typeof payloadObj.thinking === "object") {
-        const thinkingObj = payloadObj.thinking as Record<string, unknown>;
-        if (isKeepCapableModel && effectiveThinkingType === "enabled" && thinkingKeep === "all") {
-          thinkingObj.keep = "all";
-        } else if ("keep" in thinkingObj) {
-          delete thinkingObj.keep;
-        }
-      }
+        const postThinking = prepareThinkingPayload(
+          record,
+          modelId,
+          directMoonshotModel,
+          thinkingType,
+          thinkingKeep,
+        );
+        const finish = (result: unknown) => {
+          const finalPayload = asPayloadRecord(result) ?? record;
+          postThinking(finalPayload);
+          return finalizePayload ? finalizePayload(result, finalPayload) : result;
+        };
+        const result = streamOptions?.onPayload?.(payload, payloadModel);
+        return result && typeof (result as Promise<unknown>).then === "function"
+          ? Promise.resolve(result).then(finish)
+          : finish(result);
+      },
     });
   };
 }

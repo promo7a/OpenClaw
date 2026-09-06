@@ -1,3 +1,6 @@
+/**
+ * Test SDK subpath for provider auth, catalog, discovery, runtime, and media contracts.
+ */
 export {
   describeGithubCopilotProviderAuthContract,
   describeOpenAICodexProviderAuthContract,
@@ -10,7 +13,6 @@ export {
   expectCodexMissingAuthHint,
   importProviderRuntimeCatalogModule,
   loadBundledPluginPublicSurface,
-  loadBundledPluginPublicSurfaceSync,
   type ProviderPlugin,
 } from "./test-helpers/provider-catalog.js";
 export { describeProviderContracts } from "./test-helpers/provider-contract.js";

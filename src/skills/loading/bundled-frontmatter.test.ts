@@ -1,8 +1,9 @@
+// Bundled frontmatter tests cover metadata validity for bundled skills.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { parseFrontmatter } from "./frontmatter.js";
+import { parseSkillFrontmatter } from "./frontmatter.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 
@@ -15,7 +16,7 @@ describe("bundled taskflow skill frontmatter", () => {
 
     for (const relativePath of skillPaths) {
       const raw = await fs.readFile(path.join(repoRoot, relativePath), "utf8");
-      const frontmatter = parseFrontmatter(raw);
+      const frontmatter = parseSkillFrontmatter(raw);
 
       expect(frontmatter.name, relativePath).toBeTypeOf("string");
       expect(frontmatter.name?.trim(), relativePath).not.toBe("");

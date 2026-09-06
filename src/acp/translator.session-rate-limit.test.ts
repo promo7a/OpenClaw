@@ -1,3 +1,4 @@
+/** Tests ACP translator session creation rate limiting. */
 import { createInMemorySessionStore } from "@openclaw/acp-core/session";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -26,8 +27,6 @@ describe("acp session creation rate limit", () => {
     await expect(agent.newSession(createNewSessionRequest())).rejects.toThrow(
       /session creation rate limit exceeded/i,
     );
-
-    sessionStore.clearAllSessionsForTest();
   });
 
   it("does not count loadSession refreshes for an existing session ID", async () => {
@@ -45,8 +44,6 @@ describe("acp session creation rate limit", () => {
     await expect(agent.loadSession(createLoadSessionRequest("new-session"))).rejects.toThrow(
       /session creation rate limit exceeded/i,
     );
-
-    sessionStore.clearAllSessionsForTest();
   });
 
   it("falls back for non-finite session creation rate limit overrides", async () => {
@@ -65,7 +62,5 @@ describe("acp session creation rate limit", () => {
     await expect(agent.newSession(createNewSessionRequest())).resolves.toMatchObject({
       sessionId: expect.any(String),
     });
-
-    sessionStore.clearAllSessionsForTest();
   });
 });

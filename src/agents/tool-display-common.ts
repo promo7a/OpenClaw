@@ -1,17 +1,25 @@
+import { parseStrictFiniteNumber } from "@openclaw/normalization-core/number-coercion";
+/**
+ * Shared compact tool-call display helpers.
+ * Redacts and summarizes arguments into short labels/details for chat and UI
+ * tool update streams.
+ */
+import { asOptionalObjectRecord as asRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
-import { parseStrictFiniteNumber } from "../infra/parse-finite-number.js";
+import { sliceUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { redactToolPayloadText } from "../logging/redact.js";
+import { isAgentPlanProgressToolName } from "../session-cards/progress-card-channel-summary.js";
 import { resolveExecDetail, type ToolDetailMode } from "./tool-display-exec.js";
-import { asRecord } from "./tool-display-record.js";
 
 type ToolDisplayActionSpec = {
   label?: string;
   detailKeys?: string[];
 };
 
+/** Display metadata for a tool and optional per-action labels/details. */
 export type ToolDisplaySpec = {
   title?: string;
   label?: string;
@@ -19,7 +27,8 @@ export type ToolDisplaySpec = {
   actions?: Record<string, ToolDisplayActionSpec>;
 };
 
-export type ToolSearchCodeDisplayTarget = {
+/** Normalized display target for code/search bridge tools. */
+type ToolSearchCodeDisplayTarget = {
   toolName: string;
   displayToolName?: string;
   displayArgs?: Record<string, unknown>;
@@ -28,17 +37,15 @@ export type ToolSearchCodeDisplayTarget = {
 };
 
 type CoerceDisplayValueOptions = {
-  includeFalse?: boolean;
-  includeZero?: boolean;
-  includeNonFinite?: boolean;
-  maxStringChars?: number;
-  maxArrayEntries?: number;
+  includeFalsy?: boolean;
 };
 
-export function normalizeToolName(name?: string): string {
+/** Normalize a tool name for fallback display. */
+export function normalizeToolDisplayName(name?: string): string {
   return (name ?? "tool").trim();
 }
 
+/** Convert a tool identifier into a human-readable title. */
 export function defaultTitle(name: string): string {
   const cleaned = name.replace(/_/g, " ").trim();
   if (!cleaned) {
@@ -75,6 +82,7 @@ function resolveActionArg(args: unknown): string | undefined {
   return action || undefined;
 }
 
+/** Resolve display verb/detail from tool args and optional display metadata. */
 export function resolveToolVerbAndDetailForArgs(params: {
   toolKey: string;
   args?: unknown;
@@ -87,6 +95,10 @@ export function resolveToolVerbAndDetailForArgs(params: {
   detailMaxEntries?: number;
   detailFormatKey?: (raw: string) => string;
 }): { verb?: string; detail?: string } {
+  // Card arguments belong to the card renderer; generic summaries must not expose them.
+  if (isAgentPlanProgressToolName(params.toolKey)) {
+    return {};
+  }
   return resolveToolVerbAndDetail({
     toolKey: params.toolKey,
     args: params.args,
@@ -106,9 +118,6 @@ function coerceDisplayValue(
   value: unknown,
   opts: CoerceDisplayValueOptions = {},
 ): string | undefined {
-  const maxStringChars = opts.maxStringChars ?? 160;
-  const maxArrayEntries = opts.maxArrayEntries ?? 3;
-
   if (value === null || value === undefined) {
     return undefined;
   }
@@ -122,23 +131,22 @@ function coerceDisplayValue(
       return undefined;
     }
     const firstLine = redactToolPayloadText(rawLine);
-    if (firstLine.length > maxStringChars) {
-      const half = Math.floor((maxStringChars - 1) / 2);
-      return `${firstLine.slice(0, half)}…${firstLine.slice(-(maxStringChars - 1 - half))}`;
+    if (firstLine.length > 160) {
+      return `${sliceUtf16Safe(firstLine, 0, 79)}…${sliceUtf16Safe(firstLine, -80)}`;
     }
     return firstLine;
   }
   if (typeof value === "boolean") {
-    if (!value && !opts.includeFalse) {
+    if (!value && !opts.includeFalsy) {
       return undefined;
     }
     return value ? "true" : "false";
   }
   if (typeof value === "number") {
     if (!Number.isFinite(value)) {
-      return opts.includeNonFinite ? String(value) : undefined;
+      return undefined;
     }
-    if (value === 0 && !opts.includeZero) {
+    if (value === 0 && !opts.includeFalsy) {
       return undefined;
     }
     return String(value);
@@ -152,7 +160,7 @@ function coerceDisplayValue(
         continue;
       }
       displayValueCount += 1;
-      if (values.length < maxArrayEntries) {
+      if (values.length < 3) {
         values.push(display);
       }
     }
@@ -160,7 +168,7 @@ function coerceDisplayValue(
       return undefined;
     }
     const preview = values.join(", ");
-    return displayValueCount > maxArrayEntries ? `${preview}…` : preview;
+    return displayValueCount > 3 ? `${preview}…` : preview;
   }
   return undefined;
 }
@@ -183,6 +191,7 @@ function lookupValueByPath(args: unknown, path: string): unknown {
   return current;
 }
 
+/** Format a detail path/key into a short display label. */
 export function formatDetailKey(raw: string, overrides: Record<string, string> = {}): string {
   let last = "";
   for (const segment of raw.split(".")) {
@@ -339,8 +348,13 @@ function collectWebSearchQueries(record: Record<string, unknown>): string[] {
   add(record.q);
   add(record.search);
   add(record.input);
+  // Parallel's `web_search` provider uses the native Parallel Search shape
+  // (`objective` + `search_queries`). Surface those so CLI progress and
+  // Codex activity metadata render the query context instead of a bare
+  // `search`.
+  add(record.objective);
 
-  for (const key of ["search_query", "image_query", "queries"]) {
+  for (const key of ["search_query", "image_query", "queries", "search_queries"]) {
     const value = record[key];
     if (!Array.isArray(value)) {
       continue;
@@ -364,6 +378,8 @@ function collectWebSearchQueries(record: Record<string, unknown>): string[] {
 }
 
 function parseToolSearchCall(code: string): { target: string; args?: string } | undefined {
+  // This is a bounded summary parser for display only; execution still uses the
+  // real tool-search bridge and schema validation.
   const prefixMatch = code.match(/openclaw\.tools\.call\s*\(\s*/s);
   if (!prefixMatch || prefixMatch.index === undefined) {
     return undefined;
@@ -565,6 +581,7 @@ function summarizeToolSearchCallInput(raw: string | undefined): string | undefin
   return undefined;
 }
 
+/** Infer the bridged tool target displayed for tool_search_code snippets. */
 export function resolveToolSearchCodeDisplayTarget(
   args: unknown,
 ): ToolSearchCodeDisplayTarget | undefined {
@@ -682,7 +699,7 @@ function resolveDetailFromKeys(
     return undefined;
   }
   if (entries.length === 1) {
-    return entries[0].value;
+    return entries.at(0)?.value;
   }
 
   const seen = new Set<string>();
@@ -733,7 +750,7 @@ function resolveToolVerbAndDetail(params: {
   const verb = normalizeVerb(actionSpec?.label ?? params.action ?? fallbackVerb);
 
   let detail: string | undefined;
-  if (params.toolKey === "exec" || params.toolKey === "bash") {
+  if (params.toolKey === "exec" || params.toolKey === "bash" || params.toolKey === "shell") {
     detail = resolveExecDetail(params.args, { detailMode: params.toolDetailMode });
   }
   if (!detail && params.toolKey === "read") {
@@ -771,6 +788,7 @@ function resolveToolVerbAndDetail(params: {
   return { verb, detail };
 }
 
+/** Normalize final detail text before attaching it to a tool display line. */
 export function formatToolDetailText(
   detail: string | undefined,
   opts: { prefixWithWith?: boolean } = {},
@@ -795,3 +813,4 @@ export function formatToolDetailText(
   }
   return opts.prefixWithWith ? `with ${normalized}` : normalized;
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

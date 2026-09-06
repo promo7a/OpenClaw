@@ -1,4 +1,14 @@
-import { loadWorkspaceBootstrapFiles, type WorkspaceBootstrapFile } from "./workspace.js";
+/**
+ * Per-session workspace bootstrap snapshot cache.
+ * Reuses unchanged bootstrap file arrays while refreshing each turn so edits
+ * become visible to long-lived agent sessions.
+ */
+import { pruneMapToMaxSize } from "../infra/map-size.js";
+import {
+  loadWorkspaceBootstrapFiles,
+  type WorkspaceBootstrapFile,
+  workspaceFileSourceIdentitiesMatch,
+} from "./workspace.js";
 
 type BootstrapSnapshot = {
   workspaceDir: string;
@@ -23,26 +33,20 @@ function bootstrapFilesEqual(
       file.name === updated.name &&
       file.path === updated.path &&
       file.content === updated.content &&
-      file.missing === updated.missing
+      file.missing === updated.missing &&
+      // Equal bytes at a replaced inode or symlink target must carry the newly
+      // opened source identity instead of reusing stale file objects.
+      workspaceFileSourceIdentitiesMatch(file, updated)
     );
   });
 }
 
-function pruneOldestBootstrapSnapshots(): void {
-  while (cache.size > MAX_BOOTSTRAP_SNAPSHOTS) {
-    const oldestKey = cache.keys().next().value;
-    if (typeof oldestKey !== "string") {
-      return;
-    }
-    cache.delete(oldestKey);
-  }
-}
-
+/** Load bootstrap files for a session, reusing the prior snapshot when content is unchanged. */
 export async function getOrLoadBootstrapFiles(params: {
   workspaceDir: string;
   sessionKey: string;
 }): Promise<WorkspaceBootstrapFile[]> {
-  pruneOldestBootstrapSnapshots();
+  pruneMapToMaxSize(cache, MAX_BOOTSTRAP_SNAPSHOTS);
   const existing = cache.get(params.sessionKey);
   // Refresh per turn so long-lived sessions pick up edits; loadWorkspaceBootstrapFiles
   // handles unchanged file content through its guarded inode/mtime cache.
@@ -58,22 +62,16 @@ export async function getOrLoadBootstrapFiles(params: {
   }
 
   cache.set(params.sessionKey, { workspaceDir: params.workspaceDir, files });
-  pruneOldestBootstrapSnapshots();
+  pruneMapToMaxSize(cache, MAX_BOOTSTRAP_SNAPSHOTS);
   return files;
 }
 
-export function getBootstrapSnapshotCacheSizeForTest(): number {
-  return cache.size;
-}
-
-export function hasBootstrapSnapshotForTest(sessionKey: string): boolean {
-  return cache.has(sessionKey);
-}
-
+/** Drop one cached bootstrap snapshot. */
 export function clearBootstrapSnapshot(sessionKey: string): void {
   cache.delete(sessionKey);
 }
 
+/** Clear bootstrap state when a visible session rolls over to a new backing session. */
 export function clearBootstrapSnapshotOnSessionRollover(params: {
   sessionKey?: string;
   previousSessionId?: string;
@@ -85,6 +83,13 @@ export function clearBootstrapSnapshotOnSessionRollover(params: {
   clearBootstrapSnapshot(params.sessionKey);
 }
 
-export function clearAllBootstrapSnapshots(): void {
-  cache.clear();
+/** Clear bootstrap state after an in-log lifecycle boundary is durably appended. */
+export function clearBootstrapSnapshotOnSessionBoundary(params: {
+  boundaryAppended: boolean;
+  sessionKey?: string;
+}): void {
+  if (!params.boundaryAppended || !params.sessionKey) {
+    return;
+  }
+  clearBootstrapSnapshot(params.sessionKey);
 }

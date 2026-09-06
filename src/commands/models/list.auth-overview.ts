@@ -1,3 +1,4 @@
+/** Builds provider auth summaries for model-list/status output. */
 import { normalizeProviderIdForAuth } from "@openclaw/model-catalog-core/provider-id";
 import {
   normalizeLowercaseStringOrEmpty,
@@ -11,6 +12,7 @@ import { listProfilesForProvider } from "../../agents/auth-profiles/profiles.js"
 import type { AuthProfileStore } from "../../agents/auth-profiles/types.js";
 import { resolveProfileUnusableUntilForDisplay } from "../../agents/auth-profiles/usage.js";
 import { isNonSecretApiKeyMarker, isOAuthApiKeyMarker } from "../../agents/model-auth-markers.js";
+import { resolveProviderConfigSecretInput } from "../../agents/model-auth-provider-config.js";
 import {
   getCustomProviderApiKey,
   resolveEnvApiKey,
@@ -18,9 +20,19 @@ import {
 } from "../../agents/model-auth.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { ProviderAuthEvidence } from "../../secrets/provider-env-vars.js";
+import { maskApiKey } from "../../security/secret-mask.js";
 import { shortenHomePath } from "../../utils.js";
-import { maskApiKey } from "./list.format.js";
 import type { ProviderAuthOverview } from "./list.types.js";
+
+/**
+ * Count-first wording on purpose: `token=1`/`api_key=0` would match the console
+ * secret redactor's key=value patterns and get masked into garbled output.
+ */
+export function formatProviderAuthProfileCounts(
+  profiles: Pick<ProviderAuthOverview["profiles"], "count" | "oauth" | "token" | "apiKey">,
+): string {
+  return `${profiles.count} (${profiles.oauth} oauth, ${profiles.token} token, ${profiles.apiKey} api-key)`;
+}
 
 function formatMarkerOrSecret(value: string): string {
   return isNonSecretApiKeyMarker(value, { includeEnvVarName: false })
@@ -62,6 +74,7 @@ function resolveProfileSourceAgentDir(params: {
     : params.agentDir;
 }
 
+/** Resolves the effective auth source and profile counts for a provider. */
 export function resolveProviderAuthOverview(params: {
   provider: string;
   cfg: OpenClawConfig;
@@ -147,8 +160,17 @@ export function resolveProviderAuthOverview(params: {
   });
   const customKey = getCustomProviderApiKey(cfg, provider);
   const usableCustomKey = resolveUsableCustomProviderApiKey({ cfg, provider });
+  const providerApiKeyRef = resolveProviderConfigSecretInput(cfg, provider).ref;
 
   const effective: ProviderAuthOverview["effective"] = (() => {
+    if (providerApiKeyRef) {
+      if (!usableCustomKey) {
+        return { kind: "missing", detail: "missing" };
+      }
+      return providerApiKeyRef.source === "env"
+        ? { kind: "env", detail: maskApiKey(usableCustomKey.apiKey) }
+        : { kind: "models.json", detail: formatMarkerOrSecret(usableCustomKey.apiKey) };
+    }
     if (profiles.length > 0) {
       return {
         kind: "profiles",
@@ -214,6 +236,16 @@ export function resolveProviderAuthOverview(params: {
           },
         }
       : {}),
-    ...(params.syntheticAuth ? { syntheticAuth: params.syntheticAuth } : {}),
+    // Re-project instead of passing the caller's object through: status callers
+    // hand richer runtime shapes that also carry the raw synthetic credential,
+    // and structural typing would let it leak into `--json` output verbatim.
+    ...(params.syntheticAuth
+      ? {
+          syntheticAuth: {
+            value: params.syntheticAuth.value,
+            source: params.syntheticAuth.source,
+          },
+        }
+      : {}),
   };
 }

@@ -3,10 +3,12 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 ANDROID_DIR="$ROOT_DIR/apps/android"
-PACKAGE_NAME="ai.openclaw.app"
-RECEIVER="$PACKAGE_NAME/.VoiceE2eReceiver"
-RUN_ACTION="ai.openclaw.app.debug.RUN_VOICE_E2E"
-OPEN_ACTION="ai.openclaw.app.debug.OPEN_VOICE_E2E"
+APP_NAMESPACE="ai.openclaw.app"
+PACKAGE_NAME="$APP_NAMESPACE.debug"
+MAIN_ACTIVITY="$PACKAGE_NAME/$APP_NAMESPACE.MainActivity"
+RECEIVER="$PACKAGE_NAME/$APP_NAMESPACE.VoiceE2eReceiver"
+RUN_ACTION="$PACKAGE_NAME.RUN_VOICE_E2E"
+OPEN_ACTION="$PACKAGE_NAME.OPEN_VOICE_E2E"
 PORT=18789
 HOST="127.0.0.1"
 MODE="both"
@@ -146,7 +148,7 @@ fi
 
 adb shell pm grant "$PACKAGE_NAME" android.permission.RECORD_AUDIO >/dev/null 2>&1 || true
 adb shell am force-stop "$PACKAGE_NAME" >/dev/null
-adb shell am start -a "$OPEN_ACTION" -n "$PACKAGE_NAME/.MainActivity" >/dev/null
+adb shell am start -a "$OPEN_ACTION" -n "$MAIN_ACTIVITY" >/dev/null
 adb logcat -c
 
 run_mode() {
@@ -164,7 +166,7 @@ run_mode() {
     no_connect_flag=false
   fi
 
-  adb shell am broadcast \
+  adb shell run-as "$PACKAGE_NAME" am broadcast --user 0 \
     -a "$RUN_ACTION" \
     -n "$RECEIVER" \
     --es mode "$test_mode" \
@@ -224,7 +226,7 @@ adb logcat -d -v time |
   tail -250 >"$ARTIFACT_DIR/logcat.txt" || true
 
 if [[ "$CLEANUP" -eq 1 ]]; then
-  adb shell am broadcast -a "$RUN_ACTION" -n "$RECEIVER" --es mode stop >/dev/null
+  adb shell run-as "$PACKAGE_NAME" am broadcast --user 0 -a "$RUN_ACTION" -n "$RECEIVER" --es mode stop >/dev/null
 fi
 
 echo "$ARTIFACT_DIR"

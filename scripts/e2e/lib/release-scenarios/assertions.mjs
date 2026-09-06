@@ -1,61 +1,33 @@
+// Assertions for release scenario E2E packages and plugin state.
 import fs from "node:fs";
 import path from "node:path";
 import {
   assertAgentReplyContainsMarker,
   assertOpenAiRequestLogUsed,
 } from "../agent-turn-output.mjs";
-import { applyMockOpenAiModelConfig } from "../fixtures/mock-openai-config.mjs";
+import {
+  assertNoLegacyPrimaryAuthRows,
+  assertOpenAiEnvAuthProfileStore,
+  readCanonicalAuthProfileStoreText,
+} from "../auth-profile-store-assertions.mjs";
+import {
+  applyMockOpenAiModelConfig,
+  parseMockOpenAiPort,
+} from "../fixtures/mock-openai-config.mjs";
 import { readPluginInstallRecords } from "../plugin-index-sqlite.mjs";
+import { isExplicitPluginDisableMarker } from "../plugin-uninstall-assertions.mjs";
+import {
+  ERROR_DETAIL_TAIL_BYTES,
+  fileContainsText,
+  readJson,
+} from "../release-assertion-files.mjs";
 import { readTextFileTail } from "../text-file-utils.mjs";
 
 const command = process.argv[2];
 
-const SCAN_CHUNK_BYTES = 64 * 1024;
-const SCAN_CARRY_CHARS = 256;
-const ERROR_DETAIL_TAIL_BYTES = 16 * 1024;
-
 function assert(condition, message) {
   if (!condition) {
     throw new Error(message);
-  }
-}
-
-function readJson(file) {
-  return JSON.parse(fs.readFileSync(file, "utf8"));
-}
-
-function fileContainsText(file, needle) {
-  let stat;
-  try {
-    stat = fs.statSync(file);
-  } catch {
-    return false;
-  }
-  if (!stat.isFile() || stat.size <= 0) {
-    return false;
-  }
-
-  const fd = fs.openSync(file, "r");
-  try {
-    const buffer = Buffer.alloc(Math.min(SCAN_CHUNK_BYTES, stat.size));
-    let carry = "";
-    let offset = 0;
-    while (offset < stat.size) {
-      const bytesToRead = Math.min(buffer.length, stat.size - offset);
-      const bytesRead = fs.readSync(fd, buffer, 0, bytesToRead, offset);
-      if (bytesRead <= 0) {
-        break;
-      }
-      offset += bytesRead;
-      const text = carry + buffer.subarray(0, bytesRead).toString("utf8");
-      if (text.includes(needle)) {
-        return true;
-      }
-      carry = text.slice(-Math.max(SCAN_CARRY_CHARS, needle.length - 1));
-    }
-    return false;
-  } finally {
-    fs.closeSync(fd);
   }
 }
 
@@ -81,13 +53,22 @@ function authProfilesPath() {
   );
 }
 
+function stateDir() {
+  return process.env.OPENCLAW_STATE_DIR ?? path.dirname(configPath());
+}
+
 function readStateText() {
   const paths = [configPath(), authProfilesPath()].filter((file) => fs.existsSync(file));
-  return paths.map((file) => fs.readFileSync(file, "utf8")).join("\n");
+  return [
+    ...paths.map((file) => fs.readFileSync(file, "utf8")),
+    readCanonicalAuthProfileStoreText(stateDir()),
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function configureMockOpenAi() {
-  const mockPort = Number(process.argv[3]);
+  const mockPort = parseMockOpenAiPort(process.argv[3]);
   const cfg = readJson(configPath());
   applyMockOpenAiModelConfig(cfg, { mockPort, includeImageDefaults: true });
   writeConfig(cfg);
@@ -95,10 +76,62 @@ function configureMockOpenAi() {
 
 function assertOpenAiEnvRef() {
   const rawKey = process.argv[3];
-  const state = readStateText();
-  assert(state.includes("OPENAI_API_KEY"), "OpenAI env ref was not persisted");
-  assert(!state.includes(rawKey), "raw OpenAI key was persisted");
   assert(fs.existsSync(configPath()), "openclaw.json missing");
+  assertNoLegacyPrimaryAuthRows(stateDir());
+  assertOpenAiEnvAuthProfileStore(readCanonicalAuthProfileStoreText(stateDir()), {
+    missingMessage: "OpenAI env ref was not persisted",
+    envRefMessage: "OpenAI env ref was not persisted",
+    rawKeyMessage: "raw OpenAI key was persisted",
+    rawKeyNeedle: rawKey,
+  });
+  assert(!readStateText().includes(rawKey), "raw OpenAI key was persisted");
+}
+
+function summarizeKnownValue(value, knownValues) {
+  if (value === undefined) {
+    return "missing";
+  }
+  return knownValues.includes(value) ? value : "unexpected";
+}
+
+function summarizeBoolean(value) {
+  if (value === true || value === false) {
+    return value;
+  }
+  return value === undefined ? "missing" : "unexpected";
+}
+
+function sessionMemoryHookConfigProjection(cfg) {
+  const wizard = cfg?.wizard;
+  const hooks = cfg?.hooks;
+  const internal = hooks?.internal;
+  const sessionMemory = internal?.entries?.["session-memory"];
+  return {
+    wizard: {
+      present: wizard !== undefined,
+      lastRunCommand: summarizeKnownValue(wizard?.lastRunCommand, ["onboard", "configure"]),
+      lastRunMode: summarizeKnownValue(wizard?.lastRunMode, ["local", "remote"]),
+    },
+    hooks: {
+      present: hooks !== undefined,
+      internalPresent: internal !== undefined,
+      internalEnabled: summarizeBoolean(internal?.enabled),
+      sessionMemoryPresent: sessionMemory !== undefined,
+      sessionMemoryEnabled: summarizeBoolean(sessionMemory?.enabled),
+    },
+  };
+}
+
+function assertSessionMemoryHookEnabled() {
+  const cfg = readJson(configPath());
+  if (cfg?.hooks?.internal?.entries?.["session-memory"]?.enabled === true) {
+    return;
+  }
+  throw new Error(
+    `session-memory hook was not enabled. Onboarding config projection: ${JSON.stringify(
+      sessionMemoryHookConfigProjection(cfg),
+    )}`,
+  );
 }
 
 function assertAgentTurn() {
@@ -177,7 +210,10 @@ function assertPluginUninstalled() {
   const cfg = readJson(configPath());
   const installRecords = readPluginInstallRecords({ configPath: configPath() });
   assert(!installRecords[pluginId], `install record still present for ${pluginId}`);
-  assert(!cfg.plugins?.entries?.[pluginId], `plugin config entry still present for ${pluginId}`);
+  assert(
+    isExplicitPluginDisableMarker(cfg, pluginId),
+    `exact disabled uninstall marker missing for ${pluginId}`,
+  );
   const managedRoot = path.join(
     process.env.HOME ?? "",
     ".openclaw",
@@ -195,6 +231,7 @@ function assertPluginUninstalled() {
 const commands = {
   "configure-mock-openai": configureMockOpenAi,
   "assert-openai-env-ref": assertOpenAiEnvRef,
+  "assert-session-memory-hook-enabled": assertSessionMemoryHookEnabled,
   "assert-agent-turn": assertAgentTurn,
   "assert-file-contains": assertFileContains,
   "assert-package-version": assertPackageVersion,

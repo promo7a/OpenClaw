@@ -1,3 +1,4 @@
+// Discord plugin module implements components behavior.
 export {
   DISCORD_COMPONENT_CUSTOM_ID_KEY,
   DISCORD_MODAL_CUSTOM_ID_KEY,
@@ -14,6 +15,7 @@ export {
 } from "./components.builders.js";
 export {
   DISCORD_COMPONENT_ATTACHMENT_PREFIX,
+  coerceDiscordComponentParam,
   readDiscordComponentSpec,
   resolveDiscordComponentAttachmentName,
 } from "./components.parse.js";

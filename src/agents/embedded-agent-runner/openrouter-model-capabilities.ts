@@ -18,11 +18,13 @@
  * capabilities instead of the text-only fallback.
  */
 
+import { normalizeOpenRouterModelPricing } from "@openclaw/model-catalog-core/model-catalog-pricing";
 import { formatErrorMessage } from "../../infra/errors.js";
+import { cancelUnreadResponseBody } from "../../infra/http-body.js";
 import { resolveProxyFetchFromEnv } from "../../infra/net/proxy-fetch.js";
-import { parseStrictFiniteNumber } from "../../infra/parse-finite-number.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { createCorePluginStateSyncKeyedStore } from "../../plugin-state/plugin-state-store.js";
+import { readProviderJsonArrayFieldResponse } from "../provider-http-errors.js";
 
 const log = createSubsystemLogger("openrouter-model-capabilities");
 
@@ -51,27 +53,17 @@ interface OpenRouterApiModel {
     context_length?: number;
     max_completion_tokens?: number;
   };
-  pricing?: {
-    prompt?: string;
-    completion?: string;
-    input_cache_read?: string;
-    input_cache_write?: string;
-  };
+  pricing?: unknown;
 }
 
-export interface OpenRouterModelCapabilities {
+interface OpenRouterModelCapabilities {
   name: string;
   input: Array<"text" | "image">;
   reasoning: boolean;
   supportsTools?: boolean;
   contextWindow: number;
   maxTokens: number;
-  cost: {
-    input: number;
-    output: number;
-    cacheRead: number;
-    cacheWrite: number;
-  };
+  cost: NonNullable<ReturnType<typeof normalizeOpenRouterModelPricing>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -163,11 +155,11 @@ function parseModel(model: OpenRouterApiModel): OpenRouterModelCapabilities {
       model.max_completion_tokens ??
       model.max_output_tokens ??
       8192,
-    cost: {
-      input: (parseStrictFiniteNumber(model.pricing?.prompt) ?? 0) * 1_000_000,
-      output: (parseStrictFiniteNumber(model.pricing?.completion) ?? 0) * 1_000_000,
-      cacheRead: (parseStrictFiniteNumber(model.pricing?.input_cache_read) ?? 0) * 1_000_000,
-      cacheWrite: (parseStrictFiniteNumber(model.pricing?.input_cache_write) ?? 0) * 1_000_000,
+    cost: normalizeOpenRouterModelPricing(model.pricing) ?? {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
     },
   };
 }
@@ -179,10 +171,11 @@ function parseModel(model: OpenRouterApiModel): OpenRouterModelCapabilities {
 async function doFetch(): Promise<void> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  let response: Response | undefined;
   try {
     const fetchFn = resolveProxyFetchFromEnv() ?? globalThis.fetch;
 
-    const response = await fetchFn(OPENROUTER_MODELS_URL, {
+    response = await fetchFn(OPENROUTER_MODELS_URL, {
       signal: controller.signal,
     });
 
@@ -191,12 +184,19 @@ async function doFetch(): Promise<void> {
       return;
     }
 
-    const data = (await response.json()) as { data?: OpenRouterApiModel[] };
-    const models = data.data ?? [];
+    const models = await readProviderJsonArrayFieldResponse(
+      response,
+      "OpenRouter models response",
+      "data",
+    );
     const map = new Map<string, OpenRouterModelCapabilities>();
 
-    for (const model of models) {
-      if (!model.id) {
+    for (const value of models) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        continue;
+      }
+      const model = value as OpenRouterApiModel;
+      if (typeof model.id !== "string" || !model.id) {
         continue;
       }
       map.set(model.id, parseModel(model));
@@ -210,6 +210,7 @@ async function doFetch(): Promise<void> {
     log.warn(`Failed to fetch OpenRouter models: ${message}`);
   } finally {
     clearTimeout(timeout);
+    await cancelUnreadResponseBody(response);
   }
 }
 
@@ -282,12 +283,17 @@ export async function loadOpenRouterModelCapabilities(modelId: string): Promise<
 export function getOpenRouterModelCapabilities(
   modelId: string,
 ): OpenRouterModelCapabilities | undefined {
-  ensureOpenRouterModelCache();
+  // A failed awaited load, such as an oversized catalog body, already attempted
+  // a refresh. Do not let the follow-up sync lookup immediately retry it.
+  const skipMissRefresh = skipNextMissRefresh.delete(modelId);
+  if (!skipMissRefresh) {
+    ensureOpenRouterModelCache();
+  }
   const result = cache?.get(modelId);
 
   // Model not found but cache exists — may be a newly added model.
   // Trigger a refresh so the next call picks it up.
-  if (!result && skipNextMissRefresh.delete(modelId)) {
+  if (!result && skipMissRefresh) {
     return undefined;
   }
   if (!result && cache && !fetchInFlight) {

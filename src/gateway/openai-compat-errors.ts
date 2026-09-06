@@ -1,7 +1,9 @@
-import type { FailoverReason } from "../agents/embedded-agent-helpers/types.js";
 import { describeFailoverError, resolveFailoverStatus } from "../agents/failover-error.js";
+// OpenAI-compatible error helpers.
+// Converts OpenClaw failover/sampling errors to OpenAI-style HTTP responses.
+import type { FailoverReason } from "../agents/failover/signal.js";
 
-export type OpenAiCompatError = {
+type OpenAiCompatError = {
   status: number;
   error: {
     message: string;
@@ -10,18 +12,24 @@ export type OpenAiCompatError = {
   };
 };
 
-const ERROR_TYPE_BY_REASON: Partial<Record<FailoverReason, string>> = {
+const ERROR_TYPE_BY_REASON = {
   auth: "authentication_error",
   auth_permanent: "permission_error",
-  billing: "insufficient_quota",
   format: "invalid_request_error",
-  model_not_found: "invalid_request_error",
-  overloaded: "api_error",
   rate_limit: "rate_limit_error",
+  overloaded: "api_error",
+  billing: "insufficient_quota",
   server_error: "api_error",
-  session_expired: "invalid_request_error",
   timeout: "api_error",
-};
+  tls_certificate: "api_error",
+  context_overflow: "invalid_request_error",
+  model_not_found: "invalid_request_error",
+  session_expired: "invalid_request_error",
+  empty_response: undefined,
+  no_error_details: undefined,
+  unclassified: undefined,
+  unknown: undefined,
+} satisfies Record<FailoverReason, string | undefined>;
 
 function statusForReason(reason: FailoverReason, status: number | undefined): number {
   if (reason === "server_error") {
@@ -50,6 +58,7 @@ function messageForReason(params: {
   return params.rawError?.trim() || params.message.trim() || "request failed";
 }
 
+/** Converts a provider failover error into an OpenAI-compatible error envelope. */
 export function resolveOpenAiCompatError(err: unknown): OpenAiCompatError | undefined {
   const described = describeFailoverError(err);
   const reason = described.reason;
@@ -76,6 +85,7 @@ export function resolveOpenAiCompatError(err: unknown): OpenAiCompatError | unde
   };
 }
 
+/** Validates OpenAI-compatible sampling parameters before provider dispatch. */
 export function validateOpenAiSamplingParams(params: {
   temperature?: unknown;
   topP?: unknown;

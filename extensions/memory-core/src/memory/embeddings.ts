@@ -1,17 +1,17 @@
+// Memory Core plugin module implements embeddings behavior.
 import {
-  getEmbeddingProvider,
-  type EmbeddingProviderAdapter,
-  type EmbeddingProvider as GenericEmbeddingProvider,
-  type EmbeddingProviderRuntime as GenericEmbeddingProviderRuntime,
-} from "openclaw/plugin-sdk/embedding-providers";
-import {
-  getMemoryEmbeddingProvider as getLegacyMemoryEmbeddingProvider,
+  getMemoryEmbeddingProvider,
   type MemoryEmbeddingProvider,
   type MemoryEmbeddingProviderAdapter,
   type MemoryEmbeddingProviderCreateOptions,
   type MemoryEmbeddingProviderRuntime,
 } from "openclaw/plugin-sdk/memory-core-host-engine-embeddings";
 import { formatErrorMessage } from "../dreaming-shared.js";
+import type { MemoryCoreAcquireLocalService } from "./embedding-local-service.js";
+import {
+  createMissingLocalMemoryEmbeddingProviderError,
+  LOCAL_MEMORY_EMBEDDING_PROVIDER_ID,
+} from "./local-embedding-provider.js";
 
 export type EmbeddingProvider = MemoryEmbeddingProvider;
 export type EmbeddingProviderId = string;
@@ -28,82 +28,14 @@ export type EmbeddingProviderResult = {
   runtime?: EmbeddingProviderRuntime;
 };
 
-type CreateEmbeddingProviderOptions = MemoryEmbeddingProviderCreateOptions & {
+type CreateEmbeddingProviderOptions = Omit<MemoryEmbeddingProviderCreateOptions, "dimensions"> & {
   provider: EmbeddingProviderRequest;
   fallback: EmbeddingProviderFallback;
+  outputDimensionality?: number;
+  acquireLocalService?: MemoryCoreAcquireLocalService;
 };
 
 const DEFAULT_MEMORY_EMBEDDING_PROVIDER = "openai";
-
-function adaptGenericEmbeddingProvider(
-  provider: GenericEmbeddingProvider,
-): MemoryEmbeddingProvider {
-  return {
-    id: provider.id,
-    model: provider.model,
-    ...(typeof provider.maxInputTokens === "number"
-      ? { maxInputTokens: provider.maxInputTokens }
-      : {}),
-    embedQuery: async (text, options) =>
-      await provider.embed(text, {
-        ...options,
-        inputType: "query",
-      }),
-    embedBatch: async (texts, options) =>
-      await provider.embedBatch(texts, {
-        ...options,
-        inputType: "document",
-      }),
-    embedBatchInputs: async (inputs, options) =>
-      await provider.embedBatch(inputs, {
-        ...options,
-        inputType: "document",
-      }),
-    ...(provider.close ? { close: provider.close } : {}),
-  };
-}
-
-function adaptGenericRuntime(
-  runtime: GenericEmbeddingProviderRuntime | undefined,
-): MemoryEmbeddingProviderRuntime | undefined {
-  if (!runtime) {
-    return undefined;
-  }
-  return {
-    id: runtime.id,
-    ...(runtime.cacheKeyData ? { cacheKeyData: runtime.cacheKeyData } : {}),
-    ...(typeof runtime.inlineQueryTimeoutMs === "number"
-      ? { inlineQueryTimeoutMs: runtime.inlineQueryTimeoutMs }
-      : {}),
-    ...(typeof runtime.inlineBatchTimeoutMs === "number"
-      ? { inlineBatchTimeoutMs: runtime.inlineBatchTimeoutMs }
-      : {}),
-  };
-}
-
-function adaptGenericEmbeddingAdapter(
-  adapter: EmbeddingProviderAdapter,
-): MemoryEmbeddingProviderAdapter {
-  return {
-    id: adapter.id,
-    ...(adapter.defaultModel ? { defaultModel: adapter.defaultModel } : {}),
-    ...(adapter.transport ? { transport: adapter.transport } : {}),
-    ...(adapter.authProviderId ? { authProviderId: adapter.authProviderId } : {}),
-    ...(adapter.formatSetupError ? { formatSetupError: adapter.formatSetupError } : {}),
-    create: async (options) => {
-      const result = await adapter.create({
-        ...options,
-        ...(typeof options.outputDimensionality === "number"
-          ? { dimensions: options.outputDimensionality }
-          : {}),
-      });
-      return {
-        provider: result.provider ? adaptGenericEmbeddingProvider(result.provider) : null,
-        runtime: adaptGenericRuntime(result.runtime),
-      };
-    },
-  };
-}
 
 function formatProviderError(adapter: MemoryEmbeddingProviderAdapter, err: unknown): string {
   return adapter.formatSetupError?.(err) ?? formatErrorMessage(err);
@@ -113,26 +45,31 @@ function getAdapter(
   id: string,
   config?: MemoryEmbeddingProviderCreateOptions["config"],
 ): MemoryEmbeddingProviderAdapter {
-  const adapter = getLegacyMemoryEmbeddingProvider(id, config);
+  const adapter = getMemoryEmbeddingProvider(id, config);
   if (adapter) {
     return adapter;
   }
-  const genericAdapter = getEmbeddingProvider(id, config);
-  if (genericAdapter) {
-    return adaptGenericEmbeddingAdapter(genericAdapter);
+  if (id === LOCAL_MEMORY_EMBEDDING_PROVIDER_ID) {
+    throw createMissingLocalMemoryEmbeddingProviderError();
   }
   throw new Error(`Unknown memory embedding provider: ${id}`);
 }
 
-function resolveProviderModel(
+function resolveAdapterCreateOptions(
   adapter: MemoryEmbeddingProviderAdapter,
-  requestedModel: string,
-): string {
-  const trimmed = requestedModel.trim();
-  if (trimmed) {
-    return trimmed;
-  }
-  return adapter.defaultModel ?? "";
+  options: CreateEmbeddingProviderOptions,
+): MemoryEmbeddingProviderCreateOptions {
+  const { outputDimensionality, ...base } = options;
+  const createOptions = {
+    ...base,
+    fallback: "none",
+    model: options.model.trim() || adapter.defaultModel || "",
+    ...(typeof outputDimensionality === "number" ? { dimensions: outputDimensionality } : {}),
+  };
+  return {
+    ...createOptions,
+    model: adapter.normalizeModel?.(createOptions) ?? createOptions.model,
+  };
 }
 
 export function resolveEmbeddingProviderFallbackModel(
@@ -140,20 +77,55 @@ export function resolveEmbeddingProviderFallbackModel(
   fallbackSourceModel: string,
   config?: MemoryEmbeddingProviderCreateOptions["config"],
 ): string {
-  const adapter =
-    getLegacyMemoryEmbeddingProvider(providerId, config) ??
-    getEmbeddingProvider(providerId, config);
+  const adapter = getMemoryEmbeddingProvider(providerId, config);
   return adapter?.defaultModel ?? fallbackSourceModel;
+}
+
+export function resolveEmbeddingProviderFallbackRemote(
+  remote: MemoryEmbeddingProviderCreateOptions["remote"],
+): MemoryEmbeddingProviderCreateOptions["remote"] {
+  if (!remote) {
+    return undefined;
+  }
+  // Endpoint and auth belong to the primary provider; batch settings are safe to reuse.
+  const { baseUrl: _baseUrl, apiKey: _apiKey, headers: _headers, ...sharedRemote } = remote;
+  return Object.keys(sharedRemote).length > 0 ? sharedRemote : undefined;
+}
+
+export function resolveEmbeddingProviderAdapterTransport(
+  providerId: string,
+  config?: MemoryEmbeddingProviderCreateOptions["config"],
+): MemoryEmbeddingProviderAdapter["transport"] {
+  try {
+    return getAdapter(providerId, config).transport;
+  } catch {
+    return undefined;
+  }
+}
+
+export function resolveEmbeddingProviderIndexIdentity(options: CreateEmbeddingProviderOptions) {
+  const provider =
+    options.provider === "auto" ? DEFAULT_MEMORY_EMBEDDING_PROVIDER : options.provider;
+  try {
+    const adapter = getAdapter(provider, options.config);
+    const createOptions = resolveAdapterCreateOptions(adapter, { ...options, provider });
+    const identity = adapter.resolveIndexIdentity?.(createOptions);
+    return {
+      provider: { id: adapter.id, model: identity?.model ?? createOptions.model },
+      cacheKeyData: identity?.cacheKeyData,
+      aliases: identity?.aliases,
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 async function createWithAdapter(
   adapter: MemoryEmbeddingProviderAdapter,
   options: CreateEmbeddingProviderOptions,
 ): Promise<EmbeddingProviderResult> {
-  const result = await adapter.create({
-    ...options,
-    model: resolveProviderModel(adapter, options.model),
-  });
+  const createOptions = resolveAdapterCreateOptions(adapter, options);
+  const result = await adapter.create(createOptions);
   return {
     provider: result.provider,
     requestedProvider: options.provider,
@@ -180,6 +152,7 @@ export async function createEmbeddingProvider(
         const fallbackResult = await createWithAdapter(fallbackAdapter, {
           ...options,
           provider: options.fallback,
+          remote: resolveEmbeddingProviderFallbackRemote(options.remote),
         });
         return {
           ...fallbackResult,

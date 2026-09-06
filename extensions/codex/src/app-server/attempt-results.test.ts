@@ -1,4 +1,4 @@
-import type { EmbeddedRunAttemptResult } from "openclaw/plugin-sdk/agent-harness-runtime";
+// Codex tests cover attempt results plugin behavior.
 import { describe, expect, it } from "vitest";
 import {
   buildCodexAppServerPromptTimeoutOutcome,
@@ -6,15 +6,11 @@ import {
   isInvalidCodexImagePayloadError,
   resolveCodexAppServerReplayBlockedReason,
 } from "./attempt-results.js";
+import type { EmbeddedRunAttemptResult } from "./attempt-terminal.js";
 
 function createResult(overrides: Partial<EmbeddedRunAttemptResult> = {}): EmbeddedRunAttemptResult {
   return {
-    aborted: false,
-    externalAbort: false,
-    timedOut: false,
-    idleTimedOut: false,
-    timedOutDuringCompaction: false,
-    timedOutDuringToolExecution: false,
+    terminal: { kind: "ok" },
     sessionIdUsed: "session-1",
     messagesSnapshot: [],
     assistantTexts: [],
@@ -49,67 +45,28 @@ describe("Codex app-server attempt results", () => {
     ).toBe("first \n\nsecond");
   });
 
-  it("builds timeout outcomes from completion and side-effect evidence", () => {
-    expect(
-      buildCodexAppServerPromptTimeoutOutcome({
-        result: createResult(),
-        turnCompletionIdleTimedOut: false,
-      }),
-    ).toBeUndefined();
-    expect(
-      buildCodexAppServerPromptTimeoutOutcome({
-        result: createResult(),
-        turnCompletionIdleTimedOut: true,
-      }),
-    ).toBeUndefined();
-    expect(
-      buildCodexAppServerPromptTimeoutOutcome({
-        result: createResult({
-          itemLifecycle: { startedCount: 1, completedCount: 1, activeCount: 0 },
-        }),
-        turnCompletionIdleTimedOut: true,
-      }),
-    ).toEqual({
+  it("does not invent a timeout outcome without a deadline failure", () => {
+    expect(buildCodexAppServerPromptTimeoutOutcome(undefined)).toBeUndefined();
+  });
+
+  it.each([
+    {
+      kind: "execution" as const,
       message:
-        "Codex stopped before confirming the turn was complete. The response may be incomplete; retry if needed.",
-    });
-    expect(
-      buildCodexAppServerPromptTimeoutOutcome({
-        result: createResult({
-          replayMetadata: {
-            hadPotentialSideEffects: true,
-            replaySafe: false,
-          },
-        }),
-        turnCompletionIdleTimedOut: true,
-      }),
-    ).toEqual({
+        "Codex reached the configured execution time limit. Some work may already have been performed; verify the current state before continuing.",
+    },
+    {
+      kind: "settlement" as const,
       message:
-        "Codex stopped before confirming the turn was complete. Some work may already have been performed; verify the current state before retrying.",
+        "Codex finished its turn, but OpenClaw could not finish processing the result. Some work may already have been performed; verify the current state before continuing.",
+    },
+  ])("reports the $kind owner and prevents automatic replay", ({ kind, message }) => {
+    expect(
+      buildCodexAppServerPromptTimeoutOutcome({ kind, elapsedMs: 120_000, timeoutMs: 120_000 }),
+    ).toEqual({
+      message,
       replayInvalid: true,
       livenessState: "abandoned",
-    });
-    expect(
-      buildCodexAppServerPromptTimeoutOutcome({
-        result: createResult({
-          assistantTexts: ["I am changing the data model now..."],
-        }),
-        turnCompletionIdleTimedOut: true,
-      }),
-    ).toEqual({
-      message:
-        "Codex stopped before confirming the turn was complete. The response may be incomplete; retry if needed.",
-    });
-    expect(
-      buildCodexAppServerPromptTimeoutOutcome({
-        result: createResult({
-          toolMetas: [{ toolName: "exec" }],
-        }),
-        turnCompletionIdleTimedOut: true,
-      }),
-    ).toEqual({
-      message:
-        "Codex stopped before confirming the turn was complete. The response may be incomplete; retry if needed.",
     });
   });
 

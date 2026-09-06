@@ -1,3 +1,9 @@
+import { expectDefined } from "@openclaw/normalization-core"; /**
+ * PCM resampling and G.711 mu-law conversion helpers for Talk audio bridges.
+ *
+ * Telephony providers generally expect 8 kHz mu-law frames, while local audio
+ * capture and realtime providers can produce higher-rate signed 16-bit PCM.
+ */
 const TELEPHONY_SAMPLE_RATE = 8000;
 const RESAMPLE_FILTER_TAPS = 31;
 const RESAMPLE_CUTOFF_GUARD = 0.94;
@@ -14,12 +20,23 @@ type ResampleKernel = {
   phaseCount: number;
 };
 
+type ResamplePlan = {
+  cutoffCyclesPerSample: number;
+  inputSampleRate: number;
+  kernel: ResampleKernel | undefined;
+  outputSampleRate: number;
+  ratio: number;
+};
+
 const HOST_IS_LITTLE_ENDIAN = new Uint16Array(new Uint8Array([1, 0]).buffer)[0] === 1;
 
+/** Clamp an intermediate sample to signed 16-bit PCM range. */
 function clamp16(value: number): number {
   return Math.max(-32768, Math.min(32767, value));
 }
 
+// When the host and Buffer alignment allow it, an Int16Array view avoids copying
+// every PCM sample. The fallback below preserves correctness for odd offsets.
 function canUseInt16View(buffer: Buffer): boolean {
   return HOST_IS_LITTLE_ENDIAN && buffer.byteOffset % Int16Array.BYTES_PER_ELEMENT === 0;
 }
@@ -73,6 +90,8 @@ function buildResampleKernel(
   const inputStep = inputSampleRate / divisor;
   const phaseCount = outputSampleRate / divisor;
   if (phaseCount > RESAMPLE_MAX_PRECOMPUTED_PHASES) {
+    // Very unusual rate ratios would allocate too many phase tables; callers
+    // fall back to the direct bandlimited sampler instead.
     return undefined;
   }
   const coefficients = Array.from({ length: phaseCount }, (_, phaseIndex) => {
@@ -89,6 +108,7 @@ function buildResampleKernel(
   return { coefficients, inputStep, phaseCount };
 }
 
+// Samples through a precomputed windowed-sinc kernel for common rate ratios.
 function sampleBandlimitedWithCoefficients(
   input: Int16Array,
   center: number,
@@ -115,6 +135,7 @@ function sampleBandlimitedWithCoefficients(
   return weighted / weightSum;
 }
 
+// Direct windowed-sinc sampler used when precomputing phase tables is too large.
 function sampleBandlimited(
   input: Int16Array,
   srcPos: number,
@@ -145,6 +166,71 @@ function sampleBandlimited(
   return weighted / weightSum;
 }
 
+function createResamplePlan(inputSampleRate: number, outputSampleRate: number): ResamplePlan {
+  const ratio = inputSampleRate / outputSampleRate;
+  const maxCutoff = 0.5;
+  const downsampleCutoff = ratio > 1 ? maxCutoff / ratio : maxCutoff;
+  const cutoffCyclesPerSample = Math.max(0.01, downsampleCutoff * RESAMPLE_CUTOFF_GUARD);
+  return {
+    cutoffCyclesPerSample,
+    inputSampleRate,
+    kernel: buildResampleKernel(inputSampleRate, outputSampleRate, cutoffCyclesPerSample),
+    outputSampleRate,
+    ratio,
+  };
+}
+
+function sampleResampledPcm(
+  input: Int16Array,
+  inputStartSample: number,
+  outputIndex: number,
+  plan: ResamplePlan,
+): number {
+  const sourcePosition = (outputIndex * plan.inputSampleRate) / plan.outputSampleRate;
+  return Math.round(
+    plan.kernel
+      ? sampleBandlimitedWithCoefficients(
+          input,
+          Math.floor(sourcePosition) - inputStartSample,
+          expectDefined(
+            plan.kernel.coefficients[
+              (outputIndex * plan.kernel.inputStep) % plan.kernel.phaseCount
+            ],
+            "coefficients entry at (output index * kernel input step) % kernel phase count",
+          ) ?? plan.kernel.coefficients[0],
+        )
+      : sampleBandlimited(
+          input,
+          outputIndex * plan.ratio - inputStartSample,
+          plan.cutoffCyclesPerSample,
+        ),
+  );
+}
+
+function renderResampledPcm(
+  input: Buffer,
+  inputStartSample: number,
+  firstOutputIndex: number,
+  outputSamples: number,
+  plan: ResamplePlan,
+): Buffer {
+  const output = Buffer.alloc(outputSamples * 2);
+  const inputView = readInt16Samples(input);
+  const outputView = canUseInt16View(output) ? int16View(output) : undefined;
+  for (let offset = 0; offset < outputSamples; offset += 1) {
+    const sample = clamp16(
+      sampleResampledPcm(inputView, inputStartSample, firstOutputIndex + offset, plan),
+    );
+    if (outputView) {
+      outputView[offset] = sample;
+    } else {
+      output.writeInt16LE(sample, offset * 2);
+    }
+  }
+  return output;
+}
+
+/** Resample little-endian signed 16-bit PCM to another integer sample rate. */
 export function resamplePcm(
   input: Buffer,
   inputSampleRate: number,
@@ -158,42 +244,101 @@ export function resamplePcm(
     return Buffer.alloc(0);
   }
 
-  const ratio = inputSampleRate / outputSampleRate;
-  const outputSamples = Math.floor(inputSamples / ratio);
-  const output = Buffer.alloc(outputSamples * 2);
-  const maxCutoff = 0.5;
-  const downsampleCutoff = ratio > 1 ? maxCutoff / ratio : maxCutoff;
-  const cutoffCyclesPerSample = Math.max(0.01, downsampleCutoff * RESAMPLE_CUTOFF_GUARD);
-  const kernel = buildResampleKernel(inputSampleRate, outputSampleRate, cutoffCyclesPerSample);
-
-  const inputView = readInt16Samples(input);
-  const outputView = canUseInt16View(output) ? int16View(output) : undefined;
-
-  for (let i = 0; i < outputSamples; i += 1) {
-    const sample = Math.round(
-      kernel
-        ? sampleBandlimitedWithCoefficients(
-            inputView,
-            Math.floor((i * inputSampleRate) / outputSampleRate),
-            kernel.coefficients[(i * kernel.inputStep) % kernel.phaseCount] ??
-              kernel.coefficients[0],
-          )
-        : sampleBandlimited(inputView, i * ratio, cutoffCyclesPerSample),
-    );
-    if (outputView) {
-      outputView[i] = clamp16(sample);
-    } else {
-      output.writeInt16LE(clamp16(sample), i * 2);
-    }
-  }
-
-  return output;
+  const plan = createResamplePlan(inputSampleRate, outputSampleRate);
+  const outputSamples = Math.floor(inputSamples / plan.ratio);
+  return renderResampledPcm(input, 0, 0, outputSamples, plan);
 }
 
+/** Create a chunk-safe PCM resampler that preserves filter and fractional phase state. */
+export function createStreamingPcmResampler(
+  inputSampleRate: number,
+  outputSampleRate: number,
+): {
+  process(chunk: Buffer): Buffer;
+  flush(): Buffer;
+} {
+  if (inputSampleRate === outputSampleRate) {
+    return {
+      process: (chunk) => Buffer.from(chunk),
+      flush: () => Buffer.alloc(0),
+    };
+  }
+
+  const plan = createResamplePlan(inputSampleRate, outputSampleRate);
+  let bufferedInput = Buffer.alloc(0);
+  let inputStartSample = 0;
+  let totalInputSamples = 0;
+  let nextOutputIndex = 0;
+  let trailingByte = Buffer.alloc(0);
+  let flushed = false;
+
+  const renderAvailable = (includeRightEdge: boolean): Buffer => {
+    const targetOutputCount = Math.floor(totalInputSamples / plan.ratio);
+    let endOutputIndex = nextOutputIndex;
+    while (endOutputIndex < targetOutputCount) {
+      const center = Math.floor((endOutputIndex * plan.inputSampleRate) / plan.outputSampleRate);
+      if (!includeRightEdge && center + RESAMPLE_HALF_TAPS >= totalInputSamples) {
+        break;
+      }
+      endOutputIndex += 1;
+    }
+
+    const output = renderResampledPcm(
+      bufferedInput,
+      inputStartSample,
+      nextOutputIndex,
+      endOutputIndex - nextOutputIndex,
+      plan,
+    );
+    nextOutputIndex = endOutputIndex;
+
+    const nextCenter = Math.floor((nextOutputIndex * plan.inputSampleRate) / plan.outputSampleRate);
+    const retainFromSample = Math.max(0, nextCenter - RESAMPLE_HALF_TAPS);
+    const dropSamples = retainFromSample - inputStartSample;
+    if (dropSamples > 0) {
+      bufferedInput = Buffer.from(bufferedInput.subarray(dropSamples * 2));
+      inputStartSample = retainFromSample;
+    }
+    return output;
+  };
+
+  return {
+    process(chunk) {
+      if (flushed) {
+        throw new Error("Cannot process PCM after the streaming resampler was flushed");
+      }
+      const combined = trailingByte.length > 0 ? Buffer.concat([trailingByte, chunk]) : chunk;
+      const completeBytes = combined.length - (combined.length % 2);
+      trailingByte = Buffer.from(combined.subarray(completeBytes));
+      if (completeBytes > 0) {
+        const completePcm = combined.subarray(0, completeBytes);
+        bufferedInput =
+          bufferedInput.length > 0
+            ? Buffer.concat([bufferedInput, completePcm])
+            : Buffer.from(completePcm);
+        totalInputSamples += completeBytes / 2;
+      }
+      return renderAvailable(false);
+    },
+    flush() {
+      if (flushed) {
+        return Buffer.alloc(0);
+      }
+      flushed = true;
+      trailingByte = Buffer.alloc(0);
+      const output = renderAvailable(true);
+      bufferedInput = Buffer.alloc(0);
+      return output;
+    },
+  };
+}
+
+/** Resample little-endian signed 16-bit PCM to the telephony 8 kHz rate. */
 export function resamplePcmTo8k(input: Buffer, inputSampleRate: number): Buffer {
   return resamplePcm(input, inputSampleRate, TELEPHONY_SAMPLE_RATE);
 }
 
+/** Convert little-endian signed 16-bit PCM samples to G.711 mu-law bytes. */
 export function pcmToMulaw(pcm: Buffer): Buffer {
   const pcmView = readInt16Samples(pcm);
   const mulaw = Buffer.alloc(pcmView.length);
@@ -205,6 +350,7 @@ export function pcmToMulaw(pcm: Buffer): Buffer {
   return mulaw;
 }
 
+/** Expand G.711 mu-law bytes into little-endian signed 16-bit PCM samples. */
 export function mulawToPcm(mulaw: Buffer): Buffer {
   const pcm = Buffer.alloc(mulaw.length * 2);
   const pcmView = canUseInt16View(pcm) ? int16View(pcm) : undefined;
@@ -221,10 +367,13 @@ export function mulawToPcm(mulaw: Buffer): Buffer {
   return pcm;
 }
 
+/** Resample signed 16-bit PCM to 8 kHz and encode it as G.711 mu-law. */
 export function convertPcmToMulaw8k(pcm: Buffer, inputSampleRate: number): Buffer {
   return pcmToMulaw(resamplePcmTo8k(pcm, inputSampleRate));
 }
 
+// ITU G.711-style mu-law companding. The bias and clip constants intentionally
+// match the standard table formula so round-trips remain provider-compatible.
 function linearToMulaw(sampleInput: number): number {
   let sample = sampleInput;
   const BIAS = 132;

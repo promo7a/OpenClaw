@@ -1,19 +1,12 @@
+// Checks gateway port usage and reports listener diagnostics.
 import { danger, info, shouldLogVerbose, warn } from "../globals.js";
 import { logDebug } from "../logger.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { defaultRuntime } from "../runtime.js";
 import { isErrno } from "./errors.js";
 import { formatPortDiagnostics } from "./ports-format.js";
-import { inspectPortUsage } from "./ports-inspect.js";
 import { tryListenOnPort } from "./ports-probe.js";
-import type {
-  PortConnection,
-  PortConnections,
-  PortListener,
-  PortListenerKind,
-  PortUsage,
-  PortUsageStatus,
-} from "./ports-types.js";
+import type { PortUsage } from "./ports-types.js";
 
 class PortInUseError extends Error {
   port: number;
@@ -28,6 +21,7 @@ class PortInUseError extends Error {
 }
 
 export async function describePortOwner(port: number): Promise<string | undefined> {
+  const { inspectPortUsage } = await import("./ports-inspect.js");
   const diagnostics = await inspectPortUsage(port);
   if (diagnostics.listeners.length === 0) {
     return undefined;
@@ -35,10 +29,16 @@ export async function describePortOwner(port: number): Promise<string | undefine
   return formatPortDiagnostics(diagnostics).join("\n");
 }
 
-export async function ensurePortAvailable(port: number): Promise<void> {
+/** Probes Node's wildcard bind by default; callers may scope checks to their owned interface. */
+export async function ensurePortAvailable(
+  port: number,
+  host?: string,
+  signal?: AbortSignal,
+): Promise<void> {
   // Detect EADDRINUSE early with a friendly message.
   try {
-    await tryListenOnPort({ port });
+    const probe = { port, ...(host ? { host } : {}), ...(signal ? { signal } : {}) };
+    await tryListenOnPort(probe);
   } catch (err) {
     if (isErrno(err) && err.code === "EADDRINUSE") {
       throw new PortInUseError(port);
@@ -92,20 +92,10 @@ export async function handlePortError(
 }
 
 export { PortInUseError };
-export type {
-  PortConnection,
-  PortConnections,
-  PortListener,
-  PortListenerKind,
-  PortUsage,
-  PortUsageStatus,
-};
+export type { PortUsage };
 export {
-  buildPortHints,
   classifyPortListener,
   formatPortDiagnostics,
   isDualStackLoopbackGatewayListeners,
   isExpectedGatewayListeners,
-  isSingleExpectedGatewayListener,
 } from "./ports-format.js";
-export { inspectPortConnections, inspectPortUsage } from "./ports-inspect.js";

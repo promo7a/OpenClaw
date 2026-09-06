@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// Resolves SecretRef requests against Bitwarden Secrets Manager without printing secrets.
 import { execFileSync } from "node:child_process";
 
 const readStdin = () =>
@@ -50,6 +51,7 @@ const main = async () => {
     encoding: "utf8",
     env: {
       BWS_ACCESS_TOKEN: process.env.BWS_ACCESS_TOKEN,
+      BWS_SERVER_URL: process.env.BWS_SERVER_URL,
       PATH: process.env.PATH || "",
     },
     maxBuffer: 1024 * 1024,
@@ -79,9 +81,9 @@ const main = async () => {
     if (matches.length === 1) {
       values[id] = matches[0];
     } else if (matches.length > 1) {
-      errors[id] = { message: "ambiguous duplicate key" };
+      errors[id] = { code: "AMBIGUOUS_DUPLICATE_KEY" };
     } else {
-      errors[id] = { message: "not found" };
+      errors[id] = { code: "NOT_FOUND" };
     }
   }
 

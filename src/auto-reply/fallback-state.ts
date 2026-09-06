@@ -1,14 +1,12 @@
+/** Formats model-fallback notice state for UI/status messages and persisted transition tracking. */
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { formatRawAssistantErrorForUi } from "../agents/embedded-agent-helpers.js";
 import { areRuntimeModelRefsEquivalent } from "../agents/model-runtime-aliases.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { FallbackNoticeState } from "../status/fallback-notice-state.js";
 import { formatProviderModelRef } from "./model-runtime.js";
-import type { RuntimeFallbackAttempt } from "./reply/agent-runner-execution.js";
-export {
-  resolveActiveFallbackState,
-  type FallbackNoticeState,
-} from "../status/fallback-notice-state.js";
+import type { RuntimeFallbackAttempt } from "./reply/agent-runner-execution.types.js";
 
 const FALLBACK_REASON_PART_MAX = 80;
 const TRANSIENT_FALLBACK_REASONS = new Set([
@@ -20,14 +18,14 @@ const TRANSIENT_FALLBACK_REASONS = new Set([
   "unclassified",
 ]);
 const TRANSIENT_ERROR_DETAIL_HINT_RE =
-  /\b(?:429|5\d\d|too many requests|usage limit|quota|try again in|retry[- ]after|seconds?|minutes?|hours?|temporarily unavailable|overloaded|service unavailable|throttl)\b/i;
+  /\b(?:429|5\d\d|too many requests|usage limit|quota|try again in|retry[- ]after|seconds?|minutes?|hours?|temporarily unavailable|overloaded|service unavailable|throttl\w*)\b/i;
 
 function truncateFallbackReasonPart(value: string, max = FALLBACK_REASON_PART_MAX): string {
   const text = value.replace(/\s+/g, " ").trim();
   if (text.length <= max) {
     return text;
   }
-  return `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
+  return `${truncateUtf16Safe(text, max - 1).trimEnd()}…`;
 }
 
 function formatFallbackAttemptErrorPreview(attempt: RuntimeFallbackAttempt): string | undefined {
@@ -38,6 +36,7 @@ function formatFallbackAttemptErrorPreview(attempt: RuntimeFallbackAttempt): str
   if (!attempt.reason || !TRANSIENT_FALLBACK_REASONS.has(attempt.reason)) {
     return undefined;
   }
+  // Only expose transient-looking raw details; permanent/auth errors can leak noisy provider text.
   if (!TRANSIENT_ERROR_DETAIL_HINT_RE.test(rawError)) {
     return undefined;
   }
@@ -89,6 +88,7 @@ function buildFallbackAttemptSummaries(attempts: RuntimeFallbackAttempt[]): stri
   );
 }
 
+/** Builds the visible notice shown when runtime falls back from the selected model. */
 export function buildFallbackNotice(params: {
   selectedProvider: string;
   selectedModel: string;
@@ -106,6 +106,7 @@ export function buildFallbackNotice(params: {
   return `↪️ Model Fallback: ${active} (selected ${selected}; ${reasonSummary})`;
 }
 
+/** Builds the visible notice shown when runtime returns to the selected model. */
 export function buildFallbackClearedNotice(params: {
   selectedProvider: string;
   selectedModel: string;
@@ -140,6 +141,7 @@ type ResolvedFallbackTransition = {
   stateChanged: boolean;
 };
 
+/** Resolves fallback state transitions and the next persisted notice-state fields. */
 export function resolveFallbackTransition(params: {
   selectedProvider: string;
   selectedModel: string;
@@ -152,9 +154,9 @@ export function resolveFallbackTransition(params: {
   const selectedModelRef = formatProviderModelRef(params.selectedProvider, params.selectedModel);
   const activeModelRef = formatProviderModelRef(params.activeProvider, params.activeModel);
   const previousState = {
-    selectedModel: normalizeOptionalString(params.state?.fallbackNoticeSelectedModel),
-    activeModel: normalizeOptionalString(params.state?.fallbackNoticeActiveModel),
-    reason: normalizeOptionalString(params.state?.fallbackNoticeReason),
+    selectedModel: normalizeOptionalString(params.state?.fallbackNotice?.selectedModel),
+    activeModel: normalizeOptionalString(params.state?.fallbackNotice?.activeModel),
+    reason: normalizeOptionalString(params.state?.fallbackNotice?.reason),
   };
   const comparisonOptions = { config: params.cfg };
   const fallbackActive = !areRuntimeModelRefsEquivalent(

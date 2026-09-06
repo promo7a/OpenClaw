@@ -1,3 +1,4 @@
+// Tool-call shaped text tests cover detection of text that resembles tool calls.
 import { describe, expect, it } from "vitest";
 import { detectToolCallShapedText } from "./tool-call-shaped-text.js";
 
@@ -9,13 +10,17 @@ describe("detectToolCallShapedText", () => {
     });
   });
 
-  it("detects fenced tool_calls JSON", () => {
-    expect(
-      detectToolCallShapedText(
-        '```json\n{"tool_calls":[{"function":{"name":"web_search","arguments":{"query":"x"}}}]}\n```',
-      ),
-    ).toEqual({ kind: "json_tool_call", toolName: "web_search" });
-  });
+  it.each(["", '{"name":"earlier","arguments":{}}\n'])(
+    "prefers fenced tool_calls JSON after %j",
+    (prefix) => {
+      expect(
+        detectToolCallShapedText(
+          prefix +
+            '```json\n{"tool_calls":[{"function":{"name":"web_search","arguments":{"query":"x"}}}]}\n```',
+        ),
+      ).toEqual({ kind: "json_tool_call", toolName: "web_search" });
+    },
+  );
 
   it("detects XML and ReAct-style tool text", () => {
     expect(

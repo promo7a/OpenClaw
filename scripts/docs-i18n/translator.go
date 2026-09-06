@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -23,16 +26,21 @@ const (
 	envDocsI18nCodexExecutable  = "OPENCLAW_DOCS_I18N_CODEX_EXECUTABLE"
 )
 
-var errEmptyTranslation = errors.New("empty translation")
+var (
+	errEmptyTranslation = errors.New("empty translation")
+	errModelUnavailable = errors.New("configured translation model unavailable; check model configuration")
+)
 
 var translateRetryDelay = func(attempt int) time.Duration {
 	return translateBaseDelay * time.Duration(attempt)
 }
 
 type CodexTranslator struct {
-	systemPrompt string
-	thinking     string
-	runPrompt    codexPromptRunner
+	systemPrompt          string
+	exactGlossaryMappings map[string]string
+	model                 string
+	thinking              string
+	runPrompt             codexPromptRunner
 }
 
 type docsTranslator interface {
@@ -54,9 +62,10 @@ type codexPromptRequest struct {
 
 func NewCodexTranslator(srcLang, tgtLang string, glossary []GlossaryEntry, thinking string) (*CodexTranslator, error) {
 	return &CodexTranslator{
-		systemPrompt: translationPrompt(srcLang, tgtLang, glossary),
-		thinking:     normalizeThinking(thinking),
-		runPrompt:    runCodexExecPrompt,
+		systemPrompt:          translationPrompt(srcLang, tgtLang, glossary),
+		exactGlossaryMappings: exactGlossaryMappings(glossary),
+		thinking:              normalizeThinking(thinking),
+		runPrompt:             runCodexExecPrompt,
 	}, nil
 }
 
@@ -73,6 +82,9 @@ func (t *CodexTranslator) translate(ctx context.Context, text string, run func(c
 	if core == "" {
 		return text, nil
 	}
+	if translated, ok := t.exactGlossaryMappings[core]; ok {
+		return prefix + translated + suffix, nil
+	}
 	translated, err := t.translateWithRetry(ctx, func(ctx context.Context) (string, error) {
 		return run(ctx, core)
 	})
@@ -80,6 +92,19 @@ func (t *CodexTranslator) translate(ctx context.Context, text string, run func(c
 		return "", err
 	}
 	return prefix + translated + suffix, nil
+}
+
+func exactGlossaryMappings(glossary []GlossaryEntry) map[string]string {
+	mappings := map[string]string{}
+	for _, entry := range glossary {
+		source := strings.TrimSpace(entry.Source)
+		target := strings.TrimSpace(entry.Target)
+		if source == "" || target == "" {
+			continue
+		}
+		mappings[source] = target
+	}
+	return mappings
 }
 
 func (t *CodexTranslator) translateWithRetry(ctx context.Context, run func(context.Context) (string, error)) (string, error) {
@@ -148,12 +173,32 @@ func (t *CodexTranslator) prompt(ctx context.Context, message string) (string, e
 	}
 	promptCtx, cancel := context.WithTimeout(ctx, docsI18nPromptTimeout())
 	defer cancel()
-	return t.runPrompt(promptCtx, codexPromptRequest{
+	if t.model == "" {
+		t.model = docsI18nModel()
+	}
+	req := codexPromptRequest{
 		SystemPrompt: t.systemPrompt,
 		Message:      message,
-		Model:        docsI18nModel(),
+		Model:        t.model,
 		Thinking:     t.thinking,
-	})
+	}
+	translated, err := t.runPrompt(promptCtx, req)
+	fallback := strings.TrimSpace(os.Getenv(envDocsI18nFallbackModel))
+	if errors.Is(err, errModelUnavailable) && fallback != "" && fallback != t.model && promptCtx.Err() == nil {
+		// Each worker keeps the replacement after the provider rejects its primary.
+		t.model = fallback
+		req.Model = fallback
+		log.Print("docs-i18n: configured model unavailable; using configured fallback")
+		translated, err = t.runPrompt(promptCtx, req)
+	}
+	if err == nil {
+		for _, model := range []string{docsI18nModel(), fallback} {
+			if model != "" && strings.Contains(strings.ToLower(translated), strings.ToLower(model)) && !strings.Contains(strings.ToLower(message), strings.ToLower(model)) {
+				return "", errors.New("translation contains private model metadata")
+			}
+		}
+	}
+	return translated, err
 }
 
 func isRetryableTranslateError(err error) bool {
@@ -171,6 +216,7 @@ func isRetryableTranslateError(err error) bool {
 		return false
 	}
 	return strings.Contains(message, "placeholder missing") ||
+		strings.Contains(message, "placeholder duplicated") ||
 		strings.Contains(message, "rate limit") ||
 		strings.Contains(message, "429") ||
 		strings.Contains(message, "500") ||
@@ -189,7 +235,9 @@ func runCodexExecPrompt(ctx context.Context, req codexPromptRequest) (string, er
 	}
 	outputPath := outputFile.Name()
 	_ = outputFile.Close()
-	defer os.Remove(outputPath)
+	defer func() {
+		_ = os.Remove(outputPath)
+	}()
 
 	codexHomeBase, err := isolatedCodexHomeBase()
 	if err != nil {
@@ -199,16 +247,22 @@ func runCodexExecPrompt(ctx context.Context, req codexPromptRequest) (string, er
 	if err != nil {
 		return "", err
 	}
-	defer os.RemoveAll(codexHome)
+	defer func() {
+		_ = os.RemoveAll(codexHome)
+	}()
 	if err := writeCodexAuthFile(codexHome); err != nil {
 		return "", err
 	}
 
 	args := []string{
 		"exec",
+		"--json",
 		"--model", req.Model,
 		"-c", fmt.Sprintf("model_reasoning_effort=%q", normalizeThinking(req.Thinking)),
 		"-c", `service_tier="fast"`,
+		// Translation rules are developer instructions, not repo-guided user prose.
+		"-c", fmt.Sprintf("developer_instructions=%q", req.SystemPrompt),
+		"-c", "project_doc_max_bytes=0",
 		"--sandbox", "read-only",
 		"--ignore-rules",
 		"--skip-git-repo-check",
@@ -217,16 +271,25 @@ func runCodexExecPrompt(ctx context.Context, req codexPromptRequest) (string, er
 	}
 	command := exec.CommandContext(ctx, docsCodexExecutable(), args...)
 	configureCodexPromptCommand(command)
-	command.Stdin = strings.NewReader(buildCodexTranslationPrompt(req.SystemPrompt, req.Message))
+	command.Stdin = strings.NewReader(buildCodexTranslationPrompt(req.Message))
 	command.Env = append(os.Environ(), "CODEX_HOME="+codexHome)
 	var stdout bytes.Buffer
-	var stderr bytes.Buffer
 	command.Stdout = &stdout
-	command.Stderr = &stderr
+	command.Stderr = io.Discard
 	if err := command.Run(); err != nil {
-		return "", fmt.Errorf("codex exec failed: %w (%s)", err, previewCommandOutput(stdout.String(), stderr.String()))
+		if translated, readErr := readCodexOutputLastMessage(outputPath); readErr == nil {
+			return translated, nil
+		}
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", codexExecFailure(stdout.String(), req.Model)
 	}
 
+	return readCodexOutputLastMessage(outputPath)
+}
+
+func readCodexOutputLastMessage(outputPath string) (string, error) {
 	data, err := os.ReadFile(outputPath)
 	if err != nil {
 		return "", err
@@ -276,25 +339,52 @@ func docsCodexExecutable() string {
 	return "codex"
 }
 
-func buildCodexTranslationPrompt(systemPrompt, message string) string {
-	return strings.TrimSpace(systemPrompt) + "\n\n" +
-		"Translate the exact input below. Return only the translated text, with no code fences, no tool calls, no reasoning, and no commentary.\n\n" +
+func buildCodexTranslationPrompt(message string) string {
+	return "Translate the exact input below. Return only the translated text, with no tool calls, reasoning, or commentary. Do not wrap the response in an additional code fence; preserve every code fence already present in the input exactly.\n\n" +
 		"<openclaw_docs_i18n_input>\n" +
 		message +
 		"\n</openclaw_docs_i18n_input>\n"
 }
 
-func previewCommandOutput(stdout, stderr string) string {
-	combined := strings.TrimSpace(strings.Join([]string{stdout, stderr}, "\n"))
-	if combined == "" {
-		return "no output"
+func codexExecFailure(output, model string) error {
+	// Exec JSON exposes provider failures as messages; banners and stderr can
+	// contain model routing details and must never become public diagnostics.
+	message := ""
+	for _, line := range strings.Split(output, "\n") {
+		var event struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+			Error   struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal([]byte(line), &event) != nil {
+			continue
+		}
+		if event.Type == "error" {
+			message = event.Message
+		} else if event.Type == "turn.failed" {
+			message = event.Error.Message
+			break
+		}
 	}
-	combined = strings.Join(strings.Fields(combined), " ")
-	const limit = 500
-	if len(combined) <= limit {
-		return combined
+	normalized := strings.ToLower(strings.NewReplacer("`", "", "'", "", "\"", "").Replace(message))
+	requested := strings.ToLower(model)
+	// Codex flattens HTTP errors to their message, dropping provider code/param.
+	unavailable := regexp.MustCompile(`(?:model not found ` + regexp.QuoteMeta(requested) + `(?:[\s,.;:]|$)|model ` + regexp.QuoteMeta(requested) + ` (?:does not exist|is not available)|(?:^|[\s])` + regexp.QuoteMeta(requested) + ` model is not supported)`)
+	if strings.Contains(normalized, "model_not_found") || (requested != "" && unavailable.MatchString(normalized)) {
+		return errModelUnavailable
 	}
-	return combined[:limit] + "..."
+	if strings.Contains(normalized, "authentication") || strings.Contains(normalized, "invalid_api_key") || strings.Contains(normalized, "api key") || strings.Contains(normalized, "401") {
+		return errors.New("codex authentication failed; check translation credentials")
+	}
+	if strings.Contains(normalized, "insufficient_quota") || strings.Contains(normalized, "usage limit") || strings.Contains(normalized, "out of credits") {
+		return errors.New("translation quota exhausted; check account limits")
+	}
+	if isRetryableTranslateError(errors.New(normalized)) {
+		return errors.New("translation service temporarily unavailable")
+	}
+	return errors.New("codex exec failed; check translation configuration and service availability")
 }
 
 func sleepWithContext(ctx context.Context, delay time.Duration) error {
@@ -314,8 +404,11 @@ func normalizeThinking(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "low", "medium", "high", "xhigh":
 		return strings.ToLower(strings.TrimSpace(value))
+	case "max":
+		// Preserve an explicit maximum effort while leaving the default unchanged.
+		return "max"
 	default:
-		return "high"
+		return "xhigh"
 	}
 }
 

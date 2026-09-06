@@ -1,3 +1,4 @@
+// ACP Core tests cover session interaction mode behavior.
 import { describe, expect, it } from "vitest";
 import {
   isParentOwnedBackgroundAcpSession,
@@ -97,9 +98,5 @@ describe("isRequesterParentOfBackgroundAcpSession", () => {
         parentKey,
       ),
     ).toBe(true);
-  });
-
-  it("delegates to isParentOwnedBackgroundAcpSession for target-only checks", () => {
-    expect(isParentOwnedBackgroundAcpSession(backgroundEntry)).toBe(true);
   });
 });

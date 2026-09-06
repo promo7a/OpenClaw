@@ -1,23 +1,46 @@
-import { parseStrictNonNegativeInteger } from "../infra/parse-finite-number.js";
+import { expectDefined } from "@openclaw/normalization-core";
+import {
+  asSafeIntegerInRange,
+  MAX_DATE_TIMESTAMP_MS,
+  parseStrictNonNegativeInteger,
+} from "@openclaw/normalization-core/number-coercion";
+/** Resolves deterministic cron stagger windows for recurring schedules. */
 import type { CronSchedule } from "./types.js";
 
 /** Default jitter window applied to recurring top-of-hour cron schedules. */
-export const DEFAULT_TOP_OF_HOUR_STAGGER_MS = 5 * 60 * 1000;
+const DEFAULT_TOP_OF_HOUR_STAGGER_MS = 5 * 60 * 1000;
 
 function parseCronFields(expr: string) {
   return expr.trim().split(/\s+/).filter(Boolean);
 }
 
+const HOUR_LIST_PART = /^(?:\d+|\d+-\d+)(?:\/\d+)?$|^[*?](?:\/\d+)?$/;
+
+function hasRecurringWildcardHour(field: string): boolean {
+  const parts = field.split(",");
+  return (
+    parts.every((part) => HOUR_LIST_PART.test(part)) &&
+    parts.some((part) => part.startsWith("*") || part.startsWith("?"))
+  );
+}
+
 /** Returns whether a cron expression fires recurring jobs exactly at the top of an hour. */
-export function isRecurringTopOfHourCronExpr(expr: string) {
+function isRecurringTopOfHourCronExpr(expr: string) {
   const fields = parseCronFields(expr);
   if (fields.length === 5) {
     const [minuteField, hourField] = fields;
-    return minuteField === "0" && hourField.includes("*");
+    return (
+      minuteField === "0" &&
+      hasRecurringWildcardHour(expectDefined(hourField, "stagger hour field"))
+    );
   }
   if (fields.length === 6) {
     const [secondField, minuteField, hourField] = fields;
-    return secondField === "0" && minuteField === "0" && hourField.includes("*");
+    return (
+      secondField === "0" &&
+      minuteField === "0" &&
+      hasRecurringWildcardHour(expectDefined(hourField, "stagger hour field"))
+    );
   }
   return false;
 }
@@ -33,7 +56,8 @@ export function normalizeCronStaggerMs(raw: unknown): number | undefined {
   if (!Number.isFinite(numeric)) {
     return undefined;
   }
-  return Math.max(0, Math.floor(numeric));
+  const normalized = Math.max(0, Math.floor(numeric));
+  return asSafeIntegerInRange(normalized, { max: MAX_DATE_TIMESTAMP_MS });
 }
 
 /** Returns the default anti-thundering-herd stagger for top-of-hour recurring schedules. */

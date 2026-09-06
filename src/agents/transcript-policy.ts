@@ -1,29 +1,38 @@
+/**
+ * Transcript replay policy resolution.
+ * Combines provider plugin replay hooks with core transport fallbacks so chat
+ * history sanitization, tool IDs, thinking blocks, and turn validation align.
+ */
+import { bindsClaudeThinkingPrefix } from "@openclaw/llm-core";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolvePluginControlPlaneFingerprint } from "../plugins/plugin-control-plane-context.js";
 import type { ProviderRuntimePluginHandle } from "../plugins/provider-hook-runtime.js";
 import { resolveProviderRuntimePlugin } from "../plugins/provider-hook-runtime.js";
-import { shouldPreserveThinkingBlocks } from "../plugins/provider-replay-helpers.js";
+import { shouldDropClaudeThinkingBlocks } from "../plugins/provider-replay-helpers.js";
 import type { ProviderRuntimeModel } from "../plugins/provider-runtime-model.types.js";
 import type { ProviderReplayPolicy } from "../plugins/types.js";
 import { isGoogleModelApi } from "./embedded-agent-helpers/google.js";
 import { normalizeProviderId } from "./model-selection.js";
 import type { ToolCallIdMode } from "./tool-call-id.js";
 
-export type TranscriptSanitizeMode = "full" | "images-only";
+/** Scope of transcript content sanitization before provider replay. */
+type TranscriptSanitizeMode = "full" | "images-only";
 
+/** Effective replay policy applied before sending transcript history to a provider. */
 export type TranscriptPolicy = {
   sanitizeMode: TranscriptSanitizeMode;
   sanitizeToolCallIds: boolean;
   toolCallIdMode?: ToolCallIdMode;
+  duplicateToolCallIdStyle?: "openai";
   preserveNativeAnthropicToolUseIds: boolean;
   repairToolUseResultPairing: boolean;
   preserveSignatures: boolean;
+  appendOnlyRuntimeContext?: boolean;
   sanitizeThoughtSignatures?: {
     allowBase64Only?: boolean;
     includeCamelCase?: boolean;
   };
-  sanitizeThinkingSignatures: boolean;
   dropThinkingBlocks: boolean;
   dropReasoningFromHistory?: boolean;
   applyGoogleTurnOrdering: boolean;
@@ -34,10 +43,12 @@ export type TranscriptPolicy = {
 
 const SIGNED_THINKING_PROVIDERS = new Set(["anthropic", "amazon-bedrock", "anthropic-vertex"]);
 
+/** Return true when a provider family owns signed thinking blocks. */
 export function providerRequiresSignedThinking(provider?: string | null): boolean {
   return SIGNED_THINKING_PROVIDERS.has(normalizeProviderId(provider ?? ""));
 }
 
+/** Decide whether signed thinking can be replayed under the current provider policy. */
 export function shouldAllowProviderOwnedThinkingReplay(params: {
   modelApi?: string | null;
   provider?: string | null;
@@ -56,15 +67,27 @@ export function shouldAllowProviderOwnedThinkingReplay(params: {
   );
 }
 
+/**
+ * Bedrock Converse still requires strict role alternation, so only the direct
+ * Messages API keeps consecutive user turns separate under append-only replay.
+ */
+export function shouldMergeConsecutiveUserTurns(
+  policy: Pick<TranscriptPolicy, "appendOnlyRuntimeContext">,
+  modelApi?: string | null,
+): boolean {
+  return !(policy.appendOnlyRuntimeContext && modelApi === "anthropic-messages");
+}
+
 const DEFAULT_TRANSCRIPT_POLICY: TranscriptPolicy = {
   sanitizeMode: "images-only",
   sanitizeToolCallIds: false,
   toolCallIdMode: undefined,
+  duplicateToolCallIdStyle: undefined,
   preserveNativeAnthropicToolUseIds: false,
   repairToolUseResultPairing: true,
   preserveSignatures: false,
+  appendOnlyRuntimeContext: false,
   sanitizeThoughtSignatures: undefined,
-  sanitizeThinkingSignatures: false,
   dropThinkingBlocks: false,
   dropReasoningFromHistory: false,
   applyGoogleTurnOrdering: false,
@@ -144,7 +167,15 @@ function buildUnownedProviderTransportReplayFallback(params: {
           toolCallIdMode: "strict" as const,
         }
       : {}),
-    ...(isAnthropic ? { preserveSignatures: true } : {}),
+    ...(isAnthropic
+      ? {
+          preserveSignatures: true,
+          appendOnlyRuntimeContext: bindsClaudeThinkingPrefix({
+            id: modelId,
+            params: params.model?.params,
+          }),
+        }
+      : {}),
     ...(isGoogle
       ? {
           sanitizeThoughtSignatures: {
@@ -153,8 +184,8 @@ function buildUnownedProviderTransportReplayFallback(params: {
           },
         }
       : {}),
-    ...(isAnthropic && modelId.includes("claude")
-      ? { dropThinkingBlocks: !shouldPreserveThinkingBlocks(modelId) }
+    ...(isAnthropic && shouldDropClaudeThinkingBlocks(modelId, params.model)
+      ? { dropThinkingBlocks: true }
       : {}),
     ...(isAnthropic && modelDisablesReasoningEffort(params.model)
       ? { dropThinkingBlocks: true }
@@ -177,6 +208,9 @@ const REASONING_CONTENT_REPLAY_MODEL_IDS = new Set([
   "kimi-for-coding",
   "kimi-k2.5",
   "kimi-k2.6",
+  "kimi-k2.7-code",
+  "kimi-k2.7-code-highspeed",
+  "kimi-k3",
   "kimi-k2-thinking",
   "kimi-k2-thinking-turbo",
   "mimo-v2-pro",
@@ -216,6 +250,9 @@ function mergeTranscriptPolicy(
       ? { sanitizeToolCallIds: policy.sanitizeToolCallIds }
       : {}),
     ...(policy.toolCallIdMode ? { toolCallIdMode: policy.toolCallIdMode as ToolCallIdMode } : {}),
+    ...(policy.duplicateToolCallIdStyle
+      ? { duplicateToolCallIdStyle: policy.duplicateToolCallIdStyle }
+      : {}),
     ...(typeof policy.preserveNativeAnthropicToolUseIds === "boolean"
       ? { preserveNativeAnthropicToolUseIds: policy.preserveNativeAnthropicToolUseIds }
       : {}),
@@ -224,6 +261,9 @@ function mergeTranscriptPolicy(
       : {}),
     ...(typeof policy.preserveSignatures === "boolean"
       ? { preserveSignatures: policy.preserveSignatures }
+      : {}),
+    ...(typeof policy.appendOnlyRuntimeContext === "boolean"
+      ? { appendOnlyRuntimeContext: policy.appendOnlyRuntimeContext }
       : {}),
     ...(policy.sanitizeThoughtSignatures
       ? { sanitizeThoughtSignatures: policy.sanitizeThoughtSignatures }
@@ -274,6 +314,10 @@ function resolveTranscriptPolicyCacheKey(params: {
     provider: params.provider,
     modelApi: params.modelApi ?? "",
     modelId: params.modelId ?? "",
+    canonicalModelId:
+      typeof params.model?.params?.canonicalModelId === "string"
+        ? params.model.params.canonicalModelId
+        : "",
     dropsThinkingForReasoningCompat: modelDisablesReasoningEffort(params.model),
     preservesReasoningContentReplay: params.model?.reasoning === true,
     workspaceDir: params.workspaceDir ?? "",
@@ -285,6 +329,7 @@ function resolveTranscriptPolicyCacheKey(params: {
   });
 }
 
+/** Resolve and cache the effective replay policy for a provider/model/config tuple. */
 export function resolveTranscriptPolicy(params: {
   modelApi?: string | null;
   provider?: string | null;

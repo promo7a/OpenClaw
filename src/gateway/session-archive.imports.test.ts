@@ -1,3 +1,6 @@
+/**
+ * Session archive import-boundary tests.
+ */
 import { importFreshModule } from "openclaw/plugin-sdk/test-fixtures";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -6,11 +9,6 @@ const importCases = [
     label: "reply session module",
     importPath: "../auto-reply/reply/session.js",
     scope: "reply-session",
-  },
-  {
-    label: "session store module",
-    importPath: "../config/sessions/store.js",
-    scope: "session-store",
   },
 ] as const;
 

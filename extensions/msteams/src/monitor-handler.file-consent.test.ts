@@ -1,3 +1,4 @@
+// Msteams tests cover monitor handler.file consent plugin behavior.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginRuntime } from "../runtime-api.js";
 import { runMSTeamsFileConsentInvokeHandler } from "./file-consent-invoke.js";
 import { getPendingUploadFs, storePendingUploadFs } from "./pending-uploads-fs.js";
-import { clearPendingUploads, getPendingUpload, storePendingUpload } from "./pending-uploads.js";
+import { getPendingUpload, removePendingUpload, storePendingUpload } from "./pending-uploads.js";
 import { setMSTeamsRuntime } from "./runtime.js";
 import type { MSTeamsTurnContext } from "./sdk-types.js";
 
@@ -43,6 +44,7 @@ function createRuntimeStub(stateDir?: string): PluginRuntime {
           enqueue: async () => {},
           flushKey: async () => {},
           cancelKey: () => false,
+          drain: async () => {},
         }),
       },
     },
@@ -67,6 +69,15 @@ const log = {
   info: vi.fn(),
   error: vi.fn(),
 };
+
+const createdUploadIds = new Set<string>();
+
+afterEach(() => {
+  for (const id of createdUploadIds) {
+    removePendingUpload(id);
+  }
+  createdUploadIds.clear();
+});
 
 function createInvokeContext(params: {
   conversationId: string;
@@ -124,6 +135,7 @@ function createConsentInvokeHarness(params: {
     conversationId: params.pendingConversationId ?? "19:victim@thread.v2",
     consentCardActivityId: params.consentCardActivityId,
   });
+  createdUploadIds.add(uploadId);
   const { context, sendActivity, updateActivity } = createInvokeContext({
     conversationId: params.invokeConversationId,
     uploadId,
@@ -181,7 +193,6 @@ function readUpdatedActivity(updateActivity: ReturnType<typeof vi.fn>): {
 describe("msteams file consent invoke authz", () => {
   beforeEach(() => {
     setMSTeamsRuntime(runtimeStub);
-    clearPendingUploads();
     vi.clearAllMocks();
     fileConsentMockState.uploadToConsentUrl.mockReset();
     fileConsentMockState.uploadToConsentUrl.mockResolvedValue(undefined);
@@ -329,7 +340,6 @@ describe("msteams file consent invoke FS fallback", () => {
     tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "openclaw-msteams-invoke-"));
     process.env.OPENCLAW_STATE_DIR = tmpDir;
     setMSTeamsRuntime(createRuntimeStub(tmpDir));
-    clearPendingUploads();
     vi.clearAllMocks();
     fileConsentMockState.uploadToConsentUrl.mockReset();
     fileConsentMockState.uploadToConsentUrl.mockResolvedValue(undefined);

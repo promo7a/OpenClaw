@@ -1,3 +1,4 @@
+/** Tests ACP session metadata and usage snapshots after prompts. */
 import { createInMemorySessionStore } from "@openclaw/acp-core/session";
 import { describe, expect, it, vi } from "vitest";
 import type { GatewayClient } from "../gateway/client.js";
@@ -85,8 +86,6 @@ describe("acp session metadata and usage updates", () => {
         },
       },
     });
-
-    sessionStore.clearAllSessionsForTest();
   });
 
   it("still resolves prompts when snapshot updates fail after completion", async () => {
@@ -140,7 +139,5 @@ describe("acp session metadata and usage updates", () => {
     const session = sessionStore.getSession("usage-session");
     expect(session?.activeRunId).toBeNull();
     expect(session?.abortController).toBeNull();
-
-    sessionStore.clearAllSessionsForTest();
   });
 });

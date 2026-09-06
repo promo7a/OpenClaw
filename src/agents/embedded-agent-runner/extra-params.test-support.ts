@@ -1,16 +1,71 @@
-import type { ThinkLevel } from "../../auto-reply/thinking.shared.js";
+// Shared harness for extra-params wrapper tests.
+import { vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { Context, Model, SimpleStreamOptions } from "../../llm/types.js";
+import * as providerRuntime from "../../plugins/provider-hook-runtime.js";
+import type { ProviderPlugin } from "../../plugins/types.js";
 import type { StreamFn } from "../runtime/index.js";
-import { testing as extraParamsTesting, applyExtraParamsToAgent } from "./extra-params.js";
+import { applyExtraParamsToAgent } from "./extra-params.js";
+import type { ProviderThinkLevel } from "./utils.js";
 
-export type ExtraParamsCapture<TPayload extends Record<string, unknown>> = {
+type ProviderHook<K extends keyof ProviderPlugin> = Extract<
+  ProviderPlugin[K],
+  (...args: never[]) => unknown
+>;
+type ProviderHookCall<K extends keyof ProviderPlugin> = {
+  provider: string;
+  config?: OpenClawConfig;
+  workspaceDir?: string;
+  context: Parameters<ProviderHook<K>>[0];
+};
+export type WrapProviderStreamFnParams = ProviderHookCall<"wrapStreamFn">;
+type ProviderRuntimeDeps = {
+  prepareProviderExtraParams: (
+    params: ProviderHookCall<"prepareExtraParams">,
+  ) => ReturnType<ProviderHook<"prepareExtraParams">>;
+  resolveProviderExtraParamsForTransport: (
+    params: ProviderHookCall<"extraParamsForTransport">,
+  ) => ReturnType<ProviderHook<"extraParamsForTransport">>;
+  wrapProviderStreamFn: (
+    params: WrapProviderStreamFnParams,
+  ) => ReturnType<ProviderHook<"wrapStreamFn">>;
+};
+
+export const testing = {
+  setProviderRuntimeDepsForTest(deps: Partial<ProviderRuntimeDeps> = {}): void {
+    vi.spyOn(providerRuntime, "ensureProviderRuntimePluginHandle").mockImplementation((params) => {
+      if (params.runtimeHandle) {
+        return params.runtimeHandle;
+      }
+      return {
+        ...params,
+        plugin: {
+          id: params.provider,
+          label: params.provider,
+          auth: [],
+          prepareExtraParams: (context) =>
+            deps.prepareProviderExtraParams?.({ ...params, context }),
+          extraParamsForTransport: (context) =>
+            deps.resolveProviderExtraParamsForTransport?.({ ...params, context }),
+          wrapStreamFn: (context) => deps.wrapProviderStreamFn?.({ ...params, context }),
+        },
+      };
+    });
+  },
+  resetProviderRuntimeDepsForTest(): void {
+    vi.mocked(providerRuntime.ensureProviderRuntimePluginHandle).mockRestore();
+  },
+};
+
+type ExtraParamsCapture<TPayload extends Record<string, unknown>> = {
   headers?: Record<string, string>;
   options?: SimpleStreamOptions;
   payload: TPayload;
 };
 
 function createMockStream(): ReturnType<StreamFn> {
+  // Minimal async stream surface for wrappers that decorate push/result/iterate
+  // behavior without needing a real model provider.
   return {
     push() {},
     async result() {
@@ -34,13 +89,16 @@ type RunExtraParamsCaseParams<
   mockProviderRuntime?: boolean;
   options?: SimpleStreamOptions;
   payload: TPayload;
-  thinkingLevel?: ThinkLevel;
+  thinkingLevel?: ProviderThinkLevel;
+  workspaceDir?: string;
 };
 
 export function runExtraParamsCase<
   TApi extends "openai-completions" | "openai-responses" | "azure-openai-responses",
   TPayload extends Record<string, unknown>,
 >(params: RunExtraParamsCaseParams<TApi, TPayload>): ExtraParamsCapture<TPayload> {
+  // Capture both transport options and payload mutation, which are the two
+  // public effects of applyExtraParamsToAgent.
   const captured: ExtraParamsCapture<TPayload> = {
     payload: params.payload,
   };
@@ -54,7 +112,7 @@ export function runExtraParamsCase<
   const agent = { streamFn: baseStreamFn };
 
   if (params.mockProviderRuntime === true) {
-    extraParamsTesting.setProviderRuntimeDepsForTest({
+    testing.setProviderRuntimeDepsForTest({
       prepareProviderExtraParams: () => undefined,
       resolveProviderExtraParamsForTransport: () => undefined,
       wrapProviderStreamFn: () => undefined,
@@ -68,10 +126,12 @@ export function runExtraParamsCase<
       params.applyModelId ?? params.model.id,
       undefined,
       params.thinkingLevel,
+      undefined,
+      params.workspaceDir,
     );
   } finally {
     if (params.mockProviderRuntime === true) {
-      extraParamsTesting.resetProviderRuntimeDepsForTest();
+      testing.resetProviderRuntimeDepsForTest();
     }
   }
 

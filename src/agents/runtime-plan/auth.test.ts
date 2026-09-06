@@ -1,3 +1,5 @@
+// Runtime plan auth tests cover provider/auth-profile selection and plugin
+// alias loading behavior for the auth portion of the plan.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const pluginRegistryMocks = vi.hoisted(() => {
@@ -38,12 +40,12 @@ vi.mock("../../plugins/plugin-metadata-snapshot.js", () => ({
   loadPluginMetadataSnapshot: pluginRegistryMocks.loadPluginMetadataSnapshot,
 }));
 
-import { resetProviderAuthAliasMapCacheForTest } from "../provider-auth-aliases.js";
+import { clearPluginMetadataLifecycleCaches } from "../../plugins/plugin-metadata-lifecycle.js";
 import { buildAgentRuntimeAuthPlan } from "./auth.js";
 
 describe("buildAgentRuntimeAuthPlan", () => {
   beforeEach(() => {
-    resetProviderAuthAliasMapCacheForTest();
+    clearPluginMetadataLifecycleCaches();
     pluginRegistryMocks.loadPluginManifestRegistryForInstalledIndex.mockReset();
     pluginRegistryMocks.loadPluginManifestRegistryForPluginRegistry.mockReset();
     pluginRegistryMocks.loadPluginRegistrySnapshot.mockReset();
@@ -52,6 +54,8 @@ describe("buildAgentRuntimeAuthPlan", () => {
   });
 
   it("does not load provider auth aliases when plugins are disabled", () => {
+    // Disabling alias support should avoid metadata loading entirely, not just
+    // ignore aliases after doing plugin work.
     pluginRegistryMocks.loadPluginManifestRegistryForPluginRegistry.mockReturnValue({
       plugins: [
         {
@@ -96,5 +100,63 @@ describe("buildAgentRuntimeAuthPlan", () => {
     expect(plan.providerForAuth).toBe("fixture");
     expect(plan.authProfileProviderForAuth).toBe("fixture");
     expect(pluginRegistryMocks.loadPluginMetadataSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("preserves the selected model route and locked profile source", () => {
+    const plan = buildAgentRuntimeAuthPlan({
+      provider: "openai",
+      authProfileProvider: "openai",
+      authProfileMode: "token",
+      sessionAuthProfileId: "openai:work",
+      sessionAuthProfileSource: "user",
+      modelRoute: {
+        provider: "openai",
+        modelId: "gpt-5.5",
+        api: "openai-chatgpt-responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        authRequirement: "subscription",
+        requestTransportOverrides: "none",
+      },
+      config: {},
+    });
+
+    expect(plan).toMatchObject({
+      forwardedAuthProfileId: "openai:work",
+      forwardedAuthProfileSource: "user",
+      selectedAuthMode: "token",
+      modelRoute: {
+        provider: "openai",
+        modelId: "gpt-5.5",
+        api: "openai-chatgpt-responses",
+        authRequirement: "subscription",
+      },
+    });
+  });
+
+  it("does not forward profiles when the harness rejects host auth", () => {
+    const plan = buildAgentRuntimeAuthPlan({
+      provider: "openai",
+      authProfileProvider: "openai",
+      authProfileMode: "api_key",
+      sessionAuthProfileId: "openai:work",
+      sessionAuthProfileSource: "auto",
+      sessionAuthProfileCandidateIds: ["openai:work"],
+      modelRoute: {
+        provider: "openai",
+        modelId: "gpt-5.5",
+        api: "openai-responses",
+        baseUrl: "https://api.openai.com/v1",
+        authRequirement: "api-key",
+        requestTransportOverrides: "none",
+      },
+      config: {},
+      harnessId: "codex",
+      harnessRuntime: "codex",
+      allowHarnessAuthProfileForwarding: false,
+    });
+
+    expect(plan.forwardedAuthProfileId).toBeUndefined();
+    expect(plan.forwardedAuthProfileCandidateIds).toBeUndefined();
+    expect(plan.selectedAuthMode).toBeUndefined();
   });
 });

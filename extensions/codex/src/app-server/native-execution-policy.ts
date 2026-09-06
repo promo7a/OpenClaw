@@ -1,4 +1,13 @@
+import {
+  resolveAgentConfig,
+  tryResolveDefaultAgentId,
+} from "openclaw/plugin-sdk/agent-scope-runtime";
+/**
+ * Resolves whether Codex app-server native execution can own shell/file work,
+ * or whether OpenClaw must keep exec/process on a configured node host.
+ */
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { normalizeAgentId, parseAgentSessionKey } from "openclaw/plugin-sdk/routing";
 import { resolveSandboxRuntimeStatus } from "openclaw/plugin-sdk/sandbox";
 import { getSessionEntry, type SessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
 
@@ -10,14 +19,7 @@ type ExecHostOverride = {
   node?: string;
 };
 
-type AgentEntry = NonNullable<NonNullable<OpenClawConfig["agents"]>["list"]>[number];
-
-const DEFAULT_AGENT_ID = "main";
-const VALID_AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
-const INVALID_AGENT_ID_CHARS_PATTERN = /[^a-z0-9_-]+/g;
-const LEADING_DASH_PATTERN = /^-+/;
-const TRAILING_DASH_PATTERN = /-+$/;
-
+/** Effective execution-host policy for the Codex app-server native tool surface. */
 export type CodexNativeExecutionPolicy = {
   nativeToolSurfaceAllowed: boolean;
   requestedExecHost: ExecTarget;
@@ -26,6 +28,18 @@ export type CodexNativeExecutionPolicy = {
   blockReason?: string;
 };
 
+/** Projects node execution ownership into the runtime tool factory options. */
+export function resolveCodexNodeExecToolOverrides(
+  policy: CodexNativeExecutionPolicy,
+): { host: "node"; node?: string } | undefined {
+  if (policy.effectiveExecHost !== "node") {
+    return undefined;
+  }
+  const node = policy.node?.trim();
+  return { host: "node", ...(node ? { node } : {}) };
+}
+
+/** Resolves node/gateway/sandbox execution ownership from overrides, session, agent, and config. */
 export function resolveCodexNativeExecutionPolicy(params: {
   config?: OpenClawConfig;
   sessionEntry?: SessionEntry;
@@ -38,21 +52,28 @@ export function resolveCodexNativeExecutionPolicy(params: {
 }): CodexNativeExecutionPolicy {
   const config = params.config ?? {};
   const sessionKey = params.sessionKey?.trim() || params.sessionId?.trim() || undefined;
+  const agentId = resolvePolicyAgentId({ config, sessionKey, agentId: params.agentId });
+  const canReadSessionEntry =
+    Boolean(agentId) &&
+    params.readRuntimeSessionEntry &&
+    shouldReadRuntimeSessionEntry({ config, sessionKey, agentId });
   const sessionEntry =
     params.sessionEntry ??
-    (params.readRuntimeSessionEntry && sessionKey
-      ? readRuntimeSessionEntryBestEffort(sessionKey)
+    (canReadSessionEntry && sessionKey && agentId
+      ? readRuntimeSessionEntryBestEffort({ sessionKey, agentId })
       : undefined);
+  const sandboxAgentId = parseAgentSessionKey(sessionKey)?.agentId ?? agentId;
   const sandboxAvailable =
     params.sandboxAvailable ??
-    (sessionKey
+    (sessionKey && sandboxAgentId
       ? resolveSandboxRuntimeStatus({
           cfg: config,
           sessionKey,
+          agentId: sandboxAgentId,
+          classificationAgentId: sandboxAgentId,
         }).sandboxed
       : false);
-  const agentId = resolvePolicyAgentId({ config, sessionKey, agentId: params.agentId });
-  const agentExec = resolvePolicyAgentExec({ config, agentId });
+  const agentExec = agentId ? resolvePolicyAgentExec({ config, agentId }) : undefined;
   const globalExec = config.tools?.exec;
   const requestedExecHost =
     normalizeExecTarget(params.execOverrides?.host) ??
@@ -84,6 +105,7 @@ export function resolveCodexNativeExecutionPolicy(params: {
   };
 }
 
+/** Formats the user-facing explanation shown when native tools are blocked by exec host=node. */
 export function formatCodexNativeNodeExecBlock(params: {
   surface: string;
   reason?: string;
@@ -100,7 +122,7 @@ function resolvePolicyAgentId(params: {
   config: OpenClawConfig;
   sessionKey?: string;
   agentId?: string;
-}): string {
+}): string | undefined {
   const explicitAgentId = normalizeAgentIdOrDefault(params.agentId);
   if (explicitAgentId) {
     return explicitAgentId;
@@ -109,24 +131,14 @@ function resolvePolicyAgentId(params: {
   if (sessionAgentId) {
     return sessionAgentId;
   }
-  const agents = listAgentEntries(params.config);
-  const defaultEntry = agents.find((entry) => entry?.default) ?? agents[0];
-  return normalizeAgentId(defaultEntry?.id);
+  return tryResolveDefaultAgentId(params.config);
 }
 
 function resolvePolicyAgentExec(params: {
   config: OpenClawConfig;
   agentId: string;
 }): ExecHostOverride | undefined {
-  return listAgentEntries(params.config).find(
-    (entry) => normalizeAgentId(entry?.id) === params.agentId,
-  )?.tools?.exec;
-}
-
-function listAgentEntries(config: OpenClawConfig): AgentEntry[] {
-  return (config.agents?.list ?? []).filter(
-    (entry): entry is AgentEntry => entry !== null && typeof entry === "object",
-  );
+  return resolveAgentConfig(params.config, params.agentId)?.tools?.exec;
 }
 
 function parseAgentIdFromSessionKey(sessionKey?: string): string | undefined {
@@ -141,27 +153,35 @@ function parseAgentIdFromSessionKey(sessionKey?: string): string | undefined {
   return normalizeAgentIdOrDefault(parts[1]);
 }
 
-function normalizeAgentIdOrDefault(value?: string | null): string | undefined {
-  const normalized = normalizeAgentId(value);
-  return normalized === DEFAULT_AGENT_ID && !(value ?? "").trim() ? undefined : normalized;
+function shouldReadRuntimeSessionEntry(params: {
+  config: OpenClawConfig;
+  sessionKey?: string;
+  agentId?: string;
+}): boolean {
+  if (!params.sessionKey) {
+    return false;
+  }
+  const explicitAgentId = normalizeAgentIdOrDefault(params.agentId);
+  if (!explicitAgentId) {
+    return true;
+  }
+  const sessionAgentId = parseAgentIdFromSessionKey(params.sessionKey);
+  if (!sessionAgentId) {
+    return isDefaultAgentSessionKeyForAgent({ config: params.config, agentId: explicitAgentId });
+  }
+  return sessionAgentId === explicitAgentId;
 }
 
-function normalizeAgentId(value?: string | null): string {
-  const trimmed = (value ?? "").trim();
-  if (!trimmed) {
-    return DEFAULT_AGENT_ID;
-  }
-  const normalized = trimmed.toLowerCase();
-  if (VALID_AGENT_ID_PATTERN.test(trimmed)) {
-    return normalized;
-  }
-  return (
-    normalized
-      .replace(INVALID_AGENT_ID_CHARS_PATTERN, "-")
-      .replace(LEADING_DASH_PATTERN, "")
-      .replace(TRAILING_DASH_PATTERN, "")
-      .slice(0, 64) || DEFAULT_AGENT_ID
-  );
+function isDefaultAgentSessionKeyForAgent(params: {
+  config: OpenClawConfig;
+  agentId: string;
+}): boolean {
+  return normalizeAgentId(params.agentId) === tryResolveDefaultAgentId(params.config);
+}
+
+function normalizeAgentIdOrDefault(value?: string | null): string | undefined {
+  const normalized = normalizeAgentId(value);
+  return normalized === "main" && !(value ?? "").trim() ? undefined : normalized;
 }
 
 function normalizeExecTarget(value?: string | null): ExecTarget | undefined {
@@ -187,9 +207,16 @@ function resolveEffectiveExecHost(params: {
   return params.requestedExecHost;
 }
 
-function readRuntimeSessionEntryBestEffort(sessionKey: string): SessionEntry | undefined {
+function readRuntimeSessionEntryBestEffort(params: {
+  sessionKey: string;
+  agentId: string;
+}): SessionEntry | undefined {
   try {
-    return getSessionEntry({ sessionKey, hydrateSkillPromptRefs: false });
+    return getSessionEntry({
+      sessionKey: params.sessionKey,
+      agentId: params.agentId,
+      hydrateSkillPromptRefs: false,
+    });
   } catch {
     return undefined;
   }

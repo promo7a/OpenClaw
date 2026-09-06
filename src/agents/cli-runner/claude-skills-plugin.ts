@@ -1,3 +1,6 @@
+/**
+ * Materializes selected OpenClaw skills as a temporary Claude CLI plugin.
+ */
 import { accessSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -31,7 +34,8 @@ function sanitizeSkillDirName(name: string, used: Set<string>): string {
   return candidate;
 }
 
-export function isClaudeCliSkillFileAccessible(skillFilePath: string): boolean {
+/** Returns whether a resolved skill file is readable before linking it into the Claude plugin. */
+function isClaudeCliSkillFileAccessible(skillFilePath: string): boolean {
   try {
     accessSync(skillFilePath);
     return true;
@@ -75,6 +79,8 @@ async function linkOrCopySkillDir(params: { sourceDir: string; targetDir: string
       process.platform === "win32" ? "junction" : "dir",
     );
   } catch {
+    // Symlinks are preferred to avoid copying skill trees, but Windows/TCC/filesystem policy can
+    // reject them. Copying preserves the session-scoped plugin contract.
     await fs.cp(params.sourceDir, params.targetDir, {
       recursive: true,
       force: true,
@@ -83,11 +89,17 @@ async function linkOrCopySkillDir(params: { sourceDir: string; targetDir: string
   }
 }
 
+/** Prepares Claude CLI `--plugin-dir` args for the current session skill snapshot. */
 export async function prepareClaudeCliSkillsPlugin(params: {
   backendId: string;
   skillsSnapshot?: SkillSnapshot;
 }): Promise<{ args: string[]; cleanup: () => Promise<void>; pluginDir?: string }> {
   if (normalizeLowercaseStringOrEmpty(params.backendId) !== CLAUDE_CLI_BACKEND_ID) {
+    return { args: [], cleanup: async () => {} };
+  }
+  // Library command identities are host-owned, not frontmatter names. Keep their
+  // canonical catalog and immutable paths instead of registering colliding native aliases.
+  if (params.skillsSnapshot?.librarySelections?.length) {
     return { args: [], cleanup: async () => {} };
   }
 

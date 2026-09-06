@@ -1,13 +1,35 @@
 #!/usr/bin/env node
 
+// GitHub dependency-change guard: detects dependency files, manages override
+// comments/labels, and can autoscrub lockfile-only PR changes.
 import { appendFile, readFile } from "node:fs/promises";
-import { readBoundedResponseText } from "../lib/bounded-response.mjs";
+import {
+  GITHUB_API_REQUEST_TIMEOUT_MS,
+  GITHUB_ERROR_BODY_MAX_BYTES,
+  GITHUB_RESPONSE_BODY_MAX_BYTES,
+  createGitHubApi,
+  createGuardApproverChecks,
+  createIssueMutationHelpers,
+  guardTrustedActorCandidates,
+  isCommentNewerThan,
+  normalizeGuardLoginSet,
+  readBoundedGitHubErrorText,
+  readBoundedGitHubJson,
+  sanitizeGuardDisplayValue,
+} from "./guard-shared.mjs";
 
-export const dependencyChangeMarker = "<!-- openclaw:dependency-guard -->";
-export const dependencyGraphGuardMarker = "<!-- openclaw:dependency-graph-guard -->";
+/** Marker used to identify dependency guard comments. */
+const dependencyChangeMarker = "<!-- openclaw:dependency-guard -->";
+const dependencyGraphGuardMarker = "<!-- openclaw:dependency-graph-guard -->";
 export const dependencyChangedLabel = "dependencies-changed";
-export const allowDependenciesCommand = "/allow-dependencies-change";
-export const GITHUB_ERROR_BODY_MAX_BYTES = 64 * 1024;
+const allowDependenciesCommand = "/allow-dependencies-change";
+export {
+  GITHUB_API_REQUEST_TIMEOUT_MS,
+  GITHUB_ERROR_BODY_MAX_BYTES,
+  GITHUB_RESPONSE_BODY_MAX_BYTES,
+  readBoundedGitHubErrorText,
+  readBoundedGitHubJson,
+};
 
 const maxListedFiles = 25;
 const autoscrubCommitMessage = "chore: remove dependency lockfile change";
@@ -34,10 +56,24 @@ const dependencyManifestFields = [
   "libc",
 ];
 
+/**
+ * @typedef {{
+ *   body?: string,
+ *   created_at?: string,
+ *   html_url?: string,
+ *   user?: { login?: string },
+ * }} GuardComment
+ * @typedef {{ login: string, source: string }} GuardActorCandidate
+ * @typedef {{ path: string, fields: string[] }} DependencyManifestChange
+ * @typedef {{ kind: "not-attempted" } |
+ *   { kind: "blocked-by-dependency-manifest-fields", changes: DependencyManifestChange[] } |
+ *   { kind: "blocked-by-other-dependency-files", files: string[] } |
+ *   { kind: "failed", reason: string }} AutoscrubStatus
+ */
+
 export function isDependencyFile(filename) {
   return (
     filename.endsWith("package-lock.json") ||
-    filename.endsWith("npm-shrinkwrap.json") ||
     filename.endsWith("pnpm-lock.yaml") ||
     filename === "pnpm-workspace.yaml" ||
     filename.startsWith("patches/")
@@ -49,11 +85,7 @@ export function isDependencyManifest(filename) {
 }
 
 export function isPackageLockfile(filename) {
-  return (
-    filename.endsWith("pnpm-lock.yaml") ||
-    filename.endsWith("package-lock.json") ||
-    filename.endsWith("npm-shrinkwrap.json")
-  );
+  return filename.endsWith("pnpm-lock.yaml") || filename.endsWith("package-lock.json");
 }
 
 export function dependencyFieldChanges(baseManifest, headManifest) {
@@ -66,6 +98,17 @@ export function dependencyFieldChanges(baseManifest, headManifest) {
   return changes;
 }
 
+export function isRemovalOnlyDependencyGraphChange(changes) {
+  return changes.length > 0 && changes.every((change) => change.change_type === "removed");
+}
+
+/**
+ * @param {{
+ *   dependencyFiles?: string[],
+ *   lockfileChanges: string[],
+ *   dependencyManifestChanges?: DependencyManifestChange[],
+ * }} options
+ */
 export function shouldAutoscrubDependencyLockfiles({
   dependencyFiles = [],
   lockfileChanges,
@@ -117,18 +160,12 @@ function stableJson(value) {
   return JSON.stringify(sorted);
 }
 
-export function sanitizeDisplayValue(value) {
-  return String(value)
-    .replace(/[\p{Cc}]/gu, "?")
-    .slice(0, 240);
-}
-
 export function markdownCode(value) {
-  return `\`${sanitizeDisplayValue(value).replaceAll("`", "\\`")}\``;
+  return `\`${sanitizeGuardDisplayValue(value).replaceAll("`", "\\`")}\``;
 }
 
 function shellQuote(value) {
-  return `'${sanitizeDisplayValue(value).replaceAll("'", "'\\''")}'`;
+  return `'${sanitizeGuardDisplayValue(value).replaceAll("'", "'\\''")}'`;
 }
 
 function* dependencyOverrideCandidates({ comments, expectedSha, newerThan }) {
@@ -146,7 +183,7 @@ function* dependencyOverrideCandidates({ comments, expectedSha, newerThan }) {
       }
       yield {
         login,
-        reason: reason ? sanitizeDisplayValue(reason) : null,
+        reason: reason ? sanitizeGuardDisplayValue(reason) : null,
         sha: expectedSha,
         url: comment.html_url,
       };
@@ -154,6 +191,14 @@ function* dependencyOverrideCandidates({ comments, expectedSha, newerThan }) {
   }
 }
 
+/**
+ * @param {{
+ *   comments: GuardComment[],
+ *   expectedSha: string | null,
+ *   isSecurityMember: (login: string) => boolean,
+ *   newerThan?: string,
+ * }} options
+ */
 export function findDependencyOverrideCommand({
   comments,
   expectedSha,
@@ -168,6 +213,14 @@ export function findDependencyOverrideCommand({
   return null;
 }
 
+/**
+ * @param {{
+ *   comments: GuardComment[],
+ *   expectedSha: string | null,
+ *   isSecurityMember: (login: string) => Promise<boolean>,
+ *   newerThan?: string,
+ * }} input
+ */
 export async function findDependencyOverrideCommandAsync(input) {
   for (const candidate of dependencyOverrideCandidates(input)) {
     if (await input.isSecurityMember(candidate.login)) {
@@ -177,67 +230,41 @@ export async function findDependencyOverrideCommandAsync(input) {
   return null;
 }
 
-function isCommentNewerThan(comment, newerThan) {
-  if (!newerThan) {
-    return false;
-  }
-  const commentTime = Date.parse(comment.created_at ?? "");
-  const barrierTime = Date.parse(newerThan);
-  return Number.isFinite(commentTime) && Number.isFinite(barrierTime) && commentTime > barrierTime;
+function dependencyGraphGuardStateMarker(state, headSha) {
+  return `<!-- openclaw:dependency-graph-guard state=${state} sha=${headSha ?? "<head-sha>"} -->`;
 }
 
-export function dependencyGuardCommentHeadSha(comment) {
-  const body = comment?.body ?? "";
-  const patterns = [
-    /Approved SHA:\s+`([a-f0-9]{40})`/iu,
-    /current head SHA\s+\(`([a-f0-9]{40})`\)/iu,
-    /Current SHA:\s+`([a-f0-9]{40})`/iu,
-  ];
-  for (const pattern of patterns) {
-    const match = body.match(pattern);
-    if (match?.[1]) {
-      return match[1];
-    }
-  }
-  return null;
+function hasDependencyGraphGuardState(comment, state, headSha) {
+  // Only the machine-owned comment prefix carries reusable guard state. PR-controlled paths
+  // rendered later in the comment must never be able to create an allow decision.
+  return (
+    Boolean(headSha) &&
+    comment?.body?.startsWith(
+      `${dependencyGraphGuardMarker}\n${dependencyGraphGuardStateMarker(state, headSha)}\n`,
+    ) === true
+  );
 }
 
 export function dependencyOverrideExpectedSha(existingGuardComment, currentHeadSha) {
-  if (
-    !currentHeadSha ||
-    existingGuardComment?.body?.includes("### Dependency graph changes are blocked") !== true
-  ) {
-    return null;
-  }
-  return dependencyGuardCommentHeadSha(existingGuardComment) === currentHeadSha
+  return hasDependencyGraphGuardState(existingGuardComment, "blocked", currentHeadSha)
     ? currentHeadSha
     : null;
 }
 
 export function isDependencyGuardAuthorizedForHead(comment, currentHeadSha) {
-  return (
-    Boolean(currentHeadSha) &&
-    comment?.body?.includes("### Dependency graph change authorized") === true &&
-    dependencyGuardCommentHeadSha(comment) === currentHeadSha
-  );
+  return hasDependencyGraphGuardState(comment, "authorized", currentHeadSha);
+}
+
+export function isDependencyGuardTrustedForHead(comment, currentHeadSha) {
+  return hasDependencyGraphGuardState(comment, "trusted", currentHeadSha);
 }
 
 export function securityApproverSet(value) {
-  return new Set(
-    String(value ?? "")
-      .split(/[\s,]+/u)
-      .map((login) => login.trim().toLowerCase())
-      .filter(Boolean),
-  );
+  return normalizeGuardLoginSet(value);
 }
 
 export function dependencyGuardCommentAuthors(value) {
-  return new Set(
-    String(value ?? "github-actions[bot]")
-      .split(/[\s,]+/u)
-      .map((login) => login.trim().toLowerCase())
-      .filter(Boolean),
-  );
+  return normalizeGuardLoginSet(value, "github-actions[bot]");
 }
 
 export function isDependencyGuardMarkerComment(comment, marker, trustedAuthors) {
@@ -245,7 +272,7 @@ export function isDependencyGuardMarkerComment(comment, marker, trustedAuthors) 
   return Boolean(login && trustedAuthors.has(login) && comment.body?.includes(marker));
 }
 
-export function renderDependencyAwarenessComment(dependencyFiles) {
+function renderDependencyAwarenessComment(dependencyFiles) {
   const listedFiles = dependencyFiles.slice(0, maxListedFiles);
   const omittedCount = dependencyFiles.length - listedFiles.length;
   const fileLines = listedFiles.map((filename) => `- ${markdownCode(filename)}`);
@@ -265,8 +292,8 @@ export function renderDependencyAwarenessComment(dependencyFiles) {
     "",
     "Maintainer follow-up:",
     "- Review whether the dependency changes are intentional.",
-    "- Inspect resolved package deltas when lockfile, shrinkwrap, or workspace dependency policy changes are present.",
-    "- Treat `package-lock.json` and `npm-shrinkwrap.json` diffs as security-review surfaces.",
+    "- Inspect resolved package deltas when lockfiles or workspace dependency policy changes are present.",
+    "- Treat `pnpm-lock.yaml` and `package-lock.json` diffs as dependency security-review surfaces.",
     "- Run `pnpm deps:changes:report -- --base-ref origin/main --markdown /tmp/dependency-changes.md --json /tmp/dependency-changes.json` locally for detailed release-style evidence.",
   ].join("\n");
 }
@@ -274,13 +301,14 @@ export function renderDependencyAwarenessComment(dependencyFiles) {
 export function renderAuthorizedDependencyComment(override) {
   const lines = [
     dependencyGraphGuardMarker,
+    dependencyGraphGuardStateMarker("authorized", override.sha),
     "",
     "### Dependency graph change authorized",
     "",
-    "This PR includes dependency graph changes. A member of `@openclaw/openclaw-secops` authorized this exact head SHA with `/allow-dependencies-change`.",
+    "This PR includes dependency graph changes. A repository admin or member of `@openclaw/openclaw-secops` authorized this exact head SHA with `/allow-dependencies-change`.",
     "",
     `- Approved SHA: ${markdownCode(override.sha)}`,
-    `- Approved by: @${sanitizeDisplayValue(override.login)}`,
+    `- Approved by: @${sanitizeGuardDisplayValue(override.login)}`,
   ];
   if (override.reason) {
     lines.push(`- Reason: ${markdownCode(override.reason)}`);
@@ -289,8 +317,45 @@ export function renderAuthorizedDependencyComment(override) {
   return lines.join("\n");
 }
 
+export function renderTrustedDependencyComment({ actor, headSha }) {
+  return [
+    dependencyGraphGuardMarker,
+    dependencyGraphGuardStateMarker("trusted", headSha),
+    "",
+    "### Dependency graph changes noted",
+    "",
+    "This PR includes dependency graph changes. The dependency guard is informational because the PR author is a repository admin, a member of `@openclaw/openclaw-secops`, or an OpenClaw organization member with Maintain or Admin repository access.",
+    "",
+    `- Current SHA: ${markdownCode(headSha ?? "<head-sha>")}`,
+    `- Trusted actor: @${sanitizeGuardDisplayValue(actor.login)}`,
+    `- Trusted role: ${markdownCode(actor.reason)}`,
+    "",
+    "Security review is still recommended before merge when the dependency graph change is intentional.",
+  ].join("\n");
+}
+
+export function renderRemovalOnlyDependencyComment({ dependencyGraphChanges, headSha }) {
+  const removalLines = dependencyGraphChanges.map(
+    (change) =>
+      `- Removed ${markdownCode(change.name ?? "<unknown dependency>")} from ${markdownCode(change.manifest ?? "<unknown manifest>")}.`,
+  );
+  return [
+    dependencyGraphGuardMarker,
+    "",
+    "### Dependency removals noted",
+    "",
+    "This PR only removes dependencies from the dependency graph, so the dependency guard is informational and does not require `/allow-dependencies-change`.",
+    "",
+    ...removalLines,
+    "",
+    `- Current SHA: ${markdownCode(headSha ?? "<head-sha>")}`,
+    "",
+    "A later push that adds or changes dependency graph entries will require a fresh security approval.",
+  ].join("\n");
+}
+
 export function renderAutoscrubbedDependencyComment({ baseBranch, lockfileChanges, commitSha }) {
-  const safeBranch = sanitizeDisplayValue(baseBranch ?? "main");
+  const safeBranch = sanitizeGuardDisplayValue(baseBranch ?? "main");
   const fileLines = lockfileChanges.map((path) => `- ${markdownCode(path)}`);
   return `${dependencyGraphGuardMarker}
 
@@ -325,6 +390,15 @@ export function renderClearedDependencyGuardComment({ headSha }) {
   ].join("\n");
 }
 
+/**
+ * @param {{
+ *   baseBranch?: string,
+ *   headSha?: string,
+ *   lockfileChanges: string[],
+ *   dependencyManifestChanges: DependencyManifestChange[],
+ *   autoscrubStatus?: AutoscrubStatus | null,
+ * }} options
+ */
 export function renderBlockedDependencyComment({
   baseBranch,
   headSha,
@@ -332,7 +406,7 @@ export function renderBlockedDependencyComment({
   dependencyManifestChanges,
   autoscrubStatus,
 }) {
-  const safeBranch = sanitizeDisplayValue(baseBranch ?? "main");
+  const safeBranch = sanitizeGuardDisplayValue(baseBranch ?? "main");
   const baseRef = shellQuote(`origin/${safeBranch}`);
   const reasons = [];
   for (const path of lockfileChanges) {
@@ -358,17 +432,18 @@ export function renderBlockedDependencyComment({
       : [];
   return [
     dependencyGraphGuardMarker,
+    dependencyGraphGuardStateMarker("blocked", headSha),
     "",
     "### Dependency graph changes are blocked",
     "",
-    "OpenClaw does not accept dependency graph changes through PRs unless security explicitly authorizes the current head SHA. Dependency updates are generated internally by maintainers so external PRs cannot change the resolved graph.",
+    "OpenClaw does not accept dependency graph changes through PRs unless a repository admin or security explicitly authorizes the current head SHA. Dependency updates are generated internally by maintainers so external PRs cannot change the resolved graph.",
     "",
     "Detected dependency graph changes:",
     ...reasons,
     ...autoscrubLines,
     ...removalSteps,
     "",
-    "If this PR intentionally needs a dependency graph change, ask a member of `@openclaw/openclaw-secops` to comment:",
+    "If this PR intentionally needs a dependency graph change, ask a repository admin or member of `@openclaw/openclaw-secops` to comment:",
     "",
     "```text",
     allowDependenciesCommand,
@@ -415,52 +490,54 @@ function renderAutoscrubStatusLines(status) {
   return [];
 }
 
+export function dependencyGuardTrustedActorCandidates({ pullRequest, event, currentHeadSha }) {
+  return guardTrustedActorCandidates({ pullRequest, event, currentHeadSha });
+}
+
+/**
+ * @param {{
+ *   candidates: GuardActorCandidate[],
+ *   pullRequest: { author_association?: string },
+ *   isDependencyApprover: (login: string) => Promise<string | null>,
+ *   getRepositoryRoleName: (login: string) => Promise<string | null>,
+ * }} options
+ */
+export async function findTrustedDependencyGuardActor({
+  candidates,
+  pullRequest,
+  isDependencyApprover,
+  getRepositoryRoleName,
+}) {
+  for (const candidate of candidates) {
+    let role = await isDependencyApprover(candidate.login);
+    if (!role && pullRequest.author_association === "MEMBER") {
+      // GitHub's MEMBER association excludes outside collaborators. Keep this role path separate
+      // from override approvers so Maintain authors cannot authorize another contributor's PR.
+      const repositoryRole = await getRepositoryRoleName(candidate.login);
+      if (repositoryRole === "maintain" || repositoryRole === "admin") {
+        role = `OpenClaw organization member with repository ${repositoryRole} role`;
+      }
+    }
+    if (role) {
+      return {
+        login: candidate.login,
+        reason: `${candidate.source}; ${role}`,
+      };
+    }
+  }
+  return null;
+}
+
 function renderManifestChangeLine(change) {
   return `- ${markdownCode(change.path)} changed ${change.fields.map(markdownCode).join(", ")}.`;
 }
 
-function githubErrorBodyTooLarge(maxBytes) {
-  return new Error(`GitHub error response body exceeded ${maxBytes} bytes`);
-}
-
-export async function readBoundedGitHubErrorText(response, maxBytes = GITHUB_ERROR_BODY_MAX_BYTES) {
-  return await readBoundedResponseText(response, "GitHub error", maxBytes, {
-    createTooLargeError: () => githubErrorBodyTooLarge(maxBytes),
-  });
-}
-
-export function githubApi(token) {
-  const baseHeaders = {
-    accept: "application/vnd.github+json",
-    authorization: `Bearer ${token}`,
-    "user-agent": "openclaw-dependency-guard",
-    "x-github-api-version": "2022-11-28",
-  };
-  const request = async (path, options = {}) => {
-    const response = await fetch(`https://api.github.com${path}`, {
-      ...options,
-      headers: { ...baseHeaders, ...options.headers },
-    });
-    if (response.status === 204) {
-      return null;
-    }
-    if (!response.ok) {
-      let errorText;
-      try {
-        errorText = await readBoundedGitHubErrorText(response);
-      } catch (bodyError) {
-        errorText = bodyError instanceof Error ? bodyError.message : String(bodyError);
-      }
-      const error = new Error(`${response.status} ${response.statusText}: ${errorText}`);
-      error.status = response.status;
-      throw error;
-    }
-    return response.json();
-  };
+export function githubApi(token, options = {}) {
+  const api = createGitHubApi(token, { ...options, userAgent: "openclaw-dependency-guard" });
   return {
-    request,
+    ...api,
     graphql: async (query, variables) => {
-      const result = await request("/graphql", {
+      const result = await api.request("/graphql", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ query, variables }),
@@ -473,17 +550,6 @@ export function githubApi(token) {
         throw error;
       }
       return result.data;
-    },
-    paginate: async (path) => {
-      const items = [];
-      for (let page = 1; ; page += 1) {
-        const separator = path.includes("?") ? "&" : "?";
-        const pageItems = await request(`${path}${separator}per_page=100&page=${page}`);
-        items.push(...pageItems);
-        if (pageItems.length < 100) {
-          return items;
-        }
-      }
     },
   };
 }
@@ -693,66 +759,8 @@ async function main() {
   const existingGuardComment = findDependencyGuardComment(dependencyGraphGuardMarker);
   const labelNames = new Set(labels.map((label) => label.name));
 
-  const ignoreUnavailableWritePermission = (action) => (error) => {
-    if (error?.status === 403) {
-      console.warn(`Skipping ${action}; token does not have write permission.`);
-      return;
-    }
-    if (error?.status === 404 || error?.status === 422) {
-      console.warn(`${action} is unavailable.`);
-      return;
-    }
-    throw error;
-  };
-  const removeLabelIfPresent = async (label) => {
-    if (!labelNames.has(label)) {
-      return;
-    }
-    await api
-      .request(`${issuePath}/labels/${encodeURIComponent(label)}`, {
-        method: "DELETE",
-      })
-      .catch(ignoreUnavailableWritePermission(`label "${label}" removal`));
-    labelNames.delete(label);
-  };
-  const addLabelIfMissing = async (label) => {
-    if (labelNames.has(label)) {
-      return;
-    }
-    await api
-      .request(`${issuePath}/labels`, {
-        method: "POST",
-        body: JSON.stringify({ labels: [label] }),
-      })
-      .catch(ignoreUnavailableWritePermission(`label "${label}" update`));
-    labelNames.add(label);
-  };
-  const deleteCommentIfPresent = async (comment) => {
-    if (!comment) {
-      return;
-    }
-    await api
-      .request(`/repos/${owner}/${repo}/issues/comments/${comment.id}`, {
-        method: "DELETE",
-      })
-      .catch(ignoreUnavailableWritePermission("comment deletion"));
-  };
-  const upsertComment = async (comment, body) => {
-    if (comment) {
-      return await api
-        .request(`/repos/${owner}/${repo}/issues/comments/${comment.id}`, {
-          method: "PATCH",
-          body: JSON.stringify({ body }),
-        })
-        .catch(ignoreUnavailableWritePermission("comment update"));
-    }
-    return await api
-      .request(`${issuePath}/comments`, {
-        method: "POST",
-        body: JSON.stringify({ body }),
-      })
-      .catch(ignoreUnavailableWritePermission("comment creation"));
-  };
+  const { removeLabelIfPresent, addLabelIfMissing, deleteCommentIfPresent, upsertComment } =
+    createIssueMutationHelpers({ api, issuePath, owner, repo, labelNames });
 
   if (dependencyGraphFiles.length === 0) {
     await removeLabelIfPresent(dependencyChangedLabel);
@@ -791,6 +799,83 @@ async function main() {
         renderClearedDependencyGuardComment({ headSha: pullRequest.head?.sha }),
       );
     }
+    return;
+  }
+
+  const { getRepositoryRoleName, isSecurityMember, isRepositoryAdmin } = createGuardApproverChecks({
+    api,
+    owner,
+    repo,
+    securityTeamSlug,
+    explicitSecurityApprovers,
+  });
+  const isDependencyApprover = async (login) => {
+    if (await isSecurityMember(login)) {
+      return securityTeamSlug;
+    }
+    if (await isRepositoryAdmin(login)) {
+      return "repository admin";
+    }
+    return null;
+  };
+  const currentHeadSha = pullRequest.head?.sha;
+  if (isDependencyGuardTrustedForHead(existingGuardComment, currentHeadSha)) {
+    if (mode === "detect") {
+      await setOutput("autoscrub", "false");
+    }
+    await writeSummary(
+      [
+        "## Dependency Guard",
+        "",
+        `Dependency graph change remains informational for a trusted actor at ${markdownCode(currentHeadSha)}.`,
+      ].join("\n"),
+    );
+    console.log("Dependency graph change remains informational for this head SHA.");
+    return;
+  }
+  const trustedActor = await findTrustedDependencyGuardActor({
+    candidates: dependencyGuardTrustedActorCandidates({ pullRequest, event, currentHeadSha }),
+    pullRequest,
+    isDependencyApprover,
+    getRepositoryRoleName,
+  });
+  if (trustedActor) {
+    if (mode === "detect") {
+      await setOutput("autoscrub", "false");
+    }
+    await upsertComment(
+      existingGuardComment,
+      renderTrustedDependencyComment({ actor: trustedActor, headSha: currentHeadSha }),
+    );
+    await writeSummary(
+      [
+        "## Dependency Guard",
+        "",
+        `Dependency graph change noted for trusted actor @${sanitizeGuardDisplayValue(trustedActor.login)} and allowed to continue.`,
+      ].join("\n"),
+    );
+    console.log("Dependency graph change noted for trusted actor; guard is informational.");
+    return;
+  }
+
+  const dependencyGraphChanges = await api.paginate(
+    `/repos/${owner}/${repo}/dependency-graph/compare/${pullRequest.base?.sha}...${pullRequest.head?.sha}`,
+  );
+  if (isRemovalOnlyDependencyGraphChange(dependencyGraphChanges)) {
+    if (mode === "detect") {
+      await setOutput("autoscrub", "false");
+    }
+    await upsertComment(
+      existingGuardComment,
+      renderRemovalOnlyDependencyComment({
+        dependencyGraphChanges,
+        headSha: pullRequest.head?.sha,
+      }),
+    );
+    await writeSummary(
+      "## Dependency Guard\n\nDependency removals are informational and do not require security approval.",
+    );
+    console.log("Dependency removals detected; guard is informational.");
     return;
   }
 
@@ -891,32 +976,6 @@ async function main() {
       };
     }
   }
-
-  const membershipCache = new Map();
-  const isSecurityMember = async (login) => {
-    const normalizedLogin = login.toLowerCase();
-    if (explicitSecurityApprovers.size > 0) {
-      return explicitSecurityApprovers.has(normalizedLogin);
-    }
-    if (membershipCache.has(login)) {
-      return membershipCache.get(login);
-    }
-    try {
-      const membership = await api.request(
-        `/orgs/${owner}/teams/${securityTeamSlug}/memberships/${encodeURIComponent(login)}`,
-      );
-      const allowed = membership?.state === "active";
-      membershipCache.set(login, allowed);
-      return allowed;
-    } catch (error) {
-      if (error?.status !== 404) {
-        console.warn(`Could not verify ${login} against ${securityTeamSlug}: ${error.message}`);
-      }
-      membershipCache.set(login, false);
-      return false;
-    }
-  };
-  const currentHeadSha = pullRequest.head?.sha;
   if (isDependencyGuardAuthorizedForHead(existingGuardComment, currentHeadSha)) {
     await writeSummary(
       [
@@ -931,7 +990,7 @@ async function main() {
   const override = await findDependencyOverrideCommandAsync({
     comments,
     expectedSha: dependencyOverrideExpectedSha(existingGuardComment, currentHeadSha),
-    isSecurityMember,
+    isSecurityMember: async (login) => Boolean(await isDependencyApprover(login)),
     newerThan: existingGuardComment?.updated_at ?? existingGuardComment?.created_at,
   });
   if (override) {
@@ -940,10 +999,10 @@ async function main() {
       [
         "## Dependency Guard",
         "",
-        `Dependency graph change authorized by @${sanitizeDisplayValue(override.login)} for ${markdownCode(override.sha)}.`,
+        `Dependency graph change authorized by @${sanitizeGuardDisplayValue(override.login)} for ${markdownCode(override.sha)}.`,
       ].join("\n"),
     );
-    console.log("Dependency graph change authorized by security override.");
+    console.log("Dependency graph change authorized by trusted override.");
     return;
   }
 
@@ -958,9 +1017,11 @@ async function main() {
     }),
   );
   await writeSummary(
-    "## Dependency Guard\n\nDependency graph changes are blocked without a current secops override.",
+    "## Dependency Guard\n\nDependency graph changes are blocked without a current admin or secops override.",
   );
-  throw new Error("Dependency graph changes require removal or a current secops override.");
+  throw new Error(
+    "Dependency graph changes require removal or a current admin or secops override.",
+  );
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

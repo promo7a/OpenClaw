@@ -1,3 +1,4 @@
+// Imessage tests cover doctor plugin behavior.
 import { describe, expect, it } from "vitest";
 import { imessageDoctor } from "./doctor.js";
 
@@ -8,8 +9,8 @@ describe("imessageDoctor.collectPreviewWarnings", () => {
         channels: {
           imessage: {
             accounts: {
-              "swang430-gmail-com": {},
-              default: {},
+              "swang430-gmail-com": { enabled: true },
+              default: { enabled: true },
             },
           },
         },

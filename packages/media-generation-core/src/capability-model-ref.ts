@@ -1,4 +1,5 @@
-import { normalizeOptionalString } from "./string.js";
+// Media Generation Core module implements capability model ref behavior.
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 
 /** Provider catalog entry shape used when resolving capability-scoped model references. */
 export type CapabilityModelProviderCandidate = {

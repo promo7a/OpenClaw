@@ -1,3 +1,6 @@
+/**
+ * Appends raw embedded-agent stream payloads for diagnostics when enabled.
+ */
 import fs from "node:fs";
 import path from "node:path";
 import { resolveStateDir } from "../config/paths.js";
@@ -17,7 +20,7 @@ function resolveRawStreamPath(): string {
   );
 }
 
-export function appendRawStream(payload: Record<string, unknown>) {
+export function appendRawStream(createPayload: () => Record<string, unknown>) {
   if (!isRawStreamEnabled()) {
     return;
   }
@@ -31,12 +34,15 @@ export function appendRawStream(payload: Record<string, unknown>) {
     }
   }
   try {
+    // Evaluate and serialize before the async append while the message snapshot is current.
     void appendRegularFile({
       filePath: rawStreamPath,
-      content: `${JSON.stringify(payload)}\n`,
+      content: `${JSON.stringify(createPayload())}\n`,
       rejectSymlinkParents: true,
+    }).catch(() => {
+      // Raw diagnostics are best-effort; filesystem failures must not terminate agent runs.
     });
   } catch {
-    // ignore raw stream write failures
+    // JSON serialization can fail synchronously, for example with cyclic payloads.
   }
 }

@@ -1,8 +1,10 @@
+// Slack helper module supports config behavior.
 export { getRuntimeConfig } from "openclaw/plugin-sdk/runtime-config-snapshot";
 export { isDangerousNameMatchingEnabled } from "openclaw/plugin-sdk/dangerous-name-runtime";
 export {
+  getSessionEntry,
   readSessionUpdatedAt,
-  resolveSessionKey,
+  resolveChannelResetConfig,
   resolveStorePath,
   updateLastRoute,
 } from "openclaw/plugin-sdk/session-store-runtime";

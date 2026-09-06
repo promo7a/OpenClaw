@@ -1,3 +1,4 @@
+// Status gateway connection tests cover connection detail resolution and terminal logging.
 import { describe, expect, it, vi } from "vitest";
 import {
   logGatewayConnectionDetails,
@@ -46,6 +47,23 @@ describe("status.gateway-connection", () => {
         "Fix: set gateway.remote.url, or set gateway.mode=local.",
       ].join("\n"),
     );
+  });
+
+  it("redacts credentials from the remote fallback URL", () => {
+    const details = resolveStatusAllConnectionDetails({
+      nodeOnlyGateway: null,
+      remoteUrlMissing: true,
+      gatewayConnection: {
+        url: "ws://user:secret@127.0.0.1:18789?token=abc123",
+        urlSource: "env",
+        message: "ignored",
+      },
+      bindMode: "loopback",
+      configPath: "/tmp/openclaw.json",
+    });
+    expect(details).not.toContain("secret");
+    expect(details).not.toContain("abc123");
+    expect(details).toContain("ws://***:***@127.0.0.1:18789/?token=***");
   });
 
   it("prefers node-only connection details when present", () => {

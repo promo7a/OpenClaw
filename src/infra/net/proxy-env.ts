@@ -1,3 +1,8 @@
+import { expectDefined } from "@openclaw/normalization-core";
+// Proxy environment helpers mirror undici EnvHttpProxyAgent selection while
+// adding OpenClaw NO_PROXY CIDR/wildcard bypass checks.
+import { readTrimmedStringAlias } from "../../utils/string-readers.js";
+
 export const PROXY_ENV_KEYS = [
   "HTTP_PROXY",
   "HTTPS_PROXY",
@@ -9,16 +14,12 @@ export const PROXY_ENV_KEYS = [
 
 /** Return whether any supported proxy environment variable is non-blank. */
 export function hasProxyEnvConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
-  for (const key of PROXY_ENV_KEYS) {
-    const value = env[key];
-    if (typeof value === "string" && value.trim().length > 0) {
-      return true;
-    }
-  }
-  return false;
+  return readTrimmedStringAlias(env, PROXY_ENV_KEYS) !== undefined;
 }
 
 function normalizeProxyEnvValue(value: string | undefined): string | null | undefined {
+  // Empty lowercase env vars intentionally shadow uppercase values, matching
+  // undici's EnvHttpProxyAgent precedence.
   if (typeof value !== "string") {
     return undefined;
   }
@@ -101,9 +102,10 @@ export function shouldUseEnvHttpProxyForUrl(
   targetUrl: string,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
+  let parsed: URL;
   let protocol: "http" | "https";
   try {
-    const parsed = new URL(targetUrl);
+    parsed = new URL(targetUrl);
     if (parsed.protocol === "http:") {
       protocol = "http";
     } else if (parsed.protocol === "https:") {
@@ -115,7 +117,7 @@ export function shouldUseEnvHttpProxyForUrl(
     return false;
   }
 
-  return hasEnvHttpProxyConfigured(protocol, env) && !matchesNoProxy(targetUrl, env);
+  return hasEnvHttpProxyConfigured(protocol, env) && !matchesNoProxy(parsed, env);
 }
 
 /**
@@ -125,6 +127,8 @@ export function shouldUseEnvHttpProxyForUrl(
  * (`undici/lib/dispatcher/env-http-proxy-agent.js`):
  * - Entries separated by commas OR whitespace (undici splits on `/[,\s]/`)
  * - Case-insensitive
+ * - A single trailing DNS dot is ignored in both hosts and entries
+ * - Lower-case `no_proxy` shadows upper-case `NO_PROXY`, including blank values
  * - Empty or missing → no bypass
  * - Bare `*` value → bypass everything
  * - Exact hostname match
@@ -145,20 +149,27 @@ export function shouldUseEnvHttpProxyForUrl(
  * in provider HTTP helpers; see openclaw#64974 review thread on NO_PROXY
  * SSRF bypass.
  */
-export function matchesNoProxy(targetUrl: string, env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = normalizeProxyEnvValue(env.no_proxy) ?? normalizeProxyEnvValue(env.NO_PROXY);
+export function matchesNoProxy(
+  targetUrl: string | URL,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const raw = env.no_proxy ?? env.NO_PROXY ?? "";
   if (!raw) {
     return false;
   }
 
   let parsed: URL;
   try {
-    parsed = new URL(targetUrl);
+    parsed = targetUrl instanceof URL ? targetUrl : new URL(targetUrl);
   } catch {
     return false;
   }
 
-  const targetHost = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  // Keep the eligibility gate aligned with Undici so direct bypasses retain DNS pinning.
+  const targetHost = parsed.hostname
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "")
+    .replace(/^(.+)\.$/, "$1");
   if (!targetHost) {
     return false;
   }
@@ -167,6 +178,7 @@ export function matchesNoProxy(targetUrl: string, env: NodeJS.ProcessEnv = proce
     return true;
   }
 
+  const targetIpv4 = parseIpv4Address(targetHost);
   const targetPort =
     parsed.port !== ""
       ? parsed.port
@@ -191,7 +203,7 @@ export function matchesNoProxy(targetUrl: string, env: NodeJS.ProcessEnv = proce
       if (!m) {
         continue;
       }
-      entryHost = m[1];
+      entryHost = expectDefined(m[1], "m capture group 1");
       entryPort = m[2];
     } else {
       const firstColonIdx = entry.indexOf(":");
@@ -215,12 +227,12 @@ export function matchesNoProxy(targetUrl: string, env: NodeJS.ProcessEnv = proce
     // Mirror undici: strip optional leading `*` followed by `.` so both
     // `.example.com` and `*.example.com` normalize to `example.com`. That also
     // means apex hosts still match those entries after normalization.
-    const normalizedEntry = entryHost.replace(/^\*\./, "").replace(/^\./, "");
+    const normalizedEntry = entryHost.replace(/^\*?\./, "").replace(/^(.+)\.$/, "$1");
     if (!normalizedEntry || normalizedEntry === "*") {
       continue;
     }
 
-    if (matchesIpv4NoProxyPattern(targetHost, normalizedEntry)) {
+    if (matchesIpv4NoProxyPattern(targetIpv4, normalizedEntry)) {
       return true;
     }
 
@@ -253,15 +265,14 @@ function parseIpv4Address(host: string): number | undefined {
   return value >>> 0;
 }
 
-function matchesIpv4NoProxyPattern(targetHost: string, entryHost: string): boolean {
-  const target = parseIpv4Address(targetHost);
+function matchesIpv4NoProxyPattern(target: number | undefined, entryHost: string): boolean {
   if (target === undefined) {
     return false;
   }
 
   const cidrMatch = entryHost.match(/^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/);
   if (cidrMatch) {
-    const network = parseIpv4Address(cidrMatch[1]);
+    const network = parseIpv4Address(expectDefined(cidrMatch[1], "cidr match capture group 1"));
     const prefixLength = Number(cidrMatch[2]);
     if (network === undefined || prefixLength < 0 || prefixLength > 32) {
       return false;
@@ -273,22 +284,20 @@ function matchesIpv4NoProxyPattern(targetHost: string, entryHost: string): boole
   if (!entryHost.includes("*")) {
     return false;
   }
-  const targetParts = targetHost.split(".");
   const patternParts = entryHost.split(".");
   if (patternParts.length > 4 || patternParts.length === 0) {
     return false;
   }
-  for (let index = 0; index < patternParts.length; index += 1) {
-    const part = patternParts[index];
+  for (const [index, part] of patternParts.entries()) {
     if (part === "*") {
       if (index === patternParts.length - 1) {
         return true;
       }
       continue;
     }
-    if (!/^\d{1,3}$/.test(part) || Number(part) !== Number(targetParts[index])) {
+    if (!/^\d{1,3}$/.test(part) || Number(part) !== ((target >>> ((3 - index) * 8)) & 255)) {
       return false;
     }
   }
-  return patternParts.length === targetParts.length;
+  return patternParts.length === 4;
 }

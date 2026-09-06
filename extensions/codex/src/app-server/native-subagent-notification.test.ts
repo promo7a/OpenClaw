@@ -1,8 +1,9 @@
+// Codex tests cover native subagent notification plugin behavior.
 import { describe, expect, it } from "vitest";
-import {
-  extractCodexNativeSubagentCompletions,
-  extractCodexNativeSubagentCompletionsFromText,
-} from "./native-subagent-notification.js";
+import { codexNativeSubagentNotifications } from "./native-subagent-notification.js";
+
+const extractCodexNativeSubagentCompletions = codexNativeSubagentNotifications.fromNotification;
+const extractCodexNativeSubagentCompletionsFromText = codexNativeSubagentNotifications.fromText;
 
 function trustedInterAgentNotification(params: {
   agentPath: string;
@@ -35,6 +36,40 @@ function trustedInterAgentNotification(params: {
 }
 
 describe("Codex native subagent notifications", () => {
+  it("recognizes a native completion receipt without treating its payload as a status", () => {
+    expect(
+      codexNativeSubagentNotifications.deliveredAgentPaths({
+        method: "rawResponseItem/completed",
+        params: {
+          threadId: "parent-thread",
+          turnId: "parent-turn",
+          item: {
+            type: "agent_message",
+            author: "/root/worker",
+            recipient: "/root",
+            content: [
+              {
+                type: "input_text",
+                text: "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\nBuild result",
+              },
+            ],
+          },
+        },
+      }),
+    ).toEqual(["/root/worker"]);
+  });
+
+  it("recognizes the earlier trusted inter-agent completion envelope as a delivery receipt", () => {
+    expect(
+      codexNativeSubagentNotifications.deliveredAgentPaths(
+        trustedInterAgentNotification({
+          agentPath: "child-thread",
+          text: '<subagent_notification>{"agent_path":"child-thread","status":{"completed":"done"}}</subagent_notification>',
+        }),
+      ),
+    ).toEqual(["child-thread"]);
+  });
+
   it("parses completed child results from Codex notification XML", () => {
     expect(
       extractCodexNativeSubagentCompletionsFromText(
@@ -47,6 +82,30 @@ describe("Codex native subagent notifications", () => {
         status: "succeeded",
         statusLabel: "completed",
         result: "done",
+      },
+    ]);
+  });
+
+  it("preserves Codex completed-without-final as a typed reason", () => {
+    expect(
+      extractCodexNativeSubagentCompletionsFromText(
+        '<subagent_notification>{"agent_path":"null-child","status":{"completed":null}}' +
+          "</subagent_notification>\n" +
+          '<subagent_notification>{"agent_path":"empty-child","status":{"completed":"  "}}' +
+          "</subagent_notification>",
+      ),
+    ).toEqual([
+      {
+        agentPath: "null-child",
+        status: "succeeded",
+        statusLabel: "completed_without_final_message",
+        result: "Codex native subagent completed without a final assistant message.",
+      },
+      {
+        agentPath: "empty-child",
+        status: "succeeded",
+        statusLabel: "completed_without_final_message",
+        result: "Codex native subagent completed without a final assistant message.",
       },
     ]);
   });

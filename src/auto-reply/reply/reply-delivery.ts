@@ -1,6 +1,7 @@
+/** Normalizes reply directives and delivers block replies through streaming or direct paths. */
 import { hasOutboundReplyContent } from "openclaw/plugin-sdk/reply-payload";
 import { logVerbose } from "../../globals.js";
-import { copyReplyPayloadMetadata } from "../reply-payload.js";
+import { copyReplyPayloadMetadata, isReplyPayloadTerminalContent } from "../reply-payload.js";
 import { SILENT_REPLY_TOKEN } from "../tokens.js";
 import type { BlockReplyContext, ReplyPayload, ReplyThreadingPolicy } from "../types.js";
 import type { BlockReplyPipeline } from "./block-reply-pipeline.js";
@@ -9,8 +10,9 @@ import { parseReplyDirectives } from "./reply-directives.js";
 import { applyReplyTagsToPayload, isRenderablePayload } from "./reply-payloads.js";
 import type { TypingSignaler } from "./typing-mode.js";
 
-export type ReplyDirectiveParseMode = "always" | "auto" | "never";
+type ReplyDirectiveParseMode = "always" | "auto" | "never";
 
+/** Parses inline reply directives into payload fields and silent-reply state. */
 export function normalizeReplyPayloadDirectives(params: {
   payload: ReplyPayload;
   currentMessageId?: string;
@@ -47,7 +49,7 @@ export function normalizeReplyPayloadDirectives(params: {
   }
 
   const mediaUrls = params.payload.mediaUrls ?? parsed?.mediaUrls;
-  const mediaUrl = params.payload.mediaUrl ?? parsed?.mediaUrl ?? mediaUrls?.[0];
+  const mediaUrl = params.payload.mediaUrl ?? parsed?.mediaUrls?.[0] ?? mediaUrls?.[0];
 
   return {
     payload: copyReplyPayloadMetadata(params.payload, {
@@ -67,13 +69,20 @@ export function normalizeReplyPayloadDirectives(params: {
 async function sendDirectBlockReply(params: {
   onBlockReply: (payload: ReplyPayload, context?: BlockReplyContext) => Promise<void> | void;
   directlySentBlockKeys: Set<string>;
+  directlySentBlockPayloads: Array<ReplyPayload | undefined>;
   trackingPayload: ReplyPayload;
   payload: ReplyPayload;
 }) {
-  params.directlySentBlockKeys.add(createBlockReplyContentKey(params.trackingPayload));
+  const deliveryIndex = params.directlySentBlockPayloads.length;
+  params.directlySentBlockPayloads.push(undefined);
   await params.onBlockReply(params.payload);
+  if (isReplyPayloadTerminalContent(params.trackingPayload)) {
+    params.directlySentBlockKeys.add(createBlockReplyContentKey(params.trackingPayload));
+    params.directlySentBlockPayloads[deliveryIndex] = params.trackingPayload;
+  }
 }
 
+/** Creates the handler used for assistant block replies during streaming/tool phases. */
 export function createBlockReplyDeliveryHandler(params: {
   onBlockReply: (payload: ReplyPayload, context?: BlockReplyContext) => Promise<void> | void;
   currentMessageId?: string;
@@ -82,11 +91,22 @@ export function createBlockReplyDeliveryHandler(params: {
   applyReplyToMode: (payload: ReplyPayload) => ReplyPayload;
   normalizeMediaPaths?: (payload: ReplyPayload) => Promise<ReplyPayload>;
   typingSignals: TypingSignaler;
+  reasoningPayloadsEnabled?: boolean;
+  commentaryPayloadsEnabled?: boolean;
   blockStreamingEnabled: boolean;
   blockReplyPipeline: BlockReplyPipeline | null;
   directlySentBlockKeys: Set<string>;
+  directlySentBlockPayloads: Array<ReplyPayload | undefined>;
 }): (payload: ReplyPayload) => Promise<void> {
   return async (payload) => {
+    // Suppressed display lanes must not enter delivery bookkeeping: callers use
+    // that evidence to decide whether an otherwise empty turn needs a fallback.
+    if (
+      (payload.isReasoning === true && params.reasoningPayloadsEnabled !== true) ||
+      (payload.isCommentary === true && params.commentaryPayloadsEnabled !== true)
+    ) {
+      return;
+    }
     const { text, skip } = params.normalizeStreamingText(payload);
     if (skip && !hasOutboundReplyContent({ ...payload, text: undefined })) {
       return;
@@ -98,6 +118,7 @@ export function createBlockReplyDeliveryHandler(params: {
         : payload.replyToCurrent === false
           ? false
           : params.replyThreading?.implicitCurrentMessage !== "deny";
+    // Reply-to-current is implicit for block replies unless per-turn threading disables it.
 
     const taggedPayload = applyReplyTagsToPayload(
       {
@@ -160,13 +181,21 @@ export function createBlockReplyDeliveryHandler(params: {
       await sendDirectBlockReply({
         onBlockReply: params.onBlockReply,
         directlySentBlockKeys: params.directlySentBlockKeys,
+        directlySentBlockPayloads: params.directlySentBlockPayloads,
         trackingPayload: blockPayload,
         payload: blockPayload,
       });
-    } else if (blockHasNonTextContent) {
+    } else if (
+      blockHasNonTextContent ||
+      blockPayload.isReasoning === true ||
+      blockPayload.isCommentary === true
+    ) {
+      // Enabled display lanes never merge into final text, so deliver them directly
+      // even when block streaming is off.
       await sendDirectBlockReply({
         onBlockReply: params.onBlockReply,
         directlySentBlockKeys: params.directlySentBlockKeys,
+        directlySentBlockPayloads: params.directlySentBlockPayloads,
         trackingPayload: blockPayload,
         payload: blockPayload,
       });

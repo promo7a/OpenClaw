@@ -1,12 +1,15 @@
+// Provider discovery contract helpers define reusable discovery tests for provider plugins.
+import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AuthProfileStore, OpenClawConfig } from "../provider-auth.js";
+import { runProviderCatalog } from "../../plugins/provider-discovery.js";
 import {
   registerProviderPlugins as registerProviders,
   requireRegisteredProvider as requireProvider,
-  runProviderCatalog,
-} from "../testing.js";
+} from "../../test-utils/plugin-registration.js";
+import type { AuthProfileStore, OpenClawConfig } from "../provider-auth.js";
 
-const resolveCopilotApiTokenMock = vi.hoisted(() => vi.fn());
+const resolveCopilotRuntimeAuthMock = vi.hoisted(() => vi.fn());
 const buildVllmProviderMock = vi.hoisted(() => vi.fn());
 const buildSglangProviderMock = vi.hoisted(() => vi.fn());
 const ensureAuthProfileStoreMock = vi.hoisted(() => vi.fn());
@@ -135,14 +138,10 @@ function providerModelIds(provider: Record<string, unknown>): Array<unknown> {
 function installDiscoveryHooks(state: DiscoveryState, options: DiscoveryContractOptions) {
   beforeAll(async () => {
     vi.resetModules();
-    vi.doMock("openclaw/plugin-sdk/agent-runtime", () => {
+    vi.doMock("openclaw/plugin-sdk/provider-auth", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("../provider-auth.js")>();
       return {
-        ensureAuthProfileStore: ensureAuthProfileStoreMock,
-        listProfilesForProvider: listProfilesForProviderMock,
-      };
-    });
-    vi.doMock("openclaw/plugin-sdk/provider-auth", () => {
-      return {
+        ...actual,
         DEFAULT_COPILOT_API_BASE_URL: "https://api.individual.githubcopilot.com",
         MINIMAX_OAUTH_MARKER: "minimax-oauth",
         applyAuthProfileConfig: (config: OpenClawConfig) => config,
@@ -161,20 +160,46 @@ function installDiscoveryHooks(state: DiscoveryState, options: DiscoveryContract
           "Editor-Version": "vscode/1.96.2",
           "User-Agent": "GitHubCopilotChat/0.26.7",
         })),
-        coerceSecretRef: (value: unknown) =>
-          value && typeof value === "object" && !Array.isArray(value)
-            ? (value as Record<string, unknown>)
-            : null,
+        coerceSecretRef: asNullableRecord,
         ensureApiKeyFromOptionEnvOrPrompt: vi.fn(),
         ensureAuthProfileStore: ensureAuthProfileStoreMock,
         listProfilesForProvider: listProfilesForProviderMock,
         normalizeApiKeyInput: (value: unknown) => (typeof value === "string" ? value.trim() : ""),
-        normalizeOptionalSecretInput: (value: unknown) =>
-          typeof value === "string" && value.trim() ? value.trim() : undefined,
+        normalizeGithubCopilotDomain: (raw: unknown) => {
+          const trimmed = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+          return trimmed === "github.com" || /^[a-z0-9-]+\.ghe\.com$/.test(trimmed)
+            ? trimmed
+            : "github.com";
+        },
+        normalizeOptionalSecretInput: normalizeOptionalString,
         resolveNonEnvSecretRefApiKeyMarker: (source: unknown) =>
           typeof source === "string" ? source : "",
         upsertAuthProfile: vi.fn(),
         validateApiKeyInput: () => undefined,
+      };
+    });
+    vi.doMock("openclaw/plugin-sdk/provider-setup", async () => {
+      const actual = await vi.importActual<typeof import("../provider-setup.js")>(
+        "openclaw/plugin-sdk/provider-setup",
+      );
+      return {
+        ...actual,
+        discoverOpenAICompatibleLocalModels: async (params: {
+          apiKey?: string;
+          baseUrl: string;
+          label: string;
+        }) => {
+          const isVllm = params.label === "vLLM";
+          const defaultBaseUrl = isVllm ? "http://127.0.0.1:8000/v1" : "http://127.0.0.1:30000/v1";
+          const provider = requireRecord(
+            await (isVllm ? buildVllmProviderMock : buildSglangProviderMock)({
+              apiKey: params.apiKey,
+              ...(params.baseUrl === defaultBaseUrl ? {} : { baseUrl: params.baseUrl }),
+            }),
+            `${params.label} provider`,
+          );
+          return Array.isArray(provider.models) ? provider.models : [];
+        },
       };
     });
     if (options.githubCopilotRegisterRuntimeModuleId) {
@@ -182,7 +207,7 @@ function installDiscoveryHooks(state: DiscoveryState, options: DiscoveryContract
         const actual = await vi.importActual<object>(options.githubCopilotRegisterRuntimeModuleId!);
         return {
           ...actual,
-          resolveCopilotApiToken: resolveCopilotApiTokenMock,
+          resolveCopilotRuntimeAuth: resolveCopilotRuntimeAuthMock,
         };
       });
     }
@@ -193,7 +218,6 @@ function installDiscoveryHooks(state: DiscoveryState, options: DiscoveryContract
           VLLM_DEFAULT_BASE_URL: "http://127.0.0.1:8000/v1",
           VLLM_MODEL_PLACEHOLDER: "meta-llama/Meta-Llama-3-8B-Instruct",
           VLLM_PROVIDER_LABEL: "vLLM",
-          buildVllmProvider: (...args: unknown[]) => buildVllmProviderMock(...args),
         };
       });
     }
@@ -204,7 +228,6 @@ function installDiscoveryHooks(state: DiscoveryState, options: DiscoveryContract
           SGLANG_DEFAULT_BASE_URL: "http://127.0.0.1:30000/v1",
           SGLANG_MODEL_PLACEHOLDER: "Qwen/Qwen3-8B",
           SGLANG_PROVIDER_LABEL: "SGLang",
-          buildSglangProvider: (...args: unknown[]) => buildSglangProviderMock(...args),
         };
       });
     }
@@ -255,7 +278,7 @@ function installDiscoveryHooks(state: DiscoveryState, options: DiscoveryContract
 
   afterEach(() => {
     vi.restoreAllMocks();
-    resolveCopilotApiTokenMock.mockReset();
+    resolveCopilotRuntimeAuthMock.mockReset();
     buildVllmProviderMock.mockReset();
     buildSglangProviderMock.mockReset();
     ensureAuthProfileStoreMock.mockReset();
@@ -283,7 +306,7 @@ export function describeGithubCopilotProviderDiscoveryContract(params: {
       ).resolves.toBeNull();
     });
 
-    it("keeps profile-only catalog fallback provider-owned", async () => {
+    it("reports an unavailable profile catalog without replacing inventory", async () => {
       setGithubCopilotProfileSnapshot();
 
       await expect(
@@ -291,18 +314,19 @@ export function describeGithubCopilotProviderDiscoveryContract(params: {
           provider: state.githubCopilotProvider!,
         }),
       ).resolves.toEqual({
-        provider: {
-          baseUrl: "https://api.individual.githubcopilot.com",
-          models: [],
-        },
+        providers: {},
+        outcomes: [
+          { provider: "github-copilot", profileId: "github-copilot:github", status: "unavailable" },
+        ],
       });
     });
 
     it("keeps env-token base URL resolution provider-owned", async () => {
-      resolveCopilotApiTokenMock.mockResolvedValueOnce({
-        token: "copilot-api-token",
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ data: [] }));
+      resolveCopilotRuntimeAuthMock.mockResolvedValueOnce({
+        apiKey: "copilot-api-token",
+        source: "validated:https://api.github.com/copilot_internal/user",
         baseUrl: "https://copilot-proxy.example.com",
-        expiresAt: Date.now() + 60_000,
       });
 
       await expect(
@@ -318,9 +342,10 @@ export function describeGithubCopilotProviderDiscoveryContract(params: {
           baseUrl: "https://copilot-proxy.example.com",
           models: [],
         },
+        outcomes: [{ provider: "github-copilot", status: "ready" }],
       });
       const copilotCall = requireRecord(
-        resolveCopilotApiTokenMock.mock.calls.at(0)?.[0],
+        resolveCopilotRuntimeAuthMock.mock.calls.at(0)?.[0],
         "copilot token params",
       );
       expect(copilotCall.githubToken).toBe("github-env-token");
@@ -694,6 +719,17 @@ export function describeMinimaxProviderDiscoveryContract(
 
   describe("minimax provider discovery contract", () => {
     installDiscoveryHooks(state, { providerIds: ["minimax"], loadMinimax: load });
+    beforeEach(() => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () =>
+          Response.json({
+            data: [{ id: "MiniMax-M3" }, { id: "MiniMax-M2.7" }, { id: "MiniMax-M2.7-highspeed" }],
+          }),
+        ),
+      );
+    });
+    afterEach(() => vi.unstubAllGlobals());
 
     it("keeps API catalog provider-owned", async () => {
       const result = await state.runProviderCatalog({
@@ -796,6 +832,17 @@ export function describeModelStudioProviderDiscoveryContract(
 
   describe("modelstudio provider discovery contract", () => {
     installDiscoveryHooks(state, { providerIds: ["modelstudio"], loadModelStudio: load });
+    beforeEach(() => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () =>
+          Response.json({
+            data: [{ id: "qwen3.5-plus" }, { id: "qwen3-max-2026-01-23" }, { id: "MiniMax-M2.5" }],
+          }),
+        ),
+      );
+    });
+    afterEach(() => vi.unstubAllGlobals());
 
     it("keeps catalog provider-owned", async () => {
       const result = await state.runProviderCatalog({
@@ -905,3 +952,4 @@ export function describeCloudflareAiGatewayProviderDiscoveryContract(
     });
   });
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

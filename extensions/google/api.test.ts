@@ -1,8 +1,15 @@
+// Google tests cover api plugin behavior.
 import { describe, expect, it } from "vitest";
 import {
+  applyGoogleGeminiModelDefault,
+  GOOGLE_GEMINI_DEFAULT_MODEL,
   isGoogleGenerativeAiApi,
+  isGoogleVertexBaseUrl,
+  isGoogleVertexHostname,
+  normalizeAntigravityModelId,
   normalizeGoogleApiBaseUrl,
   normalizeGoogleGenerativeAiBaseUrl,
+  normalizeGoogleModelId,
   normalizeGoogleProviderConfig,
   parseGeminiAuth,
   resolveGoogleGenerativeAiHttpRequestConfig,
@@ -10,8 +17,23 @@ import {
   resolveGoogleGenerativeAiTransport,
   shouldNormalizeGoogleGenerativeAiProviderConfig,
 } from "./api.js";
+import {
+  normalizeAntigravityModelId as normalizeAntigravityModelIdDirect,
+  normalizeGoogleModelId as normalizeGoogleModelIdDirect,
+} from "./model-id.js";
+import {
+  applyGoogleGeminiModelDefault as applyGoogleGeminiModelDefaultDirect,
+  GOOGLE_GEMINI_DEFAULT_MODEL as GOOGLE_GEMINI_DEFAULT_MODEL_DIRECT,
+} from "./onboard.js";
 
 describe("google generative ai helpers", () => {
+  it("re-exports model normalization and default helpers", () => {
+    expect(normalizeAntigravityModelId).toBe(normalizeAntigravityModelIdDirect);
+    expect(normalizeGoogleModelId).toBe(normalizeGoogleModelIdDirect);
+    expect(applyGoogleGeminiModelDefault).toBe(applyGoogleGeminiModelDefaultDirect);
+    expect(GOOGLE_GEMINI_DEFAULT_MODEL).toBe(GOOGLE_GEMINI_DEFAULT_MODEL_DIRECT);
+  });
+
   it("detects the Google Generative AI transport id", () => {
     expect(isGoogleGenerativeAiApi("google-generative-ai")).toBe(true);
     expect(isGoogleGenerativeAiApi("google-gemini-cli")).toBe(false);
@@ -37,6 +59,8 @@ describe("google generative ai helpers", () => {
     expect(normalizeGoogleGenerativeAiBaseUrl("https://xgenerativelanguage.googleapis.com")).toBe(
       "https://xgenerativelanguage.googleapis.com",
     );
+    expect(normalizeGoogleGenerativeAiBaseUrl("")).toBeUndefined();
+    expect(normalizeGoogleGenerativeAiBaseUrl("   ")).toBeUndefined();
     expect(normalizeGoogleGenerativeAiBaseUrl()).toBeUndefined();
   });
 
@@ -83,6 +107,23 @@ describe("google generative ai helpers", () => {
         models: [{ api: "openai-completions" }],
       }),
     ).toBe(false);
+    expect(
+      shouldNormalizeGoogleGenerativeAiProviderConfig("google-vertex", {
+        baseUrl: "https://aiplatform.googleapis.com",
+      }),
+    ).toBe(false);
+  });
+
+  it("detects native Google Vertex hosts by hostname only", () => {
+    expect(isGoogleVertexHostname("aiplatform.googleapis.com")).toBe(true);
+    expect(isGoogleVertexHostname("us-central1-aiplatform.googleapis.com")).toBe(true);
+    expect(isGoogleVertexHostname("generativelanguage.googleapis.com")).toBe(false);
+    expect(isGoogleVertexHostname("evil-aiplatform.googleapis.com.attacker.com")).toBe(false);
+    expect(
+      isGoogleVertexBaseUrl(
+        "https://generativelanguage.googleapis.com/v1beta/proxy/aiplatform.googleapis.com",
+      ),
+    ).toBe(false);
   });
 
   it("normalizes transport baseUrls only for Google Generative AI", () => {
@@ -113,6 +154,28 @@ describe("google generative ai helpers", () => {
     ).toEqual({
       api: "openai-completions",
       baseUrl: "https://generativelanguage.googleapis.com",
+    });
+    expect(
+      resolveGoogleGenerativeAiTransport({
+        provider: "google-vertex",
+        api: undefined,
+        baseUrl: "https://us-central1-aiplatform.googleapis.com",
+      }),
+    ).toEqual({
+      api: "google-vertex",
+      baseUrl: "https://us-central1-aiplatform.googleapis.com",
+    });
+    expect(
+      resolveGoogleGenerativeAiTransport({
+        provider: "google-vertex",
+        api: "openai-completions",
+        baseUrl:
+          "https://aiplatform.googleapis.com/v1/projects/test/locations/us-central1/endpoints/openapi",
+      }),
+    ).toEqual({
+      api: "openai-completions",
+      baseUrl:
+        "https://aiplatform.googleapis.com/v1/projects/test/locations/us-central1/endpoints/openapi",
     });
   });
 
@@ -191,10 +254,12 @@ describe("google generative ai helpers", () => {
     });
     expect(oauthConfig.baseUrl).toBe("https://generativelanguage.googleapis.com/v1beta");
     expect(oauthConfig.allowPrivateNetwork).toBe(false);
-    expect(Object.fromEntries(new Headers(oauthConfig.headers).entries())).toEqual({
+    const oauthHeaders = Object.fromEntries(new Headers(oauthConfig.headers).entries());
+    expect(oauthHeaders).toMatchObject({
       authorization: "Bearer oauth-token",
       "content-type": "application/json",
     });
+    expect(oauthHeaders["x-goog-api-client"]).toMatch(/^openclaw\//u);
 
     const apiKeyConfig = resolveGoogleGenerativeAiHttpRequestConfig({
       apiKey: "api-key-123",
@@ -203,10 +268,27 @@ describe("google generative ai helpers", () => {
     });
     expect(apiKeyConfig.baseUrl).toBe("https://generativelanguage.googleapis.com/v1beta");
     expect(apiKeyConfig.allowPrivateNetwork).toBe(false);
-    expect(Object.fromEntries(new Headers(apiKeyConfig.headers).entries())).toEqual({
+    const apiKeyHeaders = Object.fromEntries(new Headers(apiKeyConfig.headers).entries());
+    expect(apiKeyHeaders).toMatchObject({
       "content-type": "application/json",
       "x-goog-api-key": "api-key-123",
     });
+    expect(apiKeyHeaders["x-goog-api-client"]).toMatch(/^openclaw\//u);
+  });
+
+  it.each([
+    ["empty", ""],
+    ["whitespace-only", "   "],
+  ])("defaults a %s shared request base URL", (_label, baseUrl) => {
+    const config = resolveGoogleGenerativeAiHttpRequestConfig({
+      apiKey: "api-key-123",
+      baseUrl,
+      capability: "video",
+      transport: "media-understanding",
+    });
+
+    expect(config.baseUrl).toBe("https://generativelanguage.googleapis.com/v1beta");
+    expect(new Headers(config.headers).get("x-goog-api-client")).toMatch(/^openclaw\//u);
   });
 
   it("preserves explicit OpenAI-compatible Google endpoints during provider normalization", () => {

@@ -1,11 +1,15 @@
+// Doctor repair flow builds and runs repair actions for doctor findings.
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { scrubDoctorErrorMessage } from "./doctor-error-message.js";
-import { normalizeHealthCheck } from "./health-check-adapter.js";
+import { defineSplitHealthCheckInput, normalizeHealthCheck } from "./health-check-adapter.js";
 import { listHealthChecks } from "./health-check-registry.js";
-import type { HealthCheckRunResult, RegisteredHealthCheck } from "./health-check-runner-types.js";
 import type {
-  HealthCheck,
+  HealthCheckInput,
+  HealthCheckRunResult,
+  RegisteredHealthCheck,
+} from "./health-check-runner-types.js";
+import type {
   HealthFinding,
   HealthRepairContext,
   HealthRepairDiff,
@@ -13,13 +17,14 @@ import type {
   HealthRepairResult,
 } from "./health-checks.js";
 
-export interface DoctorRepairRunOptions {
-  readonly checks?: readonly HealthCheck[];
+// Repair runner for structured doctor health checks; carries config between checks.
+interface DoctorRepairRunOptions {
+  readonly checks?: readonly HealthCheckInput[];
   readonly dryRun?: boolean;
   readonly diff?: boolean;
 }
 
-export interface DoctorRepairRunResult {
+interface DoctorRepairRunResult {
   readonly config: OpenClawConfig;
   readonly findings: readonly HealthFinding[];
   readonly remainingFindings: readonly HealthFinding[];
@@ -32,13 +37,13 @@ export interface DoctorRepairRunResult {
   readonly checksValidated: number;
 }
 
+/** Runs health checks in fix mode, applies repair outputs, and validates repaired scopes. */
 export async function runDoctorHealthRepairs(
   ctx: HealthRepairContext,
   opts: DoctorRepairRunOptions = {},
 ): Promise<DoctorRepairRunResult> {
-  const checks: readonly RegisteredHealthCheck[] = (opts.checks ?? listHealthChecks()).map(
-    normalizeHealthCheck,
-  );
+  const inputs = opts.checks ?? listHealthChecks().map(defineSplitHealthCheckInput);
+  const checks: readonly RegisteredHealthCheck[] = inputs.map(normalizeHealthCheck);
   const findings: HealthFinding[] = [];
   const remainingFindings: HealthFinding[] = [];
   const changes: string[] = [];
@@ -54,7 +59,11 @@ export async function runDoctorHealthRepairs(
     const runResult = await runHealthCheck(check, detectCtx, opts);
     cfg = runResult.config;
     findings.push(...runResult.findings);
-    remainingFindings.push(...runResult.remainingFindings);
+    // Only a completed validation can replace this check's original findings;
+    // skipped, failed, and unvalidated siblings must remain visible in mixed batches.
+    remainingFindings.push(
+      ...(runResult.checksValidated > 0 ? runResult.remainingFindings : runResult.findings),
+    );
     changes.push(...runResult.changes);
     warnings.push(...runResult.warnings);
     diffs.push(...runResult.diffs);
@@ -115,6 +124,7 @@ async function runSplitHealthCheck(
     return repairRunResult(cfg, findings, remainingFindings, changes, warnings, diffs, effects);
   }
 
+  // Split checks expose detect/repair separately, so repair output must be validated by detect().
   try {
     const result = await check.repair(
       { ...ctx, dryRun: opts.dryRun === true, diff: opts.diff === true },
@@ -123,6 +133,7 @@ async function runSplitHealthCheck(
     warnings.push(...(result.warnings ?? []));
     diffs.push(...(result.diffs ?? []));
     effects.push(...(result.effects ?? []));
+    changes.push(...result.changes);
     const status = result.status ?? "repaired";
     if (status !== "repaired") {
       warnings.push(`${check.id} repair ${status}${result.reason ? `: ${result.reason}` : ""}`);
@@ -131,7 +142,6 @@ async function runSplitHealthCheck(
     if (result.config !== undefined && opts.dryRun !== true) {
       cfg = result.config;
     }
-    changes.push(...result.changes);
     checksRepaired++;
     if (opts.dryRun === true) {
       return repairRunResult(cfg, findings, remainingFindings, changes, warnings, diffs, effects, {
@@ -196,6 +206,7 @@ async function runRunnableHealthCheck(
   effects.push(...(result.effects ?? []));
   const status = result.status ?? "repaired";
   const hasRepairOutput = hasHealthRepairOutput(result);
+  // Runnable checks may report "repairable" during dry-run without mutating config.
   if (status === "repairable") {
     changes.push(...(result.changes ?? []));
     return repairRunResult(cfg, findings, remainingFindings, changes, warnings, diffs, effects, {
@@ -248,6 +259,7 @@ async function runRunnableHealthCheck(
   });
 }
 
+// Only non-empty repair effects count as work; a clean detector with status repaired should not.
 function hasHealthRepairOutput(result: HealthRepairResult | HealthCheckRunResult): boolean {
   return (
     result.config !== undefined ||
@@ -281,6 +293,7 @@ function repairRunResult(
   };
 }
 
+// Re-run only the failing paths/ocPaths after repair to avoid unrelated expensive checks.
 function createValidationScope(findings: readonly HealthFinding[]) {
   return {
     findings,

@@ -1,3 +1,4 @@
+// Directory adapter tests cover channel directory adapter contracts and result normalization.
 import { describe, expect, it } from "vitest";
 import {
   createChannelDirectoryAdapter,
@@ -9,6 +10,12 @@ import {
 describe("directory adapters", () => {
   it("defaults self to null", async () => {
     const adapter = createChannelDirectoryAdapter();
+    await expect(adapter.self?.({ cfg: {}, runtime: {} as never })).resolves.toBeNull();
+  });
+
+  it("defaults an explicitly undefined self to the null resolver", async () => {
+    const adapter = createChannelDirectoryAdapter({ self: undefined });
+    expect(adapter.self).toBe(nullChannelDirectorySelf);
     await expect(adapter.self?.({ cfg: {}, runtime: {} as never })).resolves.toBeNull();
   });
 

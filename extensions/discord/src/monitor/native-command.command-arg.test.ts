@@ -1,11 +1,10 @@
+// Discord tests cover native command.command arg plugin behavior.
 import type { ChatCommandDefinition } from "openclaw/plugin-sdk/command-auth-native";
 import * as commandRegistryModule from "openclaw/plugin-sdk/command-auth-native";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  createDiscordCommandArgFallbackButton,
-  type DispatchDiscordCommandInteraction,
-} from "./native-command-ui.js";
+import { createDiscordCommandArgFallbackButton } from "./native-command-arg-ui.js";
+import type { DispatchDiscordCommandInteraction } from "./native-command-dispatch.js";
 import { createNoopThreadBindingManager } from "./thread-bindings.js";
 
 type CommandArgContext = Parameters<typeof createDiscordCommandArgFallbackButton>[0]["ctx"];
@@ -80,12 +79,17 @@ describe("discord command argument fallback", () => {
 
   it("preserves public slash command visibility for selected argument follow-ups", async () => {
     const commandDefinition = createCommandDefinition();
+    const dispatchReplyFromConfig =
+      vi.fn<NonNullable<CommandArgContext["dispatchReplyFromConfig"]>>();
     vi.spyOn(commandRegistryModule, "findCommandByNativeName").mockReturnValue(commandDefinition);
     const dispatchSpy = vi
       .fn<DispatchDiscordCommandInteraction>()
       .mockResolvedValue({ accepted: true });
     const button = createDiscordCommandArgFallbackButton({
-      ctx: createContext({ slashCommand: { ephemeral: false } }),
+      ctx: {
+        ...createContext({ slashCommand: { ephemeral: false } }),
+        dispatchReplyFromConfig,
+      },
       safeInteractionCall,
       dispatchCommandInteraction: dispatchSpy,
     });
@@ -104,5 +108,6 @@ describe("discord command argument fallback", () => {
     expect(dispatchCall?.accountId).toBe("default");
     expect(dispatchCall?.sessionPrefix).toBe("discord:slash");
     expect(dispatchCall?.preferFollowUp).toBe(true);
+    expect(dispatchCall?.dispatchReplyFromConfig).toBe(dispatchReplyFromConfig);
   });
 });

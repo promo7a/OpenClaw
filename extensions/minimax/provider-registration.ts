@@ -1,3 +1,4 @@
+// Minimax provider module implements model/runtime integration.
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import type {
   OpenClawPluginApi,
@@ -10,17 +11,16 @@ import type {
 } from "openclaw/plugin-sdk/plugin-entry";
 import {
   MINIMAX_OAUTH_MARKER,
-  ensureAuthProfileStore,
-  listProfilesForProvider,
+  buildOauthProviderAuthResult,
 } from "openclaw/plugin-sdk/provider-auth";
-import { buildOauthProviderAuthResult } from "openclaw/plugin-sdk/provider-auth";
 import { createProviderApiKeyAuthMethod } from "openclaw/plugin-sdk/provider-auth-api-key";
+import { buildOpenAICompatibleLiveProviderCatalog } from "openclaw/plugin-sdk/provider-catalog-live-runtime";
 import type { ProviderPlugin } from "openclaw/plugin-sdk/provider-model-shared";
 import {
   buildProviderReplayFamilyHooks,
   normalizeModelCompat,
 } from "openclaw/plugin-sdk/provider-model-shared";
-import { MINIMAX_FAST_MODE_STREAM_HOOKS } from "openclaw/plugin-sdk/provider-stream-family";
+import { buildProviderStreamFamilyHooks } from "openclaw/plugin-sdk/provider-stream-family";
 import { fetchMinimaxUsage } from "openclaw/plugin-sdk/provider-usage";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
@@ -33,10 +33,12 @@ import { DEFAULT_MINIMAX_MAX_TOKENS, resolveMinimaxApiCost } from "./model-defin
 import type { MiniMaxRegion } from "./oauth.js";
 import { applyMinimaxApiConfig, applyMinimaxApiConfigCn } from "./onboard.js";
 import {
+  buildMinimaxModelDiscovery,
   buildMinimaxPortalProvider,
   buildMinimaxProvider,
   resolveMinimaxCatalogBaseUrl,
 } from "./provider-catalog.js";
+import { resolveMinimaxThinkingProfile } from "./thinking.js";
 
 const API_PROVIDER_ID = "minimax";
 const PORTAL_PROVIDER_ID = "minimax-portal";
@@ -61,8 +63,10 @@ const HYBRID_ANTHROPIC_OPENAI_REPLAY_HOOKS = buildProviderReplayFamilyHooks({
 });
 const MINIMAX_PROVIDER_HOOKS = {
   ...HYBRID_ANTHROPIC_OPENAI_REPLAY_HOOKS,
-  ...MINIMAX_FAST_MODE_STREAM_HOOKS,
+  ...buildProviderStreamFamilyHooks("minimax-fast-mode"),
   resolveReasoningOutputMode: () => "native" as const,
+  resolveThinkingProfile: ({ modelId }: { modelId: string }) =>
+    resolveMinimaxThinkingProfile(modelId),
 };
 
 function getDefaultBaseUrl(region: MiniMaxRegion): string {
@@ -130,40 +134,60 @@ function resolveMinimaxDynamicModel(params: {
   });
 }
 
-function resolveApiCatalog(ctx: ProviderCatalogContext) {
-  const apiKey = ctx.resolveProviderApiKey(API_PROVIDER_ID).apiKey;
-  if (!apiKey) {
+async function resolveApiCatalog(ctx: ProviderCatalogContext) {
+  const auth = ctx.resolveProviderApiKey(API_PROVIDER_ID);
+  if (!auth.apiKey) {
     return null;
   }
-  return {
-    provider: {
-      ...buildMinimaxProvider(ctx.env),
-      apiKey,
-    },
-  };
+  return await buildOpenAICompatibleLiveProviderCatalog({
+    discoveryMode: "strict",
+    providerId: API_PROVIDER_ID,
+    providerConfig: buildMinimaxProvider(ctx.env),
+    apiKey: auth.apiKey,
+    discoveryApiKey: auth.discoveryApiKey,
+    profileId: auth.profileId,
+    modelDiscovery: buildMinimaxModelDiscovery(),
+  });
 }
 
-function resolvePortalCatalog(ctx: ProviderCatalogContext) {
+async function resolvePortalCatalog(ctx: ProviderCatalogContext) {
   const explicitProvider = ctx.config.models?.providers?.[PORTAL_PROVIDER_ID];
-  const envApiKey = ctx.resolveProviderApiKey(PORTAL_PROVIDER_ID).apiKey;
-  const authStore = ensureAuthProfileStore(ctx.agentDir, {
-    allowKeychainPrompt: false,
+  const apiKeyAuth = ctx.resolveProviderApiKey(PORTAL_PROVIDER_ID);
+  const profileAuth = ctx.resolveProviderAuth(PORTAL_PROVIDER_ID, {
+    oauthMarker: MINIMAX_OAUTH_MARKER,
   });
-  const hasProfiles = listProfilesForProvider(authStore, PORTAL_PROVIDER_ID).length > 0;
   const explicitApiKey = normalizeOptionalString(explicitProvider?.apiKey);
-  const apiKey = envApiKey ?? explicitApiKey ?? (hasProfiles ? MINIMAX_OAUTH_MARKER : undefined);
+  const apiKey = apiKeyAuth.apiKey ?? explicitApiKey ?? profileAuth.apiKey;
   if (!apiKey) {
     return null;
   }
+  const usesPortalBearerAuth =
+    apiKeyAuth.apiKey === "MINIMAX_OAUTH_TOKEN" ||
+    (apiKeyAuth.apiKey && apiKeyAuth.mode
+      ? apiKeyAuth.mode === "token" || apiKeyAuth.mode === "oauth"
+      : (profileAuth.mode === "token" && profileAuth.apiKey === apiKey) ||
+        (!apiKeyAuth.apiKey && !explicitApiKey && profileAuth.mode === "oauth"));
 
   const explicitBaseUrl = normalizeOptionalString(explicitProvider?.baseUrl);
 
-  return {
-    provider: buildPortalProviderCatalog({
-      baseUrl: explicitBaseUrl || buildMinimaxPortalProvider(ctx.env).baseUrl,
-      apiKey,
-    }),
-  };
+  const providerConfig = buildPortalProviderCatalog({
+    baseUrl: explicitBaseUrl || buildMinimaxPortalProvider(ctx.env).baseUrl,
+    apiKey,
+  });
+  const discoveryAuth = apiKeyAuth.discoveryApiKey
+    ? apiKeyAuth
+    : usesPortalBearerAuth
+      ? profileAuth
+      : apiKeyAuth;
+  return await buildOpenAICompatibleLiveProviderCatalog({
+    discoveryMode: "strict",
+    providerId: PORTAL_PROVIDER_ID,
+    providerConfig,
+    apiKey,
+    discoveryApiKey: discoveryAuth.discoveryApiKey,
+    profileId: discoveryAuth.profileId,
+    modelDiscovery: buildMinimaxModelDiscovery(usesPortalBearerAuth ? "oauth" : "api_key"),
+  });
 }
 
 function createOAuthHandler(region: MiniMaxRegion) {
@@ -176,9 +200,10 @@ function createOAuthHandler(region: MiniMaxRegion) {
       const { loginMiniMaxPortalOAuth } = await import("./oauth.runtime.js");
       const result = await loginMiniMaxPortalOAuth({
         openUrl: ctx.openUrl,
-        note: ctx.prompter.note,
+        note: (message, title) => ctx.prompter.note(message, title),
         progress,
         region,
+        ...(ctx.signal ? { signal: ctx.signal } : {}),
       });
 
       progress.stop("MiniMax OAuth complete");
@@ -284,7 +309,7 @@ function createMinimaxOAuthMethod(region: MiniMaxRegion) {
   };
 }
 
-export function buildMinimaxApiProviderPlugin(): ProviderPlugin {
+function buildMinimaxApiProviderPlugin(): ProviderPlugin {
   return {
     id: API_PROVIDER_ID,
     label: PROVIDER_LABEL,
@@ -321,7 +346,7 @@ export function buildMinimaxApiProviderPlugin(): ProviderPlugin {
   };
 }
 
-export function buildMinimaxPortalProviderPlugin(): ProviderPlugin {
+function buildMinimaxPortalProviderPlugin(): ProviderPlugin {
   return {
     id: PORTAL_PROVIDER_ID,
     label: PROVIDER_LABEL,

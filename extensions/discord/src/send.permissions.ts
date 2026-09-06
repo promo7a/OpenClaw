@@ -1,11 +1,14 @@
+// Discord plugin module implements send.permissions behavior.
 import type { APIChannel, APIGuild, APIGuildMember, APIRole } from "discord-api-types/v10";
 import { ChannelType, PermissionFlagsBits } from "discord-api-types/v10";
+import { isDiscordThreadChannelType } from "./channel-type.js";
 import { resolveDiscordRest } from "./client.js";
 import {
   getChannel,
   getCurrentUser,
   getGuild,
   getGuildMember,
+  getThreadMember,
   type RequestClient,
 } from "./internal/discord.js";
 import type { DiscordPermissionsSummary, DiscordReactOpts } from "./send.types.js";
@@ -42,14 +45,6 @@ function hasAdministrator(bitfield: bigint) {
 
 function hasPermissionBit(bitfield: bigint, permission: bigint) {
   return (bitfield & permission) === permission;
-}
-
-export function isThreadChannelType(channelType?: number) {
-  return (
-    channelType === ChannelType.GuildNewsThread ||
-    channelType === ChannelType.GuildPublicThread ||
-    channelType === ChannelType.GuildPrivateThread
-  );
 }
 
 async function fetchBotUserId(rest: RequestClient) {
@@ -144,7 +139,7 @@ function resolveMemberChannelPermissionBits(params: {
 async function resolveChannelPermissionSubject(rest: RequestClient, channel: APIChannel) {
   const channelType = "type" in channel ? channel.type : undefined;
   const parentId = "parent_id" in channel ? channel.parent_id : undefined;
-  if (isThreadChannelType(channelType) && parentId) {
+  if (isDiscordThreadChannelType(channelType) && parentId) {
     return await getChannel(rest, parentId);
   }
   return channel;
@@ -183,7 +178,8 @@ export async function canViewDiscordGuildChannel(
   const rest = resolveDiscordRest(opts);
   try {
     const channel = await getChannel(rest, channelId);
-    const channelGuildId = "guild_id" in channel ? channel.guild_id : undefined;
+    const permissionChannel = await resolveChannelPermissionSubject(rest, channel);
+    const channelGuildId = "guild_id" in permissionChannel ? permissionChannel.guild_id : undefined;
     if (channelGuildId !== guildId) {
       return false;
     }
@@ -199,9 +195,18 @@ export async function canViewDiscordGuildChannel(
       userId,
       guild,
       member,
-      channel,
+      channel: permissionChannel,
     });
-    return hasPermissionBit(permissions, PermissionFlagsBits.ViewChannel);
+    if (!hasPermissionBit(permissions, PermissionFlagsBits.ViewChannel)) {
+      return false;
+    }
+    if ("type" in channel && channel.type === ChannelType.PrivateThread) {
+      if (hasPermissionBit(permissions, PermissionFlagsBits.ManageThreads)) {
+        return true;
+      }
+      await getThreadMember(rest, channel.id, userId);
+    }
+    return true;
   } catch {
     return false;
   }
@@ -378,17 +383,14 @@ export async function hasAllGuildPermissionsDiscord(
   );
 }
 
-/**
- * @deprecated Prefer hasAnyGuildPermissionDiscord or hasAllGuildPermissionsDiscord for clarity.
- */
-export const hasGuildPermissionDiscord = hasAnyGuildPermissionDiscord;
-
 export async function fetchChannelPermissionsDiscord(
   channelId: string,
   opts: DiscordReactOpts,
 ): Promise<DiscordPermissionsSummary> {
+  opts.signal?.throwIfAborted();
   const rest = resolveDiscordRest(opts);
   const channel = await getChannel(rest, channelId);
+  opts.signal?.throwIfAborted();
   const channelType = "type" in channel ? channel.type : undefined;
   const guildId = "guild_id" in channel ? channel.guild_id : undefined;
   if (!guildId) {
@@ -402,10 +404,12 @@ export async function fetchChannelPermissionsDiscord(
   }
 
   const botId = await fetchBotUserId(rest);
+  opts.signal?.throwIfAborted();
   const [guild, member] = await Promise.all([
     getGuild(rest, guildId),
     getGuildMember(rest, guildId, botId),
   ]);
+  opts.signal?.throwIfAborted();
 
   const permissions = resolveMemberChannelPermissionBits({
     guildId,

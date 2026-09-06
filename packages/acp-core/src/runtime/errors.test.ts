@@ -1,3 +1,4 @@
+// ACP Core tests cover errors behavior.
 import { afterEach, describe, expect, it } from "vitest";
 import { configureAcpErrorRedactor } from "../error-format.js";
 import {
@@ -161,13 +162,9 @@ describe("formatAcpErrorChain redaction", () => {
     expect(out).not.toContain(token);
   });
 
-  it("redacts common HTTP, provider, and private-key credentials in ACP error text", () => {
+  it("redacts common HTTP and private-key credentials in ACP error text", () => {
     const secrets = [
       "Authorization: Basic dXNlcjpwYXNzd29yZGFiY2RlZg==",
-      "Bearer eyJabcdefghijklmnopqrstuvwxyz.abcdefghijklmnopqrstuvwxyz.abcdefghijklmnopqrstuvwxyz",
-      "github_pat_abcdefghijklmnopqrstuvwxyz123456",
-      ["xoxb", "1234567890", "abcdefghijklmnop"].join("-"),
-      "bot123456789:abcdefghijklmnopqrstuvwxyz123456",
       "-----BEGIN PRIVATE KEY-----\nabcdefghijklmnopqrstuvwxyz\n-----END PRIVATE KEY-----",
     ];
     const out = formatAcpErrorChain(

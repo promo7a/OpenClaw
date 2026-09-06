@@ -1,3 +1,4 @@
+/** Prompt harness helpers for ACP translator lifecycle/cancel/stop-reason tests. */
 import type { PromptRequest } from "@agentclientprotocol/sdk";
 import { createInMemorySessionStore } from "@openclaw/acp-core/session";
 import { expect, vi } from "vitest";
@@ -10,12 +11,15 @@ type PendingPromptHarness = {
   agent: AcpGatewayAgent;
   promptPromise: ReturnType<AcpGatewayAgent["prompt"]>;
   runId: string;
+  sessionUpdate: ReturnType<typeof vi.fn>;
 };
 
+// Shared prompt harness used by translator cancellation and lifecycle tests.
 const DEFAULT_SESSION_ID = "session-1";
 export const DEFAULT_SESSION_KEY = "agent:main:main";
 const DEFAULT_PROMPT_TEXT = "hello";
 
+/** Creates an ACP translator instance with one preloaded session. */
 export function createSessionAgentHarness(
   request: GatewayClient["request"],
   options: { sessionId?: string; sessionKey?: string; cwd?: string } = {},
@@ -28,7 +32,8 @@ export function createSessionAgentHarness(
     sessionKey,
     cwd: options.cwd ?? "/tmp",
   });
-  const agent = new AcpGatewayAgent(createAcpConnection(), createAcpGateway(request), {
+  const connection = createAcpConnection();
+  const agent = new AcpGatewayAgent(connection, createAcpGateway(request), {
     sessionStore,
   });
 
@@ -37,9 +42,11 @@ export function createSessionAgentHarness(
     sessionId,
     sessionKey,
     sessionStore,
+    sessionUpdate: connection["__sessionUpdateMock"],
   };
 }
 
+/** Starts a prompt against a translator test agent. */
 export function promptAgent(
   agent: AcpGatewayAgent,
   sessionId = DEFAULT_SESSION_ID,
@@ -52,6 +59,7 @@ export function promptAgent(
   } as unknown as PromptRequest);
 }
 
+/** Observes prompt promise settlement without awaiting it immediately. */
 export function observeSettlement(promise: ReturnType<AcpGatewayAgent["prompt"]>) {
   const settleSpy = vi.fn();
   void promise.then(
@@ -61,6 +69,7 @@ export function observeSettlement(promise: ReturnType<AcpGatewayAgent["prompt"]>
   return settleSpy;
 }
 
+/** Starts a prompt that remains pending until tests inject Gateway events. */
 export async function createPendingPromptHarness(): Promise<PendingPromptHarness> {
   let runId: string | undefined;
   const request = vi.fn(async (method: string, params?: Record<string, unknown>) => {
@@ -71,7 +80,7 @@ export async function createPendingPromptHarness(): Promise<PendingPromptHarness
     return {};
   }) as GatewayClient["request"];
 
-  const { agent, sessionId } = createSessionAgentHarness(request);
+  const { agent, sessionId, sessionUpdate } = createSessionAgentHarness(request);
   const promptPromise = promptAgent(agent, sessionId);
 
   await vi.waitFor(() => {
@@ -82,9 +91,11 @@ export async function createPendingPromptHarness(): Promise<PendingPromptHarness
     agent,
     promptPromise,
     runId: runId!,
+    sessionUpdate,
   };
 }
 
+/** Builds a Gateway chat event fixture for pending-prompt tests. */
 export function createChatEvent(payload: Record<string, unknown>): EventFrame {
   return {
     type: "event",

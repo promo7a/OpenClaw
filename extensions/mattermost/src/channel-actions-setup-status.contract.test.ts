@@ -1,3 +1,4 @@
+// Mattermost tests cover channel actions setup status.contract plugin behavior.
 import {
   installChannelActionsContractSuite,
   installChannelSetupContractSuite,
@@ -13,7 +14,7 @@ describe("mattermost actions contract", () => {
     unsupportedAction: "poll",
     cases: [
       {
-        name: "configured account exposes send and react",
+        name: "configured account exposes send and react while reads stay opt in",
         cfg: {
           channels: {
             mattermost: {
@@ -27,7 +28,7 @@ describe("mattermost actions contract", () => {
         expectedCapabilities: ["presentation"],
       },
       {
-        name: "reactions can be disabled while send stays available",
+        name: "disabled reactions do not enable message reads",
         cfg: {
           channels: {
             mattermost: {
@@ -39,6 +40,21 @@ describe("mattermost actions contract", () => {
           },
         } as OpenClawConfig,
         expectedActions: ["send"],
+        expectedCapabilities: ["presentation"],
+      },
+      {
+        name: "message reads can be disabled while send and react stay available",
+        cfg: {
+          channels: {
+            mattermost: {
+              enabled: true,
+              botToken: "test-token-placeholder",
+              baseUrl: "https://chat.example.com",
+              actions: { messages: false },
+            },
+          },
+        } as OpenClawConfig,
+        expectedActions: ["send", "react"],
         expectedCapabilities: ["presentation"],
       },
       {

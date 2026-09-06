@@ -1,6 +1,9 @@
+/**
+ * Runtime SDK subpath for active memory search manager operations.
+ */
 export {
-  closeActiveMemorySearchManager,
-  closeActiveMemorySearchManagers,
-  getActiveMemorySearchManager,
+  closeActiveMemorySearchManagerCore as closeActiveMemorySearchManager,
+  closeActiveMemorySearchManagersCore as closeActiveMemorySearchManagers,
+  getActiveMemorySearchManagerCore as getActiveMemorySearchManager,
   resolveActiveMemoryBackendConfig,
 } from "../plugins/memory-runtime.js";

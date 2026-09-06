@@ -1,9 +1,15 @@
+/**
+ * Resolves effective model context windows and formats guard warnings/blocks.
+ *
+ * Configured model values can cap provider metadata, and local endpoints get
+ * more actionable remediation text.
+ */
 import { findNormalizedProviderValue } from "@openclaw/model-catalog-core/provider-id";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveProviderEndpoint } from "./provider-attribution.js";
 
 export const CONTEXT_WINDOW_HARD_MIN_TOKENS = 4_000;
-export const CONTEXT_WINDOW_WARN_BELOW_TOKENS = 8_000;
+const CONTEXT_WINDOW_WARN_BELOW_TOKENS = 8_000;
 const CONTEXT_WINDOW_HARD_MIN_RATIO = 0.1;
 const CONTEXT_WINDOW_WARN_BELOW_RATIO = 0.2;
 
@@ -44,6 +50,7 @@ function modelIdMatchesProviderScope(params: {
   return stripProvider(configuredId) === stripProvider(params.modelId);
 }
 
+/** Resolve the effective context window and source for one provider/model. */
 export function resolveContextWindowInfo(params: {
   cfg: OpenClawConfig | undefined;
   provider: string;
@@ -75,18 +82,11 @@ export function resolveContextWindowInfo(params: {
     normalizePositiveInt(params.modelContextWindow);
   const defaultTokens =
     normalizePositiveInt(params.defaultTokens) ?? CONTEXT_WINDOW_WARN_BELOW_TOKENS;
-  const baseInfo = fromModelsConfig
+  return fromModelsConfig
     ? { tokens: fromModelsConfig, source: "modelsConfig" as const }
     : fromModel
       ? { tokens: fromModel, source: "model" as const }
       : { tokens: defaultTokens, source: "default" as const };
-
-  const capTokens = normalizePositiveInt(params.cfg?.agents?.defaults?.contextTokens);
-  if (capTokens && capTokens < baseInfo.tokens) {
-    return { tokens: capTokens, referenceTokens: baseInfo.tokens, source: "agentContextTokens" };
-  }
-
-  return baseInfo;
 }
 
 type ContextWindowGuardResult = ContextWindowInfo & {
@@ -116,7 +116,8 @@ function resolveContextWindowGuardHint(params: {
   };
 }
 
-export function resolveContextWindowGuardThresholds(
+/** Derive warning/block floors from the resolved model context window. */
+function resolveContextWindowGuardThresholds(
   contextWindowTokens: number,
 ): ContextWindowGuardThresholds {
   const tokens = normalizePositiveInt(contextWindowTokens) ?? 0;
@@ -132,6 +133,7 @@ export function resolveContextWindowGuardThresholds(
   };
 }
 
+/** Format a non-blocking low-context warning message. */
 export function formatContextWindowWarningMessage(params: {
   provider: string;
   modelId: string;
@@ -142,12 +144,6 @@ export function formatContextWindowWarningMessage(params: {
   const hint = resolveContextWindowGuardHint({ runtimeBaseUrl: params.runtimeBaseUrl });
   if (!hint.likelySelfHosted) {
     return base;
-  }
-  if (params.guard.source === "agentContextTokens") {
-    return (
-      `${base}; OpenClaw is capped by agents.defaults.contextTokens, so raise that cap ` +
-      `if you want to use more of the model context window`
-    );
   }
   if (params.guard.source === "modelsConfig") {
     return (
@@ -161,6 +157,7 @@ export function formatContextWindowWarningMessage(params: {
   );
 }
 
+/** Format a blocking context-window guard message. */
 export function formatContextWindowBlockMessage(params: {
   guard: ContextWindowGuardResult;
   runtimeBaseUrl?: string | null;
@@ -171,9 +168,6 @@ export function formatContextWindowBlockMessage(params: {
   const hint = resolveContextWindowGuardHint({ runtimeBaseUrl: params.runtimeBaseUrl });
   if (!hint.likelySelfHosted) {
     return base;
-  }
-  if (params.guard.source === "agentContextTokens") {
-    return `${base} OpenClaw is capped by agents.defaults.contextTokens. Raise that cap.`;
   }
   if (params.guard.source === "modelsConfig") {
     return (
@@ -188,6 +182,7 @@ export function formatContextWindowBlockMessage(params: {
   );
 }
 
+/** Evaluate whether the resolved context window should warn or block. */
 export function evaluateContextWindowGuard(params: {
   info: ContextWindowInfo;
   warnBelowTokens?: number;

@@ -1,3 +1,4 @@
+// Core extension facade boundary tests cover allowed imports between core and extension facades.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,7 +14,7 @@ const forbiddenOllamaFacadeFiles = [
 ] as const;
 const genericCoreFixtureFiles = [
   "src/commands/auth-choice.apply.plugin-provider.test.ts",
-  "src/plugins/contracts/memory-embedding-provider.contract.test.ts",
+  "src/plugins/contracts/embedding-provider.contract.test.ts",
   "src/plugins/discovery.test.ts",
   "src/plugins/contracts/tts-contract-suites.ts",
 ] as const;

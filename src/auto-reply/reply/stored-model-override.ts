@@ -1,66 +1,38 @@
+// Normalizes stored reply models and detects stale heartbeat fallback pins.
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { hasSessionAutoModelFallbackProvenance } from "../../agents/agent-scope.js";
+import { resolveCliRuntimeCanonicalProvider } from "../../agents/cli-backends.js";
 import {
-  modelKey,
-  normalizeModelRef,
+  normalizeStoredOverrideModel,
   resolvePersistedOverrideModelRef,
-} from "../../agents/model-selection.js";
-import { resolveSessionParentSessionKey } from "../../channels/plugins/session-conversation.js";
+} from "../../agents/model-selection-persisted.js";
+import { modelKey, normalizeModelRef } from "../../agents/model-selection.js";
+import { RUNTIME_MODEL_VISIBILITY_NORMALIZATION } from "../../agents/model-visibility-policy.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type { StoredModelOverride } from "../../sessions/stored-model-overrides.js";
+import type { RuntimeModelNormalization } from "./model-runtime-normalization.js";
 
-export type StoredModelOverride = {
-  provider?: string;
-  model: string;
-  source: "session" | "parent";
-};
-
-function resolveParentSessionKeyCandidate(params: {
-  sessionKey?: string;
-  parentSessionKey?: string;
-}): string | null {
-  const explicit = normalizeOptionalString(params.parentSessionKey);
-  if (explicit && explicit !== params.sessionKey) {
-    return explicit;
-  }
-  const derived = resolveSessionParentSessionKey(params.sessionKey);
-  if (derived && derived !== params.sessionKey) {
-    return derived;
-  }
-  return null;
-}
-
-export function resolveStoredModelOverride(params: {
-  sessionEntry?: SessionEntry;
-  sessionStore?: Record<string, SessionEntry>;
-  sessionKey?: string;
-  parentSessionKey?: string;
-  defaultProvider: string;
-}): StoredModelOverride | null {
-  const direct = resolvePersistedOverrideModelRef({
-    defaultProvider: params.defaultProvider,
-    overrideProvider: params.sessionEntry?.providerOverride,
-    overrideModel: params.sessionEntry?.modelOverride,
-  });
-  if (direct) {
-    return { ...direct, source: "session" };
-  }
-  const parentKey = resolveParentSessionKeyCandidate({
-    sessionKey: params.sessionKey,
-    parentSessionKey: params.parentSessionKey,
-  });
-  if (!parentKey || !params.sessionStore) {
-    return null;
-  }
-  const parentEntry = params.sessionStore[parentKey];
-  const parentOverride = resolvePersistedOverrideModelRef({
-    defaultProvider: params.defaultProvider,
-    overrideProvider: parentEntry?.providerOverride,
-    overrideModel: parentEntry?.modelOverride,
-  });
-  if (!parentOverride) {
-    return null;
-  }
-  return { ...parentOverride, source: "parent" };
+/** Normalizes a stored model ref, resolving runtime aliases only for CLI-bound sessions. */
+export function normalizeStoredRuntimeModelRef(
+  provider: string,
+  model: string,
+  cfg?: OpenClawConfig,
+  sessionEntry?: SessionEntry,
+  normalization: RuntimeModelNormalization = RUNTIME_MODEL_VISIBILITY_NORMALIZATION,
+) {
+  const normalized = normalizeModelRef(provider, model, normalization);
+  const hasCliSessionBinding =
+    sessionEntry?.cliSessionBindings?.[normalized.provider] !== undefined;
+  const canonicalProvider =
+    cfg && hasCliSessionBinding
+      ? resolveCliRuntimeCanonicalProvider({
+          runtime: normalized.provider,
+          config: cfg,
+          includeSetupRegistry: true,
+        })
+      : undefined;
+  return canonicalProvider ? { ...normalized, provider: canonicalProvider } : normalized;
 }
 
 function resolveModelRefKey(params: {
@@ -68,14 +40,23 @@ function resolveModelRefKey(params: {
   overrideProvider?: string;
   overrideModel?: string;
 }): string | null {
-  const ref = resolvePersistedOverrideModelRef(params);
+  const normalizedOverride = normalizeStoredOverrideModel({
+    providerOverride: params.overrideProvider,
+    modelOverride: params.overrideModel,
+  });
+  const ref = resolvePersistedOverrideModelRef({
+    defaultProvider: params.defaultProvider,
+    overrideProvider: normalizedOverride.providerOverride,
+    overrideModel: normalizedOverride.modelOverride,
+  });
   if (!ref) {
     return null;
   }
-  const normalized = normalizeModelRef(ref.provider, ref.model);
-  return modelKey(normalized.provider, normalized.model);
+  const normalizedRef = normalizeModelRef(ref.provider, ref.model);
+  return modelKey(normalizedRef.provider, normalizedRef.model);
 }
 
+/** Detects heartbeat auto-fallback overrides that no longer match the primary model. */
 export function isStaleHeartbeatAutoFallbackOverride(params: {
   isHeartbeat?: boolean;
   hasResolvedHeartbeatModelOverride?: boolean;
@@ -97,6 +78,7 @@ export function isStaleHeartbeatAutoFallbackOverride(params: {
     entry !== undefined &&
     entry.modelOverrideSource === undefined &&
     hasSessionAutoModelFallbackProvenance(entry);
+  // Older sessions may lack modelOverrideSource; provenance recovers the auto-fallback state.
   if (entry?.modelOverrideSource !== "auto" && !recoveredAutoFallbackOverride) {
     return false;
   }
@@ -124,7 +106,7 @@ export function isStaleHeartbeatAutoFallbackOverride(params: {
 
   const noticeSelectedKey = resolveModelRefKey({
     defaultProvider: params.defaultProvider,
-    overrideModel: normalizeOptionalString(entry.fallbackNoticeSelectedModel),
+    overrideModel: normalizeOptionalString(entry.fallbackNotice?.selectedModel),
   });
   if (noticeSelectedKey) {
     return noticeSelectedKey !== primaryKey;

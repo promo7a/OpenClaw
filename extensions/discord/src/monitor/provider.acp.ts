@@ -1,3 +1,4 @@
+// Discord provider module implements model/runtime integration.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { asDateTimestampMs } from "openclaw/plugin-sdk/number-runtime";
 import { formatErrorMessage } from "openclaw/plugin-sdk/ssrf-runtime";
@@ -23,6 +24,14 @@ function classifyAcpStatusProbeError(params: {
   status: "stale" | "uncertain";
   reason: string;
 } {
+  if (
+    params.isAcpRuntimeError(params.error) &&
+    ["SESSION_OWNER_MIGRATION_REQUIRED", "SESSION_OWNER_UNSUPPORTED"].includes(
+      params.error.detailCode ?? "",
+    )
+  ) {
+    return { status: "uncertain", reason: formatErrorMessage(params.error) };
+  }
   if (params.isAcpRuntimeError(params.error) && params.error.code === "ACP_SESSION_INIT_FAILED") {
     return { status: "stale", reason: "session-init-failed" };
   }
@@ -57,6 +66,7 @@ function resolveRunningActivityAgeMs(params: {
 export async function probeDiscordAcpBindingHealth(params: {
   cfg: OpenClawConfig;
   sessionKey: string;
+  agentId?: string;
   storedState?: "idle" | "running" | "error";
   lastActivityAt?: number;
   providerSessionRuntime: DiscordProviderSessionRuntimeModule;
@@ -68,6 +78,7 @@ export async function probeDiscordAcpBindingHealth(params: {
     .getSessionStatus({
       cfg: params.cfg,
       sessionKey: params.sessionKey,
+      agentId: params.agentId,
       signal: statusProbeAbortController.signal,
     })
     .then((status) => ({ kind: "status" as const, status }))

@@ -1,7 +1,11 @@
+// Markdown Core module implements code spans behavior.
 import { scanFenceSpans, type FenceScanState, type FenceSpan } from "./fences.js";
 
+/** Incremental inline-code scanner state carried across chunk boundaries. */
 export type InlineCodeState = {
+  /** Whether the current scan is inside an unterminated inline code span. */
   open: boolean;
+  /** Backtick run length required to close the current inline code span. */
   ticks: number;
 };
 
@@ -10,14 +14,19 @@ export function createInlineCodeState(): InlineCodeState {
   return { open: false, ticks: 0 };
 }
 
+type CodeSpan = Pick<FenceSpan, "start" | "end">;
+
 type InlineCodeSpansResult = {
-  spans: Array<[number, number]>;
+  spans: CodeSpan[];
   state: InlineCodeState;
 };
 
 type CodeSpanIndex = {
+  /** Inline-code state to carry into the next streamed chunk. */
   inlineState: InlineCodeState;
+  /** Fenced-code state to carry into the next streamed chunk. */
   fenceState: FenceScanState;
+  /** True when an offset is inside fenced code or inline code. */
   isInside: (index: number) => boolean;
 };
 
@@ -40,8 +49,10 @@ export function buildCodeSpanIndex(
   return {
     inlineState: nextInlineState,
     fenceState: nextFenceState,
+    // Each scanner emits ordered, disjoint spans; inline spans can enclose fences.
+    // Search separately so overlap between the lists cannot hide a containing span.
     isInside: (index: number) =>
-      isInsideFenceSpan(index, fenceSpans) || isInsideInlineSpan(index, inlineSpans),
+      isInsideSpan(index, fenceSpans) || isInsideSpan(index, inlineSpans),
   };
 }
 
@@ -50,16 +61,20 @@ function parseInlineCodeSpans(
   fenceSpans: FenceSpan[],
   initialState: InlineCodeState,
 ): InlineCodeSpansResult {
-  const spans: Array<[number, number]> = [];
+  const spans: CodeSpan[] = [];
   let open = initialState.open;
   let ticks = initialState.ticks;
   let openStart = open ? 0 : -1;
 
   let i = 0;
+  // The scanner emits ordered, disjoint fences and the input cursor only advances.
+  // Retire each fence once instead of searching all prior fences at every character.
+  let fenceIndex = 0;
   while (i < text.length) {
-    const fence = findFenceSpanAtInclusive(fenceSpans, i);
-    if (fence) {
+    const fence = fenceSpans[fenceIndex];
+    if (fence && i >= fence.start) {
       i = fence.end;
+      fenceIndex += 1;
       continue;
     }
 
@@ -83,7 +98,7 @@ function parseInlineCodeSpans(
     }
 
     if (runLength === ticks) {
-      spans.push([openStart, i]);
+      spans.push({ start: openStart, end: i });
       open = false;
       ticks = 0;
       openStart = -1;
@@ -91,7 +106,7 @@ function parseInlineCodeSpans(
   }
 
   if (open) {
-    spans.push([openStart, text.length]);
+    spans.push({ start: openStart, end: text.length });
   }
 
   return {
@@ -100,14 +115,21 @@ function parseInlineCodeSpans(
   };
 }
 
-function findFenceSpanAtInclusive(spans: FenceSpan[], index: number): FenceSpan | undefined {
-  return spans.find((span) => index >= span.start && index < span.end);
-}
-
-function isInsideFenceSpan(index: number, spans: FenceSpan[]): boolean {
-  return spans.some((span) => index >= span.start && index < span.end);
-}
-
-function isInsideInlineSpan(index: number, spans: Array<[number, number]>): boolean {
-  return spans.some(([start, end]) => index >= start && index < end);
+function isInsideSpan(index: number, spans: CodeSpan[]): boolean {
+  let low = 0;
+  let high = spans.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    const span = spans[middle];
+    if (!span) {
+      return false;
+    }
+    if (index >= span.end) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  const span = spans[low];
+  return span !== undefined && index >= span.start && index < span.end;
 }

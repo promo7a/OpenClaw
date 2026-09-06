@@ -1,40 +1,33 @@
+// Verify Plugin Npm Published Runtime tests cover verify plugin npm published runtime script behavior.
 import { describe, expect, it } from "vitest";
 import {
   collectPluginNpmPublishedRuntimeErrors,
   findPackedPackageReadmePath,
+  parseVerifyPublishedPluginRuntimeArgs,
   parseNpmReadmeMetadata,
   readPluginNpmCommandOptions,
-  readPositiveIntEnv,
   resolveNpmPackFilename,
   runPluginNpmCommand,
-} from "../../scripts/verify-plugin-npm-published-runtime.mjs";
+  usage,
+} from "../../scripts/verify-plugin-npm-published-runtime.mts";
 
-describe("plugin npm publish verifier retry limits", () => {
-  it("rejects loose numeric retry env values instead of parsing prefixes", () => {
-    expect(() =>
-      readPositiveIntEnv("OPENCLAW_PLUGIN_NPM_VERIFY_ATTEMPTS", 90, {
-        OPENCLAW_PLUGIN_NPM_VERIFY_ATTEMPTS: "2tries",
-      }),
-    ).toThrow("invalid OPENCLAW_PLUGIN_NPM_VERIFY_ATTEMPTS: 2tries");
-    expect(() =>
-      readPositiveIntEnv("OPENCLAW_PLUGIN_NPM_VERIFY_DELAY_MS", 10000, {
-        OPENCLAW_PLUGIN_NPM_VERIFY_DELAY_MS: "1e3",
-      }),
-    ).toThrow("invalid OPENCLAW_PLUGIN_NPM_VERIFY_DELAY_MS: 1e3");
-    expect(() =>
-      readPositiveIntEnv("OPENCLAW_PLUGIN_NPM_README_VERIFY_ATTEMPTS", 6, {
-        OPENCLAW_PLUGIN_NPM_README_VERIFY_ATTEMPTS: "0",
-      }),
-    ).toThrow("invalid OPENCLAW_PLUGIN_NPM_README_VERIFY_ATTEMPTS: 0");
+describe("plugin npm publish verifier args", () => {
+  it("parses help and package specs before npm calls", () => {
+    expect(parseVerifyPublishedPluginRuntimeArgs(["--help"])).toEqual({ help: true, spec: "" });
+    expect(parseVerifyPublishedPluginRuntimeArgs(["--", "@openclaw/discord@2026.5.2"])).toEqual({
+      help: false,
+      spec: "@openclaw/discord@2026.5.2",
+    });
   });
 
-  it("accepts strict positive retry env values and defaults", () => {
-    expect(readPositiveIntEnv("OPENCLAW_PLUGIN_NPM_VERIFY_ATTEMPTS", 90, {})).toBe(90);
-    expect(
-      readPositiveIntEnv("OPENCLAW_PLUGIN_NPM_README_VERIFY_DELAY_MS", 10000, {
-        OPENCLAW_PLUGIN_NPM_README_VERIFY_DELAY_MS: "2500",
-      }),
-    ).toBe(2500);
+  it("rejects unknown and extra args before npm calls", () => {
+    expect(() => parseVerifyPublishedPluginRuntimeArgs([])).toThrow(usage());
+    expect(() => parseVerifyPublishedPluginRuntimeArgs(["--wat"])).toThrow(
+      "Unknown plugin npm verifier option: --wat",
+    );
+    expect(() =>
+      parseVerifyPublishedPluginRuntimeArgs(["@openclaw/discord@2026.5.2", "extra"]),
+    ).toThrow("Unexpected plugin npm verifier argument: extra");
   });
 });
 
@@ -62,11 +55,11 @@ describe("plugin npm publish verifier command limits", () => {
   });
 
   it("rejects loose npm command timeout and buffer overrides", () => {
-    expect(() =>
-      readPluginNpmCommandOptions({
-        OPENCLAW_PLUGIN_NPM_COMMAND_TIMEOUT_MS: "60s",
-      }),
-    ).toThrow("invalid OPENCLAW_PLUGIN_NPM_COMMAND_TIMEOUT_MS: 60s");
+    for (const value of ["60s", "1e3", "0"]) {
+      expect(() =>
+        readPluginNpmCommandOptions({ OPENCLAW_PLUGIN_NPM_COMMAND_TIMEOUT_MS: value }),
+      ).toThrow(`invalid OPENCLAW_PLUGIN_NPM_COMMAND_TIMEOUT_MS: ${value}`);
+    }
     expect(() =>
       readPluginNpmCommandOptions({
         OPENCLAW_PLUGIN_NPM_COMMAND_MAX_BUFFER_BYTES: "16mb",
@@ -105,6 +98,50 @@ describe("plugin npm publish verifier command limits", () => {
 });
 
 describe("collectPluginNpmPublishedRuntimeErrors", () => {
+  it.each([".ts", ".tsx", ".mts", ".cts"])(
+    "rejects source-only %s runtime and setup entries",
+    (extension) => {
+      const errors = collectPluginNpmPublishedRuntimeErrors({
+        packageJson: {
+          name: "entry-fixture",
+          openclaw: {
+            extensions: [`./src/index${extension}`],
+            setupEntry: `./src/setup${extension}`,
+          },
+        },
+        files: ["openclaw.plugin.json", `src/index${extension}`, `src/setup${extension}`],
+      });
+      expect(errors).toEqual([
+        expect.stringContaining(
+          `compiled runtime output for TypeScript entry ./src/index${extension}`,
+        ),
+        expect.stringContaining(
+          `compiled runtime output for TypeScript entry ./src/setup${extension}`,
+        ),
+      ]);
+    },
+  );
+
+  it.each([
+    [".ts", ".js"],
+    [".tsx", ".js"],
+    [".mts", ".mjs"],
+    [".cts", ".cjs"],
+  ])("accepts nested compiler output for %s entries without source", (source, output) => {
+    expect(
+      collectPluginNpmPublishedRuntimeErrors({
+        packageJson: {
+          name: "entry-fixture",
+          openclaw: {
+            extensions: [`./src/index${source}`],
+            setupEntry: `./src/setup${source}`,
+          },
+        },
+        files: ["openclaw.plugin.json", `dist/src/index${output}`, `dist/src/setup${output}`],
+      }),
+    ).toEqual([]);
+  });
+
   it("flags published plugin packages with TypeScript entries and no compiled runtime output", () => {
     expect(
       collectPluginNpmPublishedRuntimeErrors({
@@ -116,7 +153,7 @@ describe("collectPluginNpmPublishedRuntimeErrors", () => {
             extensions: ["./index.ts"],
           },
         },
-        files: ["package.json", "index.ts"],
+        files: ["package.json", "openclaw.plugin.json", "index.ts"],
       }),
     ).toEqual([
       "@openclaw/discord@2026.5.2 requires compiled runtime output for TypeScript entry ./index.ts: expected ./dist/index.js, ./dist/index.mjs, ./dist/index.cjs, ./index.js, ./index.mjs, ./index.cjs",
@@ -134,9 +171,42 @@ describe("collectPluginNpmPublishedRuntimeErrors", () => {
             runtimeExtensions: ["./dist/index.js"],
           },
         },
-        files: ["package.json", "index.ts", "dist/index.js"],
+        files: ["package.json", "openclaw.plugin.json", "index.ts", "dist/index.js"],
       }),
     ).toStrictEqual([]);
+  });
+
+  it("flags plugin npm packages without an OpenClaw plugin manifest", () => {
+    expect(
+      collectPluginNpmPublishedRuntimeErrors({
+        packageJson: {
+          name: "@openclaw/searxng-plugin",
+          version: "2026.6.11",
+          openclaw: {
+            extensions: ["./index.ts"],
+            runtimeExtensions: ["./dist/index.js"],
+          },
+        },
+        files: ["package.json", "dist/index.js"],
+      }),
+    ).toEqual([
+      "@openclaw/searxng-plugin@2026.6.11 plugin npm package must include openclaw.plugin.json",
+    ]);
+  });
+
+  it("flags reservation packages before they can pass plugin runtime verification", () => {
+    expect(
+      collectPluginNpmPublishedRuntimeErrors({
+        packageJson: {
+          name: "@openclaw/tavily-plugin",
+          version: "0.0.0",
+          description: "Bootstrap reservation",
+        },
+        files: ["package.json", "README.md"],
+      }),
+    ).toEqual([
+      "@openclaw/tavily-plugin@0.0.0 plugin npm package must include openclaw.plugin.json",
+    ]);
   });
 
   it("flags missing explicit runtimeExtensions outputs", () => {
@@ -150,7 +220,7 @@ describe("collectPluginNpmPublishedRuntimeErrors", () => {
             runtimeExtensions: ["./dist/index.js"],
           },
         },
-        files: ["package.json", "src/index.ts"],
+        files: ["package.json", "openclaw.plugin.json", "src/index.ts"],
       }),
     ).toEqual(["@openclaw/line@2026.5.3 runtime extension entry not found: ./dist/index.js"]);
   });
@@ -166,7 +236,7 @@ describe("collectPluginNpmPublishedRuntimeErrors", () => {
             runtimeExtensions: ["./dist/index.js"],
           },
         },
-        files: ["package.json", "dist/index.js"],
+        files: ["package.json", "openclaw.plugin.json", "dist/index.js"],
       }),
     ).toEqual([
       "@openclaw/acpx@2026.5.3 package.json openclaw.runtimeExtensions length (1) must match openclaw.extensions length (2)",
@@ -184,7 +254,7 @@ describe("collectPluginNpmPublishedRuntimeErrors", () => {
             runtimeExtensions: [" "],
           },
         },
-        files: ["package.json", "src/index.ts", "dist/index.js"],
+        files: ["package.json", "openclaw.plugin.json", "src/index.ts", "dist/index.js"],
       }),
     ).toEqual([
       "@openclaw/whatsapp@2026.5.3 package.json openclaw.runtimeExtensions[0] must be a non-empty string",
@@ -203,7 +273,13 @@ describe("collectPluginNpmPublishedRuntimeErrors", () => {
             setupEntry: "./setup-entry.ts",
           },
         },
-        files: ["package.json", "index.ts", "dist/index.js", "setup-entry.ts"],
+        files: [
+          "package.json",
+          "openclaw.plugin.json",
+          "index.ts",
+          "dist/index.js",
+          "setup-entry.ts",
+        ],
       }),
     ).toEqual([
       "@openclaw/line@2026.5.3 requires compiled runtime output for TypeScript entry ./setup-entry.ts: expected ./dist/setup-entry.js, ./dist/setup-entry.mjs, ./dist/setup-entry.cjs, ./setup-entry.js, ./setup-entry.mjs, ./setup-entry.cjs",
@@ -214,7 +290,7 @@ describe("collectPluginNpmPublishedRuntimeErrors", () => {
     expect(
       collectPluginNpmPublishedRuntimeErrors({
         packageJson: {
-          name: "@openclaw/qqbot",
+          name: "@openclaw/example-channel",
           version: "2026.5.3",
           openclaw: {
             extensions: ["./index.ts"],
@@ -223,7 +299,7 @@ describe("collectPluginNpmPublishedRuntimeErrors", () => {
             runtimeSetupEntry: "./dist/setup-entry.js",
           },
         },
-        files: ["package.json", "dist/index.js", "dist/setup-entry.js"],
+        files: ["package.json", "openclaw.plugin.json", "dist/index.js", "dist/setup-entry.js"],
       }),
     ).toStrictEqual([]);
   });
@@ -241,7 +317,7 @@ describe("collectPluginNpmPublishedRuntimeErrors", () => {
             runtimeSetupEntry: "./dist/setup-entry.js",
           },
         },
-        files: ["package.json", "dist/index.js"],
+        files: ["package.json", "openclaw.plugin.json", "dist/index.js"],
       }),
     ).toEqual(["@openclaw/matrix@2026.5.3 runtime setup entry not found: ./dist/setup-entry.js"]);
   });
@@ -258,7 +334,7 @@ describe("collectPluginNpmPublishedRuntimeErrors", () => {
             runtimeSetupEntry: "./dist/setup-entry.js",
           },
         },
-        files: ["package.json", "dist/index.js", "dist/setup-entry.js"],
+        files: ["package.json", "openclaw.plugin.json", "dist/index.js", "dist/setup-entry.js"],
       }),
     ).toEqual([
       "@openclaw/twitch@2026.5.3 package.json openclaw.runtimeSetupEntry requires openclaw.setupEntry",
@@ -277,6 +353,23 @@ describe("resolveNpmPackFilename", () => {
 
     expect(resolveNpmPackFilename(noisyOutput)).toBe("openclaw-msteams-2026.5.24-beta.1.tgz");
   });
+
+  it("rejects path-like tarball output instead of reading outside the pack directory", () => {
+    const unsafeOutputs = [
+      "../openclaw-msteams.tgz",
+      "nested/openclaw-msteams.tgz",
+      "nested\\openclaw-msteams.tgz",
+      "/tmp/openclaw-msteams.tgz",
+      "C:\\temp\\openclaw-msteams.tgz",
+      "openclaw-msteams\u0000.tgz",
+    ];
+
+    for (const output of unsafeOutputs) {
+      expect(() => resolveNpmPackFilename(output)).toThrow(
+        "npm pack did not report a tarball filename",
+      );
+    }
+  });
 });
 
 describe("findPackedPackageReadmePath", () => {
@@ -289,15 +382,18 @@ describe("findPackedPackageReadmePath", () => {
 });
 
 describe("parseNpmReadmeMetadata", () => {
-  it("accepts non-empty npm readme metadata", () => {
-    expect(parseNpmReadmeMetadata(JSON.stringify("# Plugin\n\nInstall it."))).toBe(
-      "# Plugin\n\nInstall it.",
-    );
+  it.each([
+    { npm: "<=11", payload: "# Plugin\n\nInstall it." },
+    { npm: "12", payload: ["# Plugin\n\nInstall it."] },
+  ])("accepts non-empty npm $npm readme metadata", ({ payload }) => {
+    expect(parseNpmReadmeMetadata(JSON.stringify(payload))).toBe("# Plugin\n\nInstall it.");
   });
 
   it("rejects empty or unsupported npm readme metadata", () => {
     expect(parseNpmReadmeMetadata(JSON.stringify(""))).toBe("");
     expect(parseNpmReadmeMetadata(JSON.stringify(null))).toBe("");
+    expect(parseNpmReadmeMetadata(JSON.stringify([]))).toBe("");
+    expect(parseNpmReadmeMetadata(JSON.stringify(["# One", "# Two"]))).toBe("");
     expect(parseNpmReadmeMetadata("{")).toBe("");
   });
 });

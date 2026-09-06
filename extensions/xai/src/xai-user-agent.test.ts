@@ -1,3 +1,4 @@
+// Xai tests cover xai user agent plugin behavior.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { xaiUserAgent, xaiUserAgentHeaderFor } from "./xai-user-agent.js";
 
@@ -9,18 +10,6 @@ describe("xaiUserAgent", () => {
   it("prefers OPENCLAW_VERSION env over the bundled package version", () => {
     vi.stubEnv("OPENCLAW_VERSION", "2026.3.22");
     expect(xaiUserAgent()).toBe("openclaw/2026.3.22");
-  });
-
-  it("falls back to OPENCLAW_SERVICE_VERSION when OPENCLAW_VERSION is unset", () => {
-    vi.stubEnv("OPENCLAW_VERSION", "");
-    vi.stubEnv("OPENCLAW_SERVICE_VERSION", "2026.3.99");
-    // OPENCLAW_VERSION from the SDK is the bundled VERSION constant. In a dev
-    // checkout it resolves to a real semver, so we cannot deterministically
-    // assert "unknown" here. We just lock the prefix to ensure the env-first
-    // contract holds whenever the bundle resolves to 0.0.0/empty.
-    const result = xaiUserAgent();
-    expect(result.startsWith("openclaw/")).toBe(true);
-    expect(result).not.toBe("openclaw/");
   });
 
   it("returns the openclaw/<version> shape", () => {

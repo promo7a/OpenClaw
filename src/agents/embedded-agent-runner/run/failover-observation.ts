@@ -1,16 +1,26 @@
+/**
+ * Logs redacted failover decisions for embedded-agent attempts.
+ */
 import { redactIdentifier } from "../../../logging/redact-identifier.js";
 import type { AuthProfileFailureReason } from "../../auth-profiles.js";
+import { sanitizeForConsole } from "../../console-sanitize.js";
 import {
   buildApiErrorObservationFields,
-  sanitizeForConsole,
   shouldSuppressRawErrorConsoleSuffix,
 } from "../../embedded-agent-error-observation.js";
 import type { FailoverReason } from "../../embedded-agent-helpers.js";
 import { log } from "../logger.js";
 
-export type FailoverDecisionLoggerInput = {
+/** Structured fields emitted whenever embedded run failover chooses an action. */
+type FailoverDecisionLoggerInput = {
   stage: "prompt" | "assistant";
-  decision: "rotate_profile" | "fallback_model" | "surface_error";
+  decision:
+    | "rotate_profile"
+    | "fallback_model"
+    | "surface_error"
+    | "retry_same_model"
+    | "retry_thinking_level"
+    | "continue_normal";
   runId?: string;
   rawError?: string;
   failoverReason: FailoverReason | null;
@@ -24,27 +34,30 @@ export type FailoverDecisionLoggerInput = {
   timedOut?: boolean;
   aborted?: boolean;
   status?: number;
+  retryCount?: number;
+  profileRotationCount?: number;
+  attemptCount?: number;
 };
 
-export type FailoverDecisionLoggerBase = Omit<FailoverDecisionLoggerInput, "decision" | "status">;
+/** Stable context captured before a concrete failover decision is known. */
+type FailoverDecisionLoggerBase = Omit<FailoverDecisionLoggerInput, "decision" | "status">;
 
-export function normalizeFailoverDecisionObservationBase(
-  base: FailoverDecisionLoggerBase,
-): FailoverDecisionLoggerBase {
-  return {
-    ...base,
-    failoverReason: base.failoverReason ?? (base.timedOut ? "timeout" : null),
-    profileFailureReason: base.profileFailureReason ?? (base.timedOut ? "timeout" : null),
-  };
-}
-
+/**
+ * Captures sanitized failover context and returns a decision logger. The closure
+ * keeps prompt/assistant failover branches consistent while still allowing the
+ * final decision and HTTP status to be supplied at the action point.
+ */
 export function createFailoverDecisionLogger(
   base: FailoverDecisionLoggerBase,
 ): (
   decision: FailoverDecisionLoggerInput["decision"],
-  extra?: Pick<FailoverDecisionLoggerInput, "status">,
+  extra?: Pick<FailoverDecisionLoggerInput, "status" | "retryCount" | "profileRotationCount">,
 ) => void {
-  const normalizedBase = normalizeFailoverDecisionObservationBase(base);
+  const normalizedBase = {
+    ...base,
+    failoverReason: base.failoverReason ?? (base.timedOut ? "timeout" : null),
+    profileFailureReason: base.profileFailureReason ?? (base.timedOut ? "timeout" : null),
+  };
   const safeProfileId = normalizedBase.profileId
     ? redactIdentifier(normalizedBase.profileId, { len: 12 })
     : undefined;
@@ -57,14 +70,25 @@ export function createFailoverDecisionLogger(
   const reasonText = normalizedBase.failoverReason ?? "none";
   const sourceChanged = safeSourceProvider !== safeProvider || safeSourceModel !== safeModel;
   return (decision, extra) => {
+    const level = decision === "continue_normal" ? "debug" : "warn";
+    // Keep normal continuation in diagnostics; avoid per-decision formatting
+    // and log transport when neither sink requests those diagnostics.
+    if (level === "debug" && !log.isEnabled(level)) {
+      return;
+    }
     const observedError = buildApiErrorObservationFields(normalizedBase.rawError);
     const safeRawErrorPreview = sanitizeForConsole(observedError.rawErrorPreview);
+    // Some provider/runtime failure kinds already have normalized detail fields.
+    // Repeating the raw suffix there makes the console line noisier without
+    // adding actionable failover evidence.
     const rawErrorConsoleSuffix =
       safeRawErrorPreview &&
       !shouldSuppressRawErrorConsoleSuffix(observedError.providerRuntimeFailureKind)
         ? ` rawError=${safeRawErrorPreview}`
         : "";
-    log.warn("embedded run failover decision", {
+    const retryCount = extra?.retryCount ?? normalizedBase.retryCount;
+    const profileRotationCount = extra?.profileRotationCount ?? normalizedBase.profileRotationCount;
+    log[level]("embedded run failover decision", {
       event: "embedded_run_failover_decision",
       tags: ["error_handling", "failover", normalizedBase.stage, decision],
       runId: normalizedBase.runId,
@@ -81,10 +105,15 @@ export function createFailoverDecisionLogger(
       timedOut: normalizedBase.timedOut,
       aborted: normalizedBase.aborted,
       status: extra?.status,
+      retryCount,
+      profileRotationCount,
+      attemptCount: normalizedBase.attemptCount,
       ...observedError,
       consoleMessage:
         `embedded run failover decision: runId=${safeRunId} stage=${normalizedBase.stage} decision=${decision} ` +
-        `reason=${reasonText} from=${safeSourceProvider}/${safeSourceModel}` +
+        `reason=${reasonText} attempt=${normalizedBase.attemptCount ?? "-"} ` +
+        `retry=${retryCount ?? "-"} rotations=${profileRotationCount ?? "-"} ` +
+        `from=${safeSourceProvider}/${safeSourceModel}` +
         `${sourceChanged ? ` to=${safeProvider}/${safeModel}` : ""} profile=${profileText}${rawErrorConsoleSuffix}`,
     });
   };

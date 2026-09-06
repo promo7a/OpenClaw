@@ -1,30 +1,13 @@
-import type { FinalizedMsgContext } from "../templating.js";
+// Formats finalized message context into prompt-visible text.
+import type { FinalizedRuntimeMsgContext } from "../templating.js";
 
-export type ContextTextKey =
-  | "BodyForAgent"
-  | "BodyForCommands"
-  | "CommandBody"
-  | "RawBody"
-  | "Body";
-
-export function resolveFirstContextText(
-  ctx: FinalizedMsgContext,
-  keys: readonly ContextTextKey[],
-): string {
-  for (const key of keys) {
-    const value = ctx[key];
-    if (typeof value === "string") {
-      return value;
-    }
-  }
-  return "";
+/** Resolves normalized text for slash/bang command parsing. */
+export function resolveCommandContextText(ctx: FinalizedRuntimeMsgContext): string {
+  return ctx.commandText.trim();
 }
 
-export function resolveCommandContextText(ctx: FinalizedMsgContext): string {
-  return resolveFirstContextText(ctx, ["BodyForCommands", "CommandBody", "RawBody", "Body"]).trim();
-}
-
-export function hasExplicitCommandContextText(ctx: FinalizedMsgContext): boolean {
+/** Checks whether the inbound context carries an explicit command prefix. */
+export function hasExplicitCommandContextText(ctx: FinalizedRuntimeMsgContext): boolean {
   const text = resolveCommandContextText(ctx);
   return text.startsWith("/") || text.startsWith("!");
 }

@@ -1,6 +1,8 @@
+// Gateway auth config utilities materialize token/password SecretRefs only for
+// the auth mode that can actually consume them.
 import type { GatewayAuthConfig } from "../config/types.gateway.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { hasConfiguredSecretInput } from "../config/types.secrets.js";
+import { hasConfiguredSecretInput, resolveSecretInputRef } from "../config/types.secrets.js";
 import { resolveRequiredConfiguredSecretRefInputString } from "./resolve-configured-secret-input-string.js";
 import {
   assignResolvedGatewaySecretInput,
@@ -17,8 +19,10 @@ type GatewayAuthSecretRefResolutionParams = {
   cfg: OpenClawConfig;
   env: NodeJS.ProcessEnv;
   mode?: GatewayAuthConfig["mode"];
-  hasPasswordCandidate: boolean;
-  hasTokenCandidate: boolean;
+  hasPasswordOverride: boolean;
+  hasTokenOverride: boolean;
+  hasPasswordFallback: boolean;
+  hasTokenFallback: boolean;
 };
 
 /** Check whether a local Gateway auth input is configured directly or through defaults. */
@@ -33,26 +37,33 @@ export function hasConfiguredGatewayAuthSecretInput(
 function shouldResolveGatewayAuthSecretRef(params: {
   mode?: GatewayAuthConfig["mode"];
   path: GatewayAuthSecretInputPath;
-  hasPasswordCandidate: boolean;
-  hasTokenCandidate: boolean;
+  hasPasswordOverride: boolean;
+  hasTokenOverride: boolean;
+  hasPasswordFallback: boolean;
+  hasTokenFallback: boolean;
 }): boolean {
   const isTokenPath = params.path === "gateway.auth.token";
-  const hasPathCandidate = isTokenPath ? params.hasTokenCandidate : params.hasPasswordCandidate;
-  if (hasPathCandidate) {
+  const hasPathOverride = isTokenPath ? params.hasTokenOverride : params.hasPasswordOverride;
+  if (hasPathOverride) {
     return false;
   }
   if (params.mode === (isTokenPath ? "token" : "password")) {
     return true;
   }
-  if (params.mode === "token" || params.mode === "none" || params.mode === "trusted-proxy") {
+  if (params.mode === "trusted-proxy") {
+    return !isTokenPath;
+  }
+  if (params.mode === "token" || params.mode === "none") {
     return false;
   }
   if (params.mode === "password") {
     return !isTokenPath;
   }
   // With implicit mode, resolve the side that does not already have a concrete
-  // candidate so token and password defaults do not both get materialized.
-  return isTokenPath ? !params.hasPasswordCandidate : !params.hasTokenCandidate;
+  // competing credential so token and password defaults do not both get materialized.
+  return isTokenPath
+    ? !(params.hasPasswordOverride || params.hasPasswordFallback)
+    : !(params.hasTokenOverride || params.hasTokenFallback);
 }
 
 function shouldResolveGatewayTokenSecretRef(
@@ -61,8 +72,10 @@ function shouldResolveGatewayTokenSecretRef(
   return shouldResolveGatewayAuthSecretRef({
     mode: params.mode,
     path: "gateway.auth.token",
-    hasPasswordCandidate: params.hasPasswordCandidate,
-    hasTokenCandidate: params.hasTokenCandidate,
+    hasPasswordOverride: params.hasPasswordOverride,
+    hasTokenOverride: params.hasTokenOverride,
+    hasPasswordFallback: params.hasPasswordFallback,
+    hasTokenFallback: params.hasTokenFallback,
   });
 }
 
@@ -72,9 +85,44 @@ function shouldResolveGatewayPasswordSecretRef(
   return shouldResolveGatewayAuthSecretRef({
     mode: params.mode,
     path: "gateway.auth.password",
-    hasPasswordCandidate: params.hasPasswordCandidate,
-    hasTokenCandidate: params.hasTokenCandidate,
+    hasPasswordOverride: params.hasPasswordOverride,
+    hasTokenOverride: params.hasTokenOverride,
+    hasPasswordFallback: params.hasPasswordFallback,
+    hasTokenFallback: params.hasTokenFallback,
   });
+}
+
+function hasActiveExecGatewayAuthSecretRef(params: {
+  cfg: OpenClawConfig;
+  path: GatewayAuthSecretInputPath;
+  shouldResolve: boolean;
+}): boolean {
+  if (!params.shouldResolve) {
+    return false;
+  }
+  const { ref } = resolveSecretInputRef({
+    value: readGatewaySecretInputValue(params.cfg, params.path),
+    defaults: params.cfg.secrets?.defaults,
+  });
+  return ref?.source === "exec";
+}
+
+/** Check whether active local Gateway auth refs can be read without invoking exec providers. */
+export function canMaterializeGatewayAuthSecretRefsWithoutExec(
+  params: GatewayAuthSecretRefResolutionParams,
+): boolean {
+  return !(
+    hasActiveExecGatewayAuthSecretRef({
+      cfg: params.cfg,
+      path: "gateway.auth.token",
+      shouldResolve: shouldResolveGatewayTokenSecretRef(params),
+    }) ||
+    hasActiveExecGatewayAuthSecretRef({
+      cfg: params.cfg,
+      path: "gateway.auth.password",
+      shouldResolve: shouldResolveGatewayPasswordSecretRef(params),
+    })
+  );
 }
 
 async function resolveGatewayAuthSecretRefValue(params: {
@@ -132,6 +180,8 @@ async function resolveGatewayAuthSecretRef(params: {
   if (!value) {
     return params.cfg;
   }
+  // Mutate a clone so startup validation can materialize secrets without
+  // altering the caller's raw config object.
   const nextConfig = structuredClone(params.cfg);
   nextConfig.gateway ??= {};
   nextConfig.gateway.auth ??= {};
@@ -147,8 +197,10 @@ async function resolveGatewayPasswordSecretRef(params: {
   cfg: OpenClawConfig;
   env: NodeJS.ProcessEnv;
   mode?: GatewayAuthConfig["mode"];
-  hasPasswordCandidate: boolean;
-  hasTokenCandidate: boolean;
+  hasPasswordOverride: boolean;
+  hasTokenOverride: boolean;
+  hasPasswordFallback: boolean;
+  hasTokenFallback: boolean;
 }): Promise<OpenClawConfig> {
   return resolveGatewayAuthSecretRef({
     cfg: params.cfg,
@@ -172,9 +224,11 @@ export async function materializeGatewayAuthSecretRefs(
     cfg: cfgWithToken,
     env: params.env,
     mode: params.mode,
-    hasPasswordCandidate: params.hasPasswordCandidate,
-    hasTokenCandidate:
-      params.hasTokenCandidate ||
+    hasPasswordOverride: params.hasPasswordOverride,
+    hasTokenOverride: params.hasTokenOverride,
+    hasPasswordFallback: params.hasPasswordFallback,
+    hasTokenFallback:
+      params.hasTokenFallback ||
       hasConfiguredGatewayAuthSecretInput(cfgWithToken, "gateway.auth.token"),
   });
 }

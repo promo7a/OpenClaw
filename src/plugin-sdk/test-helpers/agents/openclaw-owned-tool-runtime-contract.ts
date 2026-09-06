@@ -1,10 +1,35 @@
+// OpenClaw-owned tool runtime contract helpers mock agent tool runtimes in SDK tests.
 import { vi } from "vitest";
 import { resetAdjustedParamsByToolCallIdForTests } from "../../../agents/agent-tools.before-tool-call.state.js";
-import type { AgentToolResult } from "../../../agents/runtime/index.js";
+import {
+  addSession,
+  appendOutput,
+  deleteSession,
+  markExited,
+  recordNotifyOnExitRemoval,
+} from "../../../agents/bash-process-registry.js";
+import { createProcessSessionFixture } from "../../../agents/bash-process-registry.test-helpers.js";
+import { createProcessTool } from "../../../agents/bash-tools.process.js";
+import { buildEmbeddedRunPayloads } from "../../../agents/embedded-agent-runner/run/payloads.js";
+import { mergeAttemptToolMediaPayloads } from "../../../agents/embedded-agent-runner/run/tool-media-payloads.js";
 import type {
-  CodexAppServerExtensionFactory,
-  CodexAppServerToolResultEvent,
-} from "../../../plugins/codex-app-server-extension-types.js";
+  EmbeddedRunAttemptParams,
+  EmbeddedRunAttemptResult,
+} from "../../../agents/embedded-agent-runner/run/types.js";
+import { createAdmittedHostCapabilityTestFixture } from "../../../agents/harness/host-capability.test-support.js";
+import type { AgentToolResult } from "../../../agents/runtime/index.js";
+import type { ToolErrorSummary } from "../../../agents/tool-error-summary.js";
+import { createToolTerminalObserver } from "../../../agents/tool-terminal-outcome.js";
+import { setToolTerminalPresentation } from "../../../agents/tool-terminal-presentation.js";
+import type { AnyAgentTool } from "../../../agents/tools/common.js";
+import { getCoreTtsAttemptResultMediaUrls } from "../../../agents/tools/tts-tool-result-provenance.js";
+import { getReplyPayloadMetadata } from "../../../auto-reply/reply-payload.js";
+import {
+  drainSystemEventEntries,
+  enqueueSystemEventWithReceipt,
+  peekSystemEventEntries,
+} from "../../../infra/system-events.js";
+import type { AgentToolResultMiddlewareEvent } from "../../../plugins/agent-tool-result-middleware-types.js";
 import {
   initializeGlobalHookRunner,
   resetGlobalHookRunner,
@@ -15,6 +40,33 @@ import {
   resetPluginRuntimeStateForTest,
   setActivePluginRegistry,
 } from "../../../plugins/runtime.js";
+import { setPluginToolMeta } from "../../../plugins/tool-metadata.js";
+import * as ttsRuntime from "../../../tts/tts.js";
+
+/** Real process poll producer and notification queue, with a synthetic completed process. */
+export function createProcessPollDeliveryContract(sessionId: string) {
+  const sessionKey = `agent:main:${sessionId}`;
+  const session = createProcessSessionFixture({ id: sessionId, backgrounded: true });
+  session.scopeKey = sessionKey;
+  session.sessionKey = sessionKey;
+  addSession(session);
+  appendOutput(session, "stdout", "completed output");
+  markExited(session, 0, null, "completed");
+  enqueueSystemEventWithReceipt("unrelated event", { sessionKey, contextKey: "other" });
+  recordNotifyOnExitRemoval(
+    session,
+    enqueueSystemEventWithReceipt("exec completed", { sessionKey, contextKey: sessionId })!,
+  );
+  return {
+    tool: createProcessTool({ scopeKey: sessionKey }),
+    pollArguments: { action: "poll", sessionId },
+    pendingNotifications: () => peekSystemEventEntries(sessionKey).map((event) => event.text),
+    close: () => {
+      deleteSession(sessionId);
+      drainSystemEventEntries(sessionKey);
+    },
+  };
+}
 
 export function textToolResult(
   text: string,
@@ -36,6 +88,68 @@ export function mediaToolResult(
       mediaUrl,
       ...(audioAsVoice ? { audioAsVoice } : {}),
     },
+  });
+}
+
+export function createTerminalPresentationContractTool(params: {
+  name: string;
+  result: AgentToolResult<unknown>;
+  format: (params: unknown, result: AgentToolResult<unknown>) => string | undefined;
+}): AnyAgentTool {
+  return setToolTerminalPresentation(
+    {
+      name: params.name,
+      label: `${params.name} contract tool`,
+      description: `${params.name} contract tool`,
+      parameters: {},
+      execute: vi.fn(async () => params.result),
+    } as AnyAgentTool,
+    (toolParams, result) => {
+      const text = params.format(toolParams, result);
+      return text ? { text } : undefined;
+    },
+  );
+}
+
+export function createOwnerBackedContractTool(params: {
+  pluginId: string;
+  name: string;
+  result: AgentToolResult<unknown>;
+}): AnyAgentTool {
+  const tool = {
+    name: params.name,
+    label: `${params.name} owner contract tool`,
+    description: `${params.name} owner contract tool`,
+    parameters: { type: "object", properties: {}, additionalProperties: true },
+    execute: vi.fn(async () => params.result),
+  } as AnyAgentTool;
+  setPluginToolMeta(tool, {
+    pluginId: params.pluginId,
+    optional: false,
+    sideEffecting: true,
+  });
+  return tool;
+}
+
+export function createContractToolTerminalObserver(
+  runId: string,
+): NonNullable<EmbeddedRunAttemptParams["observeToolTerminal"]> {
+  return createToolTerminalObserver(runId);
+}
+
+export function buildContractReplyPayloads(params: {
+  assistantText: string;
+  lastToolError?: ToolErrorSummary;
+}) {
+  return buildEmbeddedRunPayloads({
+    assistantTexts: [params.assistantText],
+    lastAssistant: undefined,
+    lastToolError: params.lastToolError,
+    isCronTrigger: false,
+    sessionKey: "session:runtime-contract",
+    verboseLevel: "off",
+    reasoningLevel: "off",
+    toolResultFormat: "plain",
   });
 }
 
@@ -67,20 +181,18 @@ export function installOpenClawOwnedToolHooks(params?: {
  * Pair with `installOpenClawOwnedToolHooks()` when a test asserts before/after hook behavior.
  */
 export function installCodexToolResultMiddleware(
-  handler: (event: CodexAppServerToolResultEvent) => AgentToolResult<unknown>,
+  handler: (event: AgentToolResultMiddlewareEvent) => AgentToolResult<unknown>,
 ) {
-  const middleware = vi.fn(async (event: CodexAppServerToolResultEvent) => ({
+  const middleware = vi.fn(async (event: AgentToolResultMiddlewareEvent) => ({
     result: handler(event),
   }));
   const registry = createEmptyPluginRegistry();
-  const factory: CodexAppServerExtensionFactory = async (codex) => {
-    codex.on("tool_result", middleware);
-  };
-  registry.codexAppServerExtensionFactories.push({
+  registry.agentToolResultMiddlewares.push({
     pluginId: "runtime-contract",
     pluginName: "Runtime Contract",
-    rawFactory: factory,
-    factory,
+    rawHandler: middleware,
+    handler: middleware,
+    runtimes: ["codex"],
     source: "test",
   });
   setActivePluginRegistry(registry);
@@ -91,4 +203,42 @@ export function resetOpenClawOwnedToolHooks(): void {
   resetGlobalHookRunner();
   resetPluginRuntimeStateForTest();
   resetAdjustedParamsByToolCallIdForTests();
+}
+
+/** Real host TTS producer and delivery consumer; only synthesis is synthetic. */
+export async function createHostTtsRuntimeContract(
+  attempt: Parameters<typeof createAdmittedHostCapabilityTestFixture>[0],
+  audioPath: string,
+) {
+  const host = await createAdmittedHostCapabilityTestFixture(attempt);
+  const synthesis = vi.spyOn(ttsRuntime, "textToSpeech").mockResolvedValue({
+    success: true,
+    audioPath,
+    provider: "test-speech",
+    audioAsVoice: true,
+  });
+  return {
+    hostCapabilities: host.hostCapabilities,
+    synthesis,
+    deliverablePayloads: (result: EmbeddedRunAttemptResult) =>
+      (
+        mergeAttemptToolMediaPayloads({
+          toolMediaUrls: result.toolMediaUrls,
+          hostOwnedToolMediaUrls: result.hostOwnedToolMediaUrls,
+          toolAutoDeliveryMediaUrls: getCoreTtsAttemptResultMediaUrls(
+            result,
+            result.toolMediaUrls,
+            host.admittedRunContext.operationalRunInstance,
+          ),
+          toolAudioAsVoice: result.toolAudioAsVoice,
+          toolTrustedLocalMedia: result.toolTrustedLocalMedia,
+          sourceReplyDeliveryMode: "message_tool_only",
+        }) ?? []
+      ).filter((payload) => getReplyPayloadMetadata(payload)?.deliverDespiteSourceReplySuppression),
+    close: () => {
+      host.closeHost();
+      host.closeAdmission();
+      synthesis.mockRestore();
+    },
+  };
 }

@@ -1,3 +1,5 @@
+// Deepinfra provider module implements model/runtime integration.
+import { bufferToBlobPart } from "openclaw/plugin-sdk/blob-runtime";
 import {
   createOpenAiCompatibleImageGenerationProvider,
   imageSourceUploadFileName,
@@ -11,7 +13,7 @@ import {
   normalizeDeepInfraBaseUrl,
   normalizeDeepInfraModelRef,
 } from "./media-models.js";
-import type { DeepInfraSurfaceModel } from "./provider-models.js";
+import type { DeepInfraSurfaceModel } from "./media-models.js";
 
 const DEEPINFRA_IMAGE_SIZES = ["512x512", "1024x1024", "1024x1792", "1792x1024"] as const;
 const MAX_DEEPINFRA_INPUT_IMAGES = 1;
@@ -21,9 +23,10 @@ const MAX_DEEPINFRA_INPUT_IMAGES = 1;
 export function buildDeepInfraImageGenerationProvider(options?: {
   imageGenModels?: readonly DeepInfraSurfaceModel[];
 }): ImageGenerationProvider {
-  const ids = options?.imageGenModels && options.imageGenModels.length > 0
-    ? options.imageGenModels.map((model) => model.id)
-    : [...DEEPINFRA_IMAGE_FALLBACK_MODELS];
+  const ids =
+    options?.imageGenModels && options.imageGenModels.length > 0
+      ? options.imageGenModels.map((model) => model.id)
+      : [...DEEPINFRA_IMAGE_FALLBACK_MODELS];
   const defaultModel = ids[0] ?? DEEPINFRA_IMAGE_FALLBACK_MODELS[0];
   return createOpenAiCompatibleImageGenerationProvider({
     id: "deepinfra",
@@ -80,7 +83,7 @@ export function buildDeepInfraImageGenerationProvider(options?: {
       const mimeType = normalizeOptionalString(image.mimeType) ?? "image/png";
       form.append(
         "image",
-        new Blob([new Uint8Array(image.buffer)], { type: mimeType }),
+        new Blob([bufferToBlobPart(image.buffer)], { type: mimeType }),
         imageSourceUploadFileName({ image, index: 0 }),
       );
       return { kind: "multipart", form };

@@ -1,16 +1,24 @@
 /** Resolved pair-loop guard settings in milliseconds for runtime checks. */
 export type PairLoopGuardSettings = {
+  /** Whether protection is active after config and channel capability gates. */
   enabled: boolean;
+  /** Number of pair events allowed before cooldown starts. */
   maxEventsPerWindow: number;
+  /** Rolling event window size in milliseconds. */
   windowMs: number;
+  /** Suppression duration in milliseconds once the threshold is exceeded. */
   cooldownMs: number;
 };
 
 /** User-facing pair-loop guard config accepted by channel plugins. */
 export type PairLoopGuardConfig = {
+  /** Enables or disables loop protection for the channel/account scope. */
   enabled?: boolean;
+  /** Number of pair events allowed before cooldown starts. */
   maxEventsPerWindow?: number;
+  /** Rolling event window size in seconds for config files. */
   windowSeconds?: number;
+  /** Suppression duration in seconds for config files. */
   cooldownSeconds?: number;
 };
 
@@ -28,13 +36,16 @@ export type PairLoopGuardResult =
 
 /** Snapshot entry for observability and tests. */
 export type PairLoopGuardSnapshotEntry = {
+  /** Internal pair key containing scope, conversation, and unordered participant ids. */
   key: string;
+  /** Number of retained events in the current window. */
   recentCount: number;
+  /** Epoch milliseconds when cooldown ends, or zero when inactive. */
   cooldownUntilMs: number;
 };
 
 type PairLoopGuardEntry = {
-  recentMs: number[];
+  recentEvents: Array<{ timestampMs: number; eventId?: string }>;
   windowMs: number;
   cooldownStartedAtMs: number;
   cooldownUntilMs: number;
@@ -42,15 +53,26 @@ type PairLoopGuardEntry = {
 
 /** In-memory guard for suppressing repeated bidirectional bot pair loops. */
 export type PairLoopGuard = {
+  /** Records one sender/receiver interaction and reports whether it enters or is inside cooldown. */
   recordAndCheck: (params: {
+    /** Channel/account/provider scope that owns this conversation. */
     scopeId: string;
+    /** Conversation/thread identifier where the bidirectional exchange happened. */
     conversationId: string;
+    /** Sender id for this event; paired with receiverId without direction. */
     senderId: string;
+    /** Receiver id for this event; paired with senderId without direction. */
     receiverId: string;
+    /** Stable provider event identity used to avoid double-counting retries. */
+    eventId?: string;
+    /** Resolved guard thresholds for the current channel/account. */
     settings: PairLoopGuardSettings;
+    /** Optional test/runtime clock override in epoch milliseconds. */
     nowMs?: number;
   }) => PairLoopGuardResult;
+  /** Clears all tracked pair state and scheduled pruning state. */
   clear: () => void;
+  /** Returns tracked pair counters for diagnostics and tests without exposing mutable state. */
   snapshot: () => PairLoopGuardSnapshotEntry[];
 };
 
@@ -138,6 +160,7 @@ export function resolvePairLoopGuardSettings(params: {
     DEFAULT_PAIR_LOOP_GUARD_CONFIG.cooldownSeconds;
 
   return {
+    // Channel-level capability gates can disable protection even when config/defaults enable it.
     enabled: params.defaultEnabled && configuredEnabled,
     maxEventsPerWindow,
     windowMs: windowSeconds * 1000,
@@ -157,13 +180,13 @@ function buildPairKey(params: {
   return [params.scopeId, params.conversationId, lhs, rhs].join(KEY_SEPARATOR);
 }
 
-function pruneRecentTimestamps(entry: PairLoopGuardEntry, nowMs: number, windowMs: number): void {
+function pruneRecentEvents(entry: PairLoopGuardEntry, nowMs: number, windowMs: number): void {
   const cutoff = nowMs - windowMs;
-  entry.recentMs = entry.recentMs.filter((timestampMs) => timestampMs > cutoff);
+  entry.recentEvents = entry.recentEvents.filter((event) => event.timestampMs > cutoff);
 }
 
 function countCurrentWindowEvents(entry: PairLoopGuardEntry, nowMs: number): number {
-  return entry.recentMs.filter((timestampMs) => timestampMs <= nowMs).length;
+  return entry.recentEvents.filter((event) => event.timestampMs <= nowMs).length;
 }
 
 /** Creates an in-memory pair-loop guard with bounded periodic pruning. */
@@ -178,8 +201,8 @@ export function createPairLoopGuard(params?: { pruneIntervalMs?: number }): Pair
     }
     nextPruneAtMs = nowMs + pruneIntervalMs;
     for (const [key, entry] of tracked) {
-      pruneRecentTimestamps(entry, nowMs, entry.windowMs);
-      if (entry.recentMs.length === 0 && entry.cooldownUntilMs <= nowMs) {
+      pruneRecentEvents(entry, nowMs, entry.windowMs);
+      if (entry.recentEvents.length === 0 && entry.cooldownUntilMs <= nowMs) {
         tracked.delete(key);
       }
     }
@@ -190,6 +213,7 @@ export function createPairLoopGuard(params?: { pruneIntervalMs?: number }): Pair
     conversationId: string;
     senderId: string;
     receiverId: string;
+    eventId?: string;
     settings: PairLoopGuardSettings;
     nowMs?: number;
   }): PairLoopGuardResult {
@@ -221,21 +245,33 @@ export function createPairLoopGuard(params?: { pruneIntervalMs?: number }): Pair
     const key = buildPairKey(paramsLocal);
     let entry = tracked.get(key);
     if (!entry) {
-      entry = { recentMs: [], windowMs, cooldownStartedAtMs: 0, cooldownUntilMs: 0 };
+      entry = {
+        recentEvents: [],
+        windowMs,
+        cooldownStartedAtMs: 0,
+        cooldownUntilMs: 0,
+      };
       tracked.set(key, entry);
+    }
+    entry.windowMs = windowMs;
+    pruneRecentEvents(entry, nowMs, windowMs);
+    const eventId = paramsLocal.eventId?.trim();
+    if (eventId && entry.recentEvents.some((event) => event.eventId === eventId)) {
+      return { suppressed: false };
     }
     if (entry.cooldownStartedAtMs <= nowMs && entry.cooldownUntilMs > nowMs) {
       return { suppressed: true, cooldownUntilMs: entry.cooldownUntilMs };
     }
 
-    entry.windowMs = windowMs;
-    pruneRecentTimestamps(entry, nowMs, windowMs);
-    entry.recentMs.push(nowMs);
+    entry.recentEvents.push({
+      timestampMs: nowMs,
+      ...(eventId ? { eventId } : {}),
+    });
     if (countCurrentWindowEvents(entry, nowMs) > maxEventsPerWindow) {
       entry.cooldownStartedAtMs = nowMs;
       entry.cooldownUntilMs = nowMs + cooldownMs;
       // Keep only future records during cooldown; past events should not extend suppression.
-      entry.recentMs = entry.recentMs.filter((timestampMs) => timestampMs > nowMs);
+      entry.recentEvents = entry.recentEvents.filter((event) => event.timestampMs > nowMs);
       return { suppressed: true, cooldownUntilMs: entry.cooldownUntilMs };
     }
 
@@ -251,7 +287,7 @@ export function createPairLoopGuard(params?: { pruneIntervalMs?: number }): Pair
     snapshot: () =>
       Array.from(tracked.entries()).map(([key, entry]) => ({
         key,
-        recentCount: entry.recentMs.length,
+        recentCount: entry.recentEvents.length,
         cooldownUntilMs: entry.cooldownUntilMs,
       })),
   };

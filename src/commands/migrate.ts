@@ -1,3 +1,4 @@
+/** CLI command orchestration for migration list, plan, and apply flows. */
 import { cancel, confirm, isCancel, log } from "@clack/prompts";
 import {
   stylePromptHint,
@@ -17,6 +18,7 @@ import type { MigrationApplyResult, MigrationPlan } from "../plugins/types.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { writeRuntimeJson } from "../runtime.js";
 import { runMigrationApply } from "./migrate/apply.js";
+import { applyMigrationItemSelection } from "./migrate/item-selection.js";
 import { formatMigrationPreview } from "./migrate/output.js";
 import { createMigrationPlan, resolveMigrationProvider } from "./migrate/providers.js";
 import {
@@ -28,31 +30,25 @@ import {
   formatMigrationPluginSelectionLabel,
   formatMigrationSkillSelectionHint,
   formatMigrationSkillSelectionLabel,
-  getDefaultMigrationPluginSelectionValues,
-  getDefaultMigrationSkillSelectionValues,
-  getMigrationPluginSelectionValue,
-  getMigrationSkillSelectionValue,
+  getDefaultMigrationSelectionValues,
   getSelectableMigrationPluginItems,
   getSelectableMigrationSkillItems,
   MIGRATION_SELECTION_ACCEPT,
   MIGRATION_SELECTION_TOGGLE_ALL_OFF,
   MIGRATION_SELECTION_TOGGLE_ALL_ON,
-  resolveInteractiveMigrationPluginSelection,
-  resolveInteractiveMigrationSkillSelection,
+  resolveInteractiveMigrationSelection,
 } from "./migrate/selection.js";
-import { promptMigrationSelectionValues } from "./migrate/skill-selection-prompt.js";
+import { promptMigrationSkillSelectionValues } from "./migrate/skill-selection-prompt.js";
 import type {
   MigrateApplyOptions,
   MigrateCommonOptions,
   MigrateDefaultOptions,
 } from "./migrate/types.js";
 
-export type { MigrateApplyOptions, MigrateCommonOptions, MigrateDefaultOptions };
-
 function selectMigrationItems(plan: MigrationPlan, opts: MigrateCommonOptions): MigrationPlan {
-  return applyMigrationPluginSelection(
-    applyMigrationSkillSelection(plan, opts.skills),
-    opts.plugins,
+  return applyMigrationItemSelection(
+    applyMigrationPluginSelection(applyMigrationSkillSelection(plan, opts.skills), opts.plugins),
+    opts.itemIds,
   );
 }
 
@@ -130,6 +126,8 @@ async function createInteractiveMigrationPlanWithAuthPrompt(
     }
     return initialPlan;
   }
+  // Build the first plan without secrets, then only rescan with secrets after
+  // explicit consent so credential handling is opt-in for interactive users.
   const includeSecrets = await confirm({
     message: stylePromptMessage("Do you want to migrate your auth credentials as well?"),
     initialValue: true,
@@ -158,37 +156,51 @@ function assertVerifyPluginAppsProvider(providerId: string, opts: MigrateCommonO
   }
 }
 
-async function promptCodexMigrationSkillSelection(
+async function promptCodexMigrationSelection(
   runtime: RuntimeEnv,
   plan: MigrationPlan,
   opts: MigrateCommonOptions & { yes?: boolean },
+  kind: "skills" | "plugins",
 ): Promise<MigrationPlan | null> {
   if (
     plan.providerId !== "codex" ||
     opts.yes ||
     opts.json ||
-    opts.skills !== undefined ||
+    opts[kind] !== undefined ||
     !process.stdin.isTTY
   ) {
     return plan;
   }
-  const skillItems = getSelectableMigrationSkillItems(plan);
-  if (skillItems.length === 0) {
+  const skillSelection = kind === "skills";
+  const items = skillSelection
+    ? getSelectableMigrationSkillItems(plan)
+    : getSelectableMigrationPluginItems(plan);
+  if (items.length === 0) {
     return plan;
   }
-  const selected = await promptMigrationSelectionValues({
-    message: stylePromptMessage("Select Codex skills to migrate into this agent"),
+  const selected = await promptMigrationSkillSelectionValues({
+    message: stylePromptMessage(
+      skillSelection
+        ? "Select Codex skills to migrate into this agent"
+        : "Select native Codex plugins to activate in this agent",
+    ),
     options: [
       {
         value: MIGRATION_SELECTION_ACCEPT,
         label: "Accept recommended",
-        hint: "Migrate every recommended skill",
+        hint: skillSelection
+          ? "Migrate every recommended skill"
+          : "Migrate every recommended plugin",
       },
-      ...skillItems.map((item) => {
-        const hint = formatMigrationSkillSelectionHint(item);
+      ...items.map((item) => {
+        const hint = skillSelection
+          ? formatMigrationSkillSelectionHint(item)
+          : formatMigrationPluginSelectionHint(item);
         return {
-          value: getMigrationSkillSelectionValue(item),
-          label: formatMigrationSkillSelectionLabel(item),
+          value: item.id,
+          label: skillSelection
+            ? formatMigrationSkillSelectionLabel(item)
+            : formatMigrationPluginSelectionLabel(item),
           hint: hint === undefined ? undefined : stylePromptHint(hint),
         };
       }),
@@ -201,9 +213,8 @@ async function promptCodexMigrationSkillSelection(
         label: "Toggle all off",
       },
     ],
-    initialValues: getDefaultMigrationSkillSelectionValues(skillItems),
-    required: false,
-    selectableValues: skillItems.map(getMigrationSkillSelectionValue),
+    initialValues: getDefaultMigrationSelectionValues(items),
+    selectableValues: items.map((item) => item.id),
     cursorAt: MIGRATION_SELECTION_ACCEPT,
   });
   if (isCancel(selected)) {
@@ -211,72 +222,14 @@ async function promptCodexMigrationSkillSelection(
     runtime.log("Migration cancelled.");
     return null;
   }
-  const selection = resolveInteractiveMigrationSkillSelection(skillItems, selected ?? []);
-  const selectedPlan = applyMigrationSelectedSkillItemIds(plan, selection.selectedItemIds);
-  runtime.log(
-    `Selected ${selection.selectedItemIds.size} of ${skillItems.length} Codex skills for migration.`,
-  );
-  return selectedPlan;
-}
-
-async function promptCodexMigrationPluginSelection(
-  runtime: RuntimeEnv,
-  plan: MigrationPlan,
-  opts: MigrateCommonOptions & { yes?: boolean },
-): Promise<MigrationPlan | null> {
-  if (
-    plan.providerId !== "codex" ||
-    opts.yes ||
-    opts.json ||
-    opts.plugins !== undefined ||
-    !process.stdin.isTTY
-  ) {
-    return plan;
-  }
-  const pluginItems = getSelectableMigrationPluginItems(plan);
-  if (pluginItems.length === 0) {
-    return plan;
-  }
-  const selected = await promptMigrationSelectionValues({
-    message: stylePromptMessage("Select native Codex plugins to activate in this agent"),
-    options: [
-      {
-        value: MIGRATION_SELECTION_ACCEPT,
-        label: "Accept recommended",
-        hint: "Migrate every recommended plugin",
-      },
-      ...pluginItems.map((item) => {
-        const hint = formatMigrationPluginSelectionHint(item);
-        return {
-          value: getMigrationPluginSelectionValue(item),
-          label: formatMigrationPluginSelectionLabel(item),
-          hint: hint === undefined ? undefined : stylePromptHint(hint),
-        };
-      }),
-      {
-        value: MIGRATION_SELECTION_TOGGLE_ALL_ON,
-        label: "Toggle all on",
-      },
-      {
-        value: MIGRATION_SELECTION_TOGGLE_ALL_OFF,
-        label: "Toggle all off",
-      },
-    ],
-    initialValues: getDefaultMigrationPluginSelectionValues(pluginItems),
-    required: false,
-    selectableValues: pluginItems.map(getMigrationPluginSelectionValue),
-    cursorAt: MIGRATION_SELECTION_ACCEPT,
-  });
-  if (isCancel(selected)) {
-    cancel(stylePromptTitle("Migration cancelled.") ?? "Migration cancelled.");
-    runtime.log("Migration cancelled.");
-    return null;
-  }
-  const selection = resolveInteractiveMigrationPluginSelection(pluginItems, selected ?? []);
-  const selectedPlan = applyMigrationSelectedPluginItemIds(plan, selection.selectedItemIds);
-  runtime.log(
-    `Selected ${selection.selectedItemIds.size} of ${pluginItems.length} native Codex plugins for activation.`,
-  );
+  const selection = resolveInteractiveMigrationSelection(items, selected ?? []);
+  const selectedPlan = skillSelection
+    ? applyMigrationSelectedSkillItemIds(plan, selection.selectedItemIds)
+    : applyMigrationSelectedPluginItemIds(plan, selection.selectedItemIds);
+  const purpose = skillSelection
+    ? "Codex skills for migration"
+    : "native Codex plugins for activation";
+  runtime.log(`Selected ${selection.selectedItemIds.size} of ${items.length} ${purpose}.`);
   return selectedPlan;
 }
 
@@ -285,11 +238,11 @@ async function promptCodexMigrationSelections(
   plan: MigrationPlan,
   opts: MigrateCommonOptions & { yes?: boolean },
 ): Promise<MigrationPlan | null> {
-  const skillSelectedPlan = await promptCodexMigrationSkillSelection(runtime, plan, opts);
+  const skillSelectedPlan = await promptCodexMigrationSelection(runtime, plan, opts, "skills");
   if (!skillSelectedPlan) {
     return null;
   }
-  return await promptCodexMigrationPluginSelection(runtime, skillSelectedPlan, opts);
+  return await promptCodexMigrationSelection(runtime, skillSelectedPlan, opts, "plugins");
 }
 
 function hasSelectedCodexMigrationWork(plan: MigrationPlan): boolean {
@@ -334,6 +287,7 @@ function logNoCodexSelection(runtime: RuntimeEnv, plan: MigrationPlan): void {
   runtime.log("No Codex skills or native Codex plugins selected for migration.");
 }
 
+/** Lists available migration providers as JSON or terse terminal rows. */
 export async function migrateListCommand(runtime: RuntimeEnv, opts: { json?: boolean } = {}) {
   const cfg = getRuntimeConfig();
   ensureStandaloneMigrationProviderRegistryLoaded({ cfg });
@@ -363,6 +317,7 @@ export async function migrateListCommand(runtime: RuntimeEnv, opts: { json?: boo
   );
 }
 
+/** Creates and prints a migration plan without applying it. */
 export async function migratePlanCommand(
   runtime: RuntimeEnv,
   opts: MigrateCommonOptions,
@@ -387,10 +342,12 @@ export async function migratePlanCommand(
   return plan;
 }
 
+/** Applies a migration non-interactively when `yes` is true. */
 export async function migrateApplyCommand(
   runtime: RuntimeEnv,
   opts: MigrateApplyOptions & { yes: true },
 ): Promise<MigrationApplyResult>;
+/** Plans interactively when needed, prompts, then applies the selected migration. */
 export async function migrateApplyCommand(
   runtime: RuntimeEnv,
   opts: MigrateApplyOptions,
@@ -411,7 +368,7 @@ export async function migrateApplyCommand(
   }
   if (!opts.yes && !process.stdin.isTTY) {
     throw new Error(
-      `openclaw migrate apply requires --yes in non-interactive mode. Preview first with ${formatCliCommand("openclaw migrate plan --provider <provider>")}.`,
+      `openclaw migrate apply requires --yes in non-interactive mode. Preview first with ${formatCliCommand(`openclaw migrate plan '${providerId.replaceAll("'", "'\\''")}'`)}.`,
     );
   }
   const provider = resolveMigrationProvider(providerId, opts.configOverride);
@@ -458,6 +415,7 @@ export async function migrateApplyCommand(
   });
 }
 
+/** Default migrate command: list providers, plan, dry-run, or apply based on flags. */
 export async function migrateDefaultCommand(
   runtime: RuntimeEnv,
   opts: MigrateDefaultOptions,

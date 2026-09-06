@@ -1,7 +1,10 @@
+/**
+ * Normalizes outbound message text to suppress duplicate send actions.
+ */
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 
 const MIN_DUPLICATE_TEXT_LENGTH = 10;
-const MIN_REVERSE_SUBSTRING_DUPLICATE_RATIO = 0.5;
+const MIN_SUBSTRING_DUPLICATE_RATIO = 0.5;
 
 /**
  * Normalize text for duplicate comparison.
@@ -17,6 +20,7 @@ export function normalizeTextForComparison(text: string): string {
     .trim();
 }
 
+/** Compare already-normalized message text against prior sends. */
 export function isMessagingToolDuplicateNormalized(
   normalized: string,
   normalizedSentTexts: string[],
@@ -32,15 +36,16 @@ export function isMessagingToolDuplicateNormalized(
       return false;
     }
     if (normalized.includes(normalizedSent)) {
-      return true;
+      return normalizedSent.length >= normalized.length * MIN_SUBSTRING_DUPLICATE_RATIO;
     }
     return (
       normalizedSent.includes(normalized) &&
-      normalized.length >= normalizedSent.length * MIN_REVERSE_SUBSTRING_DUPLICATE_RATIO
+      normalized.length >= normalizedSent.length * MIN_SUBSTRING_DUPLICATE_RATIO
     );
   });
 }
 
+/** Return true when raw message text duplicates a prior sent message. */
 export function isMessagingToolDuplicate(text: string, sentTexts: string[]): boolean {
   if (sentTexts.length === 0) {
     return false;

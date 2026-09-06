@@ -1,3 +1,8 @@
+/**
+ * Soonest cooldown expiry tests.
+ * Verifies timestamp selection across cooldown, blocked, disabled, invalid, and
+ * model-scoped usage-state combinations.
+ */
 import { describe, expect, it } from "vitest";
 import type { AuthProfileStore } from "./auth-profiles/types.js";
 import { getSoonestCooldownExpiry } from "./auth-profiles/usage-state.js";
@@ -106,6 +111,26 @@ describe("getSoonestCooldownExpiry", () => {
       "openai:p2": {
         cooldownUntil: now + 30_000,
         cooldownReason: "timeout",
+        cooldownModel: "gpt-5.4",
+      },
+    });
+
+    expect(
+      getSoonestCooldownExpiry(store, ["openai:p1", "openai:p2"], { now, forModel: "gpt-5.4" }),
+    ).toBe(now + 10_000);
+  });
+
+  it("uses the earliest matching model_not_found cooldown for the requested model", () => {
+    const now = 1_700_000_000_000;
+    const store = makeStore({
+      "openai:p1": {
+        cooldownUntil: now + 10_000,
+        cooldownReason: "model_not_found",
+        cooldownModel: "gpt-5.4",
+      },
+      "openai:p2": {
+        cooldownUntil: now + 30_000,
+        cooldownReason: "model_not_found",
         cooldownModel: "gpt-5.4",
       },
     });

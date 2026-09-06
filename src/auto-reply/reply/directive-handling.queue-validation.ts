@@ -1,10 +1,12 @@
+/** Validation and status handling for /queue directives. */
 import type { SessionEntry } from "../../config/sessions.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { ReplyPayload } from "../types.js";
 import type { InlineDirectives } from "./directive-handling.parse.js";
 import { withOptions } from "./directive-handling.shared.js";
-import { resolveQueueSettings } from "./queue/settings.js";
+import { resolveQueueSettingsCore } from "./queue/settings.js";
 
+/** Validates `/queue` directives and returns immediate status/error replies. */
 export function maybeHandleQueueDirective(params: {
   directives: InlineDirectives;
   cfg: OpenClawConfig;
@@ -25,7 +27,8 @@ export function maybeHandleQueueDirective(params: {
     directives.rawCap === undefined &&
     directives.rawDrop === undefined;
   if (wantsStatus) {
-    const settings = resolveQueueSettings({
+    // Bare `/queue` is status, not mutation.
+    const settings = resolveQueueSettingsCore({
       cfg: params.cfg,
       channel: params.channel,
       sessionEntry: params.sessionEntry,

@@ -1,3 +1,5 @@
+import { defineChannelSetupContract } from "openclaw/plugin-sdk/channel-setup";
+// Zalouser plugin module implements setup core behavior.
 import {
   createDelegatedSetupWizardProxy,
   createPatchedAccountSetupAdapter,
@@ -13,6 +15,11 @@ export const zalouserSetupAdapter = createPatchedAccountSetupAdapter({
   channelKey: channel,
   validateInput: () => null,
   buildPatch: () => ({}),
+});
+
+export const zalouserSetupContract = defineChannelSetupContract({
+  fields: {},
+  legacyAdapter: zalouserSetupAdapter,
 });
 
 export function createZalouserSetupWizardProxy(

@@ -1,7 +1,16 @@
+// Signal helper module supports normalize behavior.
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeStringEntries,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
+
+export function normalizeSignalReactionRecipient(raw: string): string {
+  const withoutSignal = raw
+    .trim()
+    .replace(/^signal:/i, "")
+    .trim();
+  return /^uuid:/i.test(withoutSignal) ? withoutSignal.slice("uuid:".length).trim() : withoutSignal;
+}
 
 export function normalizeSignalMessagingTarget(raw: string): string | undefined {
   const trimmed = raw.trim();

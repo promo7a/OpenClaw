@@ -1,7 +1,13 @@
+// Nostr API module exposes the plugin public contract.
 import type { Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { PluginDoctorStateMigration } from "openclaw/plugin-sdk/runtime-doctor";
+import {
+  archiveLegacyStateSource,
+  type PluginDoctorStateMigration,
+} from "openclaw/plugin-sdk/runtime-doctor-migrations";
+import { asFiniteNumber } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { normalizeNostrStateAccountId } from "./src/state-account-id.js";
 
 type NostrBusState = {
   version: 2;
@@ -21,18 +27,6 @@ const BUS_STATE_NAMESPACE = "bus-state";
 const PROFILE_STATE_NAMESPACE = "profile-state";
 const MAX_NOSTR_STATE_ENTRIES = 256;
 
-function normalizeAccountId(accountId?: string): string {
-  const trimmed = accountId?.trim();
-  if (!trimmed) {
-    return "default";
-  }
-  return trimmed.replace(/[^a-z0-9._-]+/gi, "_");
-}
-
-function finiteNumberOrNull(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
 function parseBusState(value: unknown): NostrBusState | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -43,8 +37,8 @@ function parseBusState(value: unknown): NostrBusState | null {
   }
   return {
     version: 2,
-    lastProcessedAt: finiteNumberOrNull(parsed.lastProcessedAt),
-    gatewayStartedAt: finiteNumberOrNull(parsed.gatewayStartedAt),
+    lastProcessedAt: asFiniteNumber(parsed.lastProcessedAt) ?? null,
+    gatewayStartedAt: asFiniteNumber(parsed.gatewayStartedAt) ?? null,
     recentEventIds:
       parsed.version === 2 && Array.isArray(parsed.recentEventIds)
         ? parsed.recentEventIds.filter((entry): entry is string => typeof entry === "string")
@@ -71,7 +65,7 @@ function parseProfileState(value: unknown): NostrProfileState | null {
   }
   return {
     version: 1,
-    lastPublishedAt: finiteNumberOrNull(parsed.lastPublishedAt),
+    lastPublishedAt: asFiniteNumber(parsed.lastPublishedAt) ?? null,
     lastPublishedEventId:
       typeof parsed.lastPublishedEventId === "string" ? parsed.lastPublishedEventId : null,
     lastPublishResults:
@@ -79,15 +73,6 @@ function parseProfileState(value: unknown): NostrProfileState | null {
         ? null
         : lastPublishResults,
   };
-}
-
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    const stat = await fs.stat(filePath);
-    return stat.isFile();
-  } catch {
-    return false;
-  }
 }
 
 async function readJsonFile(filePath: string): Promise<unknown> {
@@ -113,7 +98,7 @@ async function listLegacyFiles(params: {
       continue;
     }
     const rawAccountId = entry.name.slice(params.prefix.length, -suffix.length);
-    const accountId = normalizeAccountId(rawAccountId);
+    const accountId = normalizeNostrStateAccountId(rawAccountId);
     const filePath = path.join(dir, entry.name);
     try {
       const value = params.parse(await readJsonFile(filePath));
@@ -125,27 +110,6 @@ async function listLegacyFiles(params: {
     }
   }
   return files;
-}
-
-async function archiveLegacySource(params: {
-  filePath: string;
-  label: string;
-  changes: string[];
-  warnings: string[];
-}): Promise<void> {
-  const archivedPath = `${params.filePath}.migrated`;
-  if (await fileExists(archivedPath)) {
-    params.warnings.push(
-      `Left migrated ${params.label} source in place because ${archivedPath} already exists`,
-    );
-    return;
-  }
-  try {
-    await fs.rename(params.filePath, archivedPath);
-    params.changes.push(`Archived ${params.label} legacy source -> ${archivedPath}`);
-  } catch (err) {
-    params.warnings.push(`Failed archiving ${params.label} legacy source: ${String(err)}`);
-  }
 }
 
 async function ensureStoreCapacity(params: {
@@ -216,7 +180,7 @@ export const stateMigrations: PluginDoctorStateMigration[] = [
           existingKeys.add(file.accountId);
           imported++;
         }
-        await archiveLegacySource({
+        await archiveLegacyStateSource({
           filePath: file.filePath,
           label: "Nostr bus state",
           changes,
@@ -278,7 +242,7 @@ export const stateMigrations: PluginDoctorStateMigration[] = [
           existingKeys.add(file.accountId);
           imported++;
         }
-        await archiveLegacySource({
+        await archiveLegacyStateSource({
           filePath: file.filePath,
           label: "Nostr profile state",
           changes,

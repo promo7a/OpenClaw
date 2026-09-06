@@ -12,3 +12,7 @@ Ballance
 optIn
 Brining
 wit
+allowIn
+planText
+nwe
+smoe

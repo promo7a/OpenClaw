@@ -1,3 +1,4 @@
+// Prompt Snapshot Files script supports OpenClaw repository automation.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { CODEX_RUNTIME_HAPPY_PATH_PROMPT_SNAPSHOT_DIR } from "../test/helpers/agents/prompt-snapshot-paths.js";
@@ -19,7 +20,7 @@ export async function listCommittedSnapshotArtifactPaths(root: string): Promise<
     committedEntries = [];
   }
   return committedEntries
-    .filter((entry) => entry.endsWith(".md") || entry.endsWith(".json"))
+    .filter((entry) => /\.(?:json|md(?:\.(?:diff|patch))?)$/u.test(entry))
     .map((entry) => path.join(CODEX_RUNTIME_HAPPY_PATH_PROMPT_SNAPSHOT_DIR, entry));
 }
 

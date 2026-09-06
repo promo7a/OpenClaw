@@ -1,4 +1,7 @@
+// Outbound policy enforces message-tool allowlists and cross-context delivery
+// markers/decorations before channel dispatch.
 import { normalizeUniqueStringEntries } from "@openclaw/normalization-core/string-normalization";
+import { resolveAgentConfig } from "../../agents/agent-scope-config.js";
 import { getChannelPlugin } from "../../channels/plugins/index.js";
 import type {
   ChannelId,
@@ -8,13 +11,14 @@ import type {
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { MessageToolsConfig } from "../../config/types.tools.js";
 import type { MessagePresentation } from "../../interactive/payload.js";
+import { MessageActionDeniedError } from "./message-action-denial.js";
 import { normalizeTargetForProvider } from "./target-normalization.js";
 import { formatTargetDisplay, lookupDirectoryDisplay } from "./target-resolver.js";
 
 /**
  * Builds a channel-native presentation for forwarded cross-context text.
  */
-export type CrossContextPresentationBuilder = (message: string) => MessagePresentation;
+type CrossContextPresentationBuilder = (message: string) => MessagePresentation;
 
 /**
  * Text and optional rich-presentation wrapper for cross-context outbound sends.
@@ -28,15 +32,23 @@ export type CrossContextDecoration = {
 const CONTEXT_GUARDED_ACTIONS = new Set<ChannelMessageActionName>([
   "send",
   "poll",
+  "poll-vote",
   "reply",
   "sendWithEffect",
   "sendAttachment",
   "upload-file",
+  "edit",
+  "delete",
+  "pin",
+  "unpin",
   "thread-create",
   "thread-reply",
   "sticker",
 ]);
 
+// Mutations are guarded above, but markers only apply to outbound payloads that
+// create new visible content. Existing-message edits/pins/deletes should not
+// grow cross-context forwarding text.
 const CONTEXT_MARKER_ACTIONS = new Set<ChannelMessageActionName>([
   "send",
   "poll",
@@ -84,16 +96,29 @@ function isCrossContextTarget(params: {
   target: string;
   toolContext?: ChannelThreadingToolContext;
 }): boolean {
-  const currentTarget = params.toolContext?.currentChannelId?.trim();
-  if (!currentTarget) {
+  if (
+    params.toolContext &&
+    getChannelPlugin(params.channel)?.threading?.matchesToolContextTarget?.({
+      target: params.target,
+      toolContext: params.toolContext,
+    })
+  ) {
+    return false;
+  }
+  const currentTargets = [
+    params.toolContext?.currentMessagingTarget?.trim(),
+    params.toolContext?.currentChannelId?.trim(),
+  ].filter((target): target is string => Boolean(target));
+  if (currentTargets.length === 0) {
     return false;
   }
   const normalizedTarget = normalizeTarget(params.channel, params.target);
-  const normalizedCurrent = normalizeTarget(params.channel, currentTarget);
-  if (!normalizedTarget || !normalizedCurrent) {
+  if (!normalizedTarget) {
     return false;
   }
-  return normalizedTarget !== normalizedCurrent;
+  return !currentTargets.some(
+    (currentTarget) => normalizeTarget(params.channel, currentTarget) === normalizedTarget,
+  );
 }
 
 function resolveAgentMessageToolsConfig(
@@ -105,8 +130,7 @@ function resolveAgentMessageToolsConfig(
   if (!trimmedAgentId) {
     return globalConfig;
   }
-  const agentConfig = cfg.agents?.list?.find((entry) => entry.id === trimmedAgentId)?.tools
-    ?.message;
+  const agentConfig = resolveAgentConfig(cfg, trimmedAgentId)?.tools?.message;
   if (!agentConfig) {
     return globalConfig;
   }
@@ -182,7 +206,11 @@ export function enforceMessageActionAllowlist(params: {
   if (!allowed || allowed.includes(params.action)) {
     return;
   }
-  throw new Error(`Message action "${params.action}" is disabled for this agent.`);
+  throw new MessageActionDeniedError(
+    `Message action "${params.action}" is disabled for this agent.`,
+    "message_action_disabled",
+    "message-actions:allowlist",
+  );
 }
 
 /**
@@ -196,7 +224,9 @@ export function enforceCrossContextPolicy(params: {
   cfg: OpenClawConfig;
   agentId?: string | null;
 }): void {
-  const currentTarget = params.toolContext?.currentChannelId?.trim();
+  const currentTarget =
+    params.toolContext?.currentChannelId?.trim() ??
+    params.toolContext?.currentMessagingTarget?.trim();
   if (!currentTarget) {
     return;
   }
@@ -208,10 +238,8 @@ export function enforceCrossContextPolicy(params: {
     cfg: params.cfg,
     agentId: params.agentId,
   });
-  if (messageConfig?.allowCrossContextSend) {
-    return;
-  }
-
+  // Doctor moves the shipped allowCrossContextSend flag into this canonical policy.
+  // Runtime must not keep a second legacy interpretation path here.
   const currentProvider = params.toolContext?.currentChannelProvider;
   const allowWithinProvider = messageConfig?.crossContext?.allowWithinProvider !== false;
   const allowAcrossProviders = messageConfig?.crossContext?.allowAcrossProviders === true;
@@ -219,8 +247,10 @@ export function enforceCrossContextPolicy(params: {
   // Provider mismatch is stronger than target mismatch; normalize targets only within one provider.
   if (currentProvider && currentProvider !== params.channel) {
     if (!allowAcrossProviders) {
-      throw new Error(
+      throw new MessageActionDeniedError(
         `Cross-context messaging denied: action=${params.action} target provider "${params.channel}" while bound to "${currentProvider}".`,
+        "message_cross_context_denied",
+        "message-cross-context:provider",
       );
     }
     return;
@@ -239,8 +269,10 @@ export function enforceCrossContextPolicy(params: {
     return;
   }
 
-  throw new Error(
+  throw new MessageActionDeniedError(
     `Cross-context messaging denied: action=${params.action} target="${target}" while bound to "${currentTarget}" (channel=${params.channel}).`,
+    "message_cross_context_denied",
+    "message-cross-context:target",
   );
 }
 
@@ -255,11 +287,13 @@ export async function buildCrossContextDecoration(params: {
   accountId?: string | null;
   agentId?: string | null;
 }): Promise<CrossContextDecoration | null> {
-  if (!params.toolContext?.currentChannelId) {
+  const currentTarget =
+    params.toolContext?.currentChannelId ?? params.toolContext?.currentMessagingTarget;
+  if (!currentTarget) {
     return null;
   }
   // Direct tool sends are authored for their destination, not forwarded from a bound context.
-  if (params.toolContext.skipCrossContextDecoration) {
+  if (params.toolContext?.skipCrossContextDecoration) {
     return null;
   }
   if (!isCrossContextTarget(params)) {
@@ -278,13 +312,13 @@ export async function buildCrossContextDecoration(params: {
     (await lookupDirectoryDisplay({
       cfg: params.cfg,
       channel: params.channel,
-      targetId: params.toolContext.currentChannelId,
+      targetId: currentTarget,
       accountId: params.accountId ?? undefined,
-    })) ?? params.toolContext.currentChannelId;
+    })) ?? currentTarget;
   // Don't force group formatting here; currentChannelId can be a DM or a group.
   const originLabel = formatTargetDisplay({
     channel: params.channel,
-    target: params.toolContext.currentChannelId,
+    target: currentTarget,
     display: currentName,
   });
   const prefixTemplate = markerConfig?.prefix ?? "[from {channel}] ";

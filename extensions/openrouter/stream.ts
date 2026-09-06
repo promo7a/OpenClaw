@@ -1,14 +1,15 @@
+// Openrouter plugin module implements stream behavior.
 import type { StreamFn } from "openclaw/plugin-sdk/agent-core";
 import type { ProviderWrapStreamFnContext } from "openclaw/plugin-sdk/plugin-entry";
-import { OPENROUTER_THINKING_STREAM_HOOKS } from "openclaw/plugin-sdk/provider-stream-family";
+import { buildProviderStreamFamilyHooks } from "openclaw/plugin-sdk/provider-stream-family";
 import {
-  createDeepSeekV4OpenAICompatibleThinkingWrapper,
-  type DeepSeekV4ReasoningEffort,
-  type DeepSeekV4ThinkingLevel,
+  composeProviderStreamWrappers,
   createPayloadPatchStreamWrapper,
+  normalizeOpenAICompatibleReasoningReplay,
 } from "openclaw/plugin-sdk/provider-stream-shared";
 import { createSubsystemLogger } from "openclaw/plugin-sdk/runtime-env";
-import { isOpenRouterDeepSeekV4ModelId } from "./models.js";
+import { asNonArrayRecord, readStringValue } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { isOpenRouterDeepSeekV4ModelId, normalizeOpenRouterModelFamilyId } from "./models.js";
 import {
   isOpenRouterProxyReasoningUnsupportedModel,
   normalizeOpenRouterBaseUrl,
@@ -16,22 +17,15 @@ import {
 } from "./provider-catalog.js";
 
 const log = createSubsystemLogger("openrouter-stream");
+const openRouterThinkingStreamHooks = buildProviderStreamFamilyHooks("openrouter-thinking");
 
-function readString(value: unknown): string | undefined {
-  return typeof value === "string" ? value.trim() : undefined;
-}
-
-function isOpenRouterAnthropicModelId(modelId: unknown): boolean {
-  const normalized = readString(modelId)?.toLowerCase();
-  return (
-    normalized?.startsWith("anthropic/") === true ||
-    normalized?.startsWith("openrouter/anthropic/") === true
-  );
+function normalizeOpenRouterStringPreservingEmpty(value: unknown): string | undefined {
+  return readStringValue(value)?.trim();
 }
 
 function isVerifiedOpenRouterRoute(model: Parameters<StreamFn>[0]): boolean {
-  const provider = readString(model.provider)?.toLowerCase();
-  const baseUrl = readString(model.baseUrl);
+  const provider = normalizeOpenRouterStringPreservingEmpty(model.provider)?.toLowerCase();
+  const baseUrl = normalizeOpenRouterStringPreservingEmpty(model.baseUrl);
   if (baseUrl) {
     return normalizeOpenRouterBaseUrl(baseUrl) === OPENROUTER_BASE_URL;
   }
@@ -39,16 +33,16 @@ function isVerifiedOpenRouterRoute(model: Parameters<StreamFn>[0]): boolean {
 }
 
 function shouldPatchAnthropicOpenRouterPayload(model: Parameters<StreamFn>[0]): boolean {
-  const api = readString(model.api);
+  const api = normalizeOpenRouterStringPreservingEmpty(model.api);
   return (
     (api === undefined || api === "openai-completions") &&
-    isOpenRouterAnthropicModelId(model.id) &&
+    normalizeOpenRouterModelFamilyId(model.id)?.startsWith("anthropic/") === true &&
     isVerifiedOpenRouterRoute(model)
   );
 }
 
 function shouldPatchDeepSeekV4OpenRouterPayload(model: Parameters<StreamFn>[0]): boolean {
-  const api = readString(model.api);
+  const api = normalizeOpenRouterStringPreservingEmpty(model.api);
   return (
     (api === undefined || api === "openai-completions") &&
     isOpenRouterDeepSeekV4ModelId(model.id) &&
@@ -57,8 +51,43 @@ function shouldPatchDeepSeekV4OpenRouterPayload(model: Parameters<StreamFn>[0]):
 }
 
 function shouldPatchOpenRouterRoutingPayload(model: Parameters<StreamFn>[0]): boolean {
-  const api = readString(model.api);
+  const api = normalizeOpenRouterStringPreservingEmpty(model.api);
   return (api === undefined || api === "openai-completions") && isVerifiedOpenRouterRoute(model);
+}
+
+function mergeOpenRouterAuthHeaders(options: Parameters<StreamFn>[2]): Parameters<StreamFn>[2] {
+  const apiKey = normalizeOpenRouterStringPreservingEmpty(options?.apiKey);
+  if (!apiKey) {
+    return options;
+  }
+  const headers = new Headers((options as { headers?: HeadersInit } | undefined)?.headers);
+  if (!headers.has("authorization")) {
+    headers.set("Authorization", `Bearer ${apiKey}`);
+  }
+  if (!headers.has("http-referer")) {
+    headers.set("HTTP-Referer", "https://openclaw.ai");
+  }
+  if (!headers.has("x-openrouter-title")) {
+    headers.set("X-OpenRouter-Title", "OpenClaw");
+  }
+  return {
+    ...options,
+    headers: Object.fromEntries(headers.entries()),
+  } as Parameters<StreamFn>[2];
+}
+
+function createOpenRouterAuthHeaderWrapper(
+  baseStreamFn: StreamFn | undefined,
+): StreamFn | undefined {
+  if (!baseStreamFn) {
+    return baseStreamFn;
+  }
+  return (model, context, options) =>
+    baseStreamFn(
+      model,
+      context,
+      isVerifiedOpenRouterRoute(model) ? mergeOpenRouterAuthHeaders(options) : options,
+    );
 }
 
 function assistantMessageHasOpenAIToolCalls(message: Record<string, unknown>): boolean {
@@ -109,27 +138,6 @@ function stripTrailingOpenRouterAssistantPrefillMessages(payload: Record<string,
   return stripped;
 }
 
-function resolveOpenRouterDeepSeekV4ReasoningEffort(
-  thinkingLevel: DeepSeekV4ThinkingLevel,
-): DeepSeekV4ReasoningEffort {
-  switch (thinkingLevel) {
-    case "minimal":
-    case "low":
-    case "medium":
-    case "high":
-    case "xhigh":
-      return thinkingLevel;
-    case "max":
-      return "xhigh";
-    case "adaptive":
-      return "medium";
-    case "off":
-    case undefined:
-      return "high";
-  }
-  return "high";
-}
-
 function isEnabledReasoningValue(value: unknown): boolean {
   if (value === undefined || value === null || value === false) {
     return false;
@@ -137,6 +145,17 @@ function isEnabledReasoningValue(value: unknown): boolean {
   if (typeof value === "string") {
     const normalized = value.trim().toLowerCase();
     return normalized !== "" && normalized !== "off" && normalized !== "none";
+  }
+  if (typeof value === "object" && !Array.isArray(value)) {
+    const reasoning = value as Record<string, unknown>;
+    if (reasoning.enabled === false) {
+      return false;
+    }
+    const effort = reasoning.effort;
+    if (typeof effort === "string") {
+      const normalized = effort.trim().toLowerCase();
+      return normalized !== "" && normalized !== "off" && normalized !== "none";
+    }
   }
   return true;
 }
@@ -203,18 +222,51 @@ function createOpenRouterAnthropicPrefillWrapper(baseStreamFn: StreamFn | undefi
   );
 }
 
-function createOpenRouterDeepSeekV4ThinkingWrapper(
+function resolveOpenRouterDeepSeekV4ReasoningEffort(
+  thinkingLevel: ProviderWrapStreamFnContext["thinkingLevel"],
+): "high" | "xhigh" | undefined {
+  if (thinkingLevel === "off") {
+    return undefined;
+  }
+  if (thinkingLevel === "xhigh" || thinkingLevel === "max") {
+    return "xhigh";
+  }
+  return "high";
+}
+
+function applyOpenRouterDeepSeekV4ReasoningEffort(
+  payload: Record<string, unknown>,
+  thinkingLevel: ProviderWrapStreamFnContext["thinkingLevel"],
+): boolean {
+  const effort = resolveOpenRouterDeepSeekV4ReasoningEffort(thinkingLevel);
+  if (!effort) {
+    delete payload.reasoning;
+    return false;
+  }
+  const reasoning = asNonArrayRecord(payload.reasoning);
+  reasoning.effort = effort;
+  payload.reasoning = reasoning;
+  return true;
+}
+
+function createOpenRouterDeepSeekV4ReplayWrapper(
   baseStreamFn: StreamFn | undefined,
   thinkingLevel: ProviderWrapStreamFnContext["thinkingLevel"],
-): StreamFn | undefined {
-  return createDeepSeekV4OpenAICompatibleThinkingWrapper({
+): StreamFn {
+  return createPayloadPatchStreamWrapper(
     baseStreamFn,
-    thinkingLevel,
-    shouldPatchModel: shouldPatchDeepSeekV4OpenRouterPayload,
-    resolveReasoningEffort: resolveOpenRouterDeepSeekV4ReasoningEffort,
-    shouldBackfillAssistantReasoningContent: (message) =>
-      !assistantMessageHasOpenAIToolCalls(message),
-  });
+    ({ payload }) => {
+      delete payload.thinking;
+      delete payload.reasoning_effort;
+      normalizeOpenAICompatibleReasoningReplay(payload, {
+        thinkingEnabled: applyOpenRouterDeepSeekV4ReasoningEffort(payload, thinkingLevel),
+        shouldBackfillAssistantMessage: (message) => !assistantMessageHasOpenAIToolCalls(message),
+      });
+    },
+    {
+      shouldPatch: ({ model }) => shouldPatchDeepSeekV4OpenRouterPayload(model),
+    },
+  );
 }
 
 export function wrapOpenRouterProviderStream(
@@ -227,21 +279,20 @@ export function wrapOpenRouterProviderStream(
   const routedStreamFn = providerRouting
     ? injectOpenRouterRouting(ctx.streamFn, providerRouting)
     : ctx.streamFn;
-  const wrapStreamFn = OPENROUTER_THINKING_STREAM_HOOKS.wrapStreamFn ?? undefined;
-  if (!wrapStreamFn) {
-    return createOpenRouterAnthropicPrefillWrapper(
-      createOpenRouterDeepSeekV4ThinkingWrapper(routedStreamFn, ctx.thinkingLevel),
-    );
-  }
-  const wrappedStreamFn =
-    wrapStreamFn({
-      ...ctx,
-      streamFn: routedStreamFn,
-      thinkingLevel: isOpenRouterProxyReasoningUnsupportedModel(ctx.modelId)
-        ? undefined
-        : ctx.thinkingLevel,
-    }) ?? undefined;
-  return createOpenRouterAnthropicPrefillWrapper(
-    createOpenRouterDeepSeekV4ThinkingWrapper(wrappedStreamFn, ctx.thinkingLevel),
+  const wrapStreamFn = openRouterThinkingStreamHooks.wrapStreamFn ?? undefined;
+  return composeProviderStreamWrappers(
+    routedStreamFn,
+    wrapStreamFn &&
+      ((streamFn) =>
+        wrapStreamFn({
+          ...ctx,
+          streamFn,
+          thinkingLevel: isOpenRouterProxyReasoningUnsupportedModel(ctx.modelId)
+            ? undefined
+            : ctx.thinkingLevel,
+        }) ?? undefined),
+    (streamFn) => createOpenRouterDeepSeekV4ReplayWrapper(streamFn, ctx.thinkingLevel),
+    createOpenRouterAuthHeaderWrapper,
+    createOpenRouterAnthropicPrefillWrapper,
   );
 }

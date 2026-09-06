@@ -1,3 +1,4 @@
+// Status scan execute tests cover overview-driven status probe execution and memory snapshot aggregation.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { executeStatusScanFromOverview } from "./status.scan-execute.ts";
 import type { StatusScanOverviewResult } from "./status.scan-overview.ts";
@@ -29,6 +30,10 @@ describe("executeStatusScanFromOverview", () => {
     const overview = {
       cfg: { channels: {} },
       sourceConfig: { channels: {} },
+      configDiagnostics: {
+        path: "/tmp/openclaw.json",
+        issues: [{ path: "gateway.port", message: "invalid" }],
+      },
       secretDiagnostics: ["diag"],
       osSummary: { label: "linux" },
       tailscaleMode: "tailnet",
@@ -71,10 +76,7 @@ describe("executeStatusScanFromOverview", () => {
     });
 
     expect(resolveMemoryPluginStatus).toHaveBeenCalledWith(overview.cfg);
-    expect(resolveStatusSummaryFromOverview).toHaveBeenCalledWith({
-      overview,
-      includeChannelSummary: undefined,
-    });
+    expect(resolveStatusSummaryFromOverview).toHaveBeenCalledWith({ overview });
     expect(resolveMemory).toHaveBeenCalledWith({
       cfg: overview.cfg,
       agentStatus: overview.agentStatus,
@@ -83,6 +85,7 @@ describe("executeStatusScanFromOverview", () => {
     });
     expect(result.cfg).toBe(overview.cfg);
     expect(result.sourceConfig).toBe(overview.sourceConfig);
+    expect(result.configDiagnostics).toBe(overview.configDiagnostics);
     expect(result.secretDiagnostics).toEqual(["diag"]);
     expect(result.tailscaleDns).toBe("box.tail.ts.net");
     expect(result.tailscaleHttpsUrl).toBe("https://box.tail.ts.net");

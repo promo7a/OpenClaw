@@ -1,10 +1,12 @@
+import type { ChannelApprovalKind } from "openclaw/plugin-sdk/approval-handler-runtime";
+// Whatsapp tests cover approval native plugin behavior.
 import type {
   ExecApprovalRequest,
   PluginApprovalRequest,
 } from "openclaw/plugin-sdk/approval-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { describe, expect, it } from "vitest";
-import { whatsappApprovalCapability, whatsappNativeApprovalAdapter } from "./approval-native.js";
+import { whatsappApprovalCapability } from "./approval-native.js";
 
 type WhatsAppConfig = NonNullable<NonNullable<OpenClawConfig["channels"]>["whatsapp"]>;
 
@@ -68,6 +70,7 @@ function buildPluginRequest(
 
 function nativeShouldHandle(params: {
   cfg: OpenClawConfig;
+  approvalKind: ChannelApprovalKind;
   request: ExecApprovalRequest | PluginApprovalRequest;
   accountId?: string | null;
 }) {
@@ -75,18 +78,23 @@ function nativeShouldHandle(params: {
     cfg: params.cfg,
     accountId: params.accountId ?? "default",
     context: {},
+    approvalKind: params.approvalKind,
     request: params.request,
   });
 }
 
 describe("whatsapp approval capability", () => {
+  it("subscribes the native runtime to system-agent approval events", () => {
+    expect(whatsappApprovalCapability.nativeRuntime?.eventKinds).toContain("system-agent");
+  });
+
   it("does not enable exec or plugin native approvals from WhatsApp account readiness alone", () => {
     const cfg = buildConfig();
     const execRequest = buildExecRequest("+15551230000");
     const pluginRequest = buildPluginRequest("+15551230000");
 
     expect(
-      whatsappNativeApprovalAdapter.auth?.getActionAvailabilityState?.({
+      whatsappApprovalCapability?.getActionAvailabilityState?.({
         cfg,
         accountId: "default",
         action: "approve",
@@ -94,7 +102,7 @@ describe("whatsapp approval capability", () => {
       }),
     ).toEqual({ kind: "disabled" });
     expect(
-      whatsappNativeApprovalAdapter.auth?.getActionAvailabilityState?.({
+      whatsappApprovalCapability?.getActionAvailabilityState?.({
         cfg,
         accountId: "default",
         action: "approve",
@@ -109,8 +117,8 @@ describe("whatsapp approval capability", () => {
         request: execRequest,
       }).enabled,
     ).toBe(false);
-    expect(nativeShouldHandle({ cfg, request: execRequest })).toBe(false);
-    expect(nativeShouldHandle({ cfg, request: pluginRequest })).toBe(false);
+    expect(nativeShouldHandle({ cfg, approvalKind: "exec", request: execRequest })).toBe(false);
+    expect(nativeShouldHandle({ cfg, approvalKind: "plugin", request: pluginRequest })).toBe(false);
   });
 
   it("allows session-mode exec delivery for matching WhatsApp origins", () => {
@@ -131,21 +139,33 @@ describe("whatsapp approval capability", () => {
       supportsApproverDmSurface: false,
       notifyOriginWhenDmOnly: true,
     });
-    expect(nativeShouldHandle({ cfg, request })).toBe(true);
+    expect(nativeShouldHandle({ cfg, approvalKind: "exec", request })).toBe(true);
   });
 
   it("keeps exec and plugin forwarding gates independent", () => {
     const execOnly = buildConfig({ approvals: { exec: { enabled: true } } });
     const pluginOnly = buildConfig({ approvals: { plugin: { enabled: true } } });
 
-    expect(nativeShouldHandle({ cfg: execOnly, request: buildPluginRequest("+15551230000") })).toBe(
-      false,
-    );
-    expect(nativeShouldHandle({ cfg: pluginOnly, request: buildExecRequest("+15551230000") })).toBe(
-      false,
-    );
     expect(
-      nativeShouldHandle({ cfg: pluginOnly, request: buildPluginRequest("+15551230000") }),
+      nativeShouldHandle({
+        cfg: execOnly,
+        approvalKind: "plugin",
+        request: buildPluginRequest("+15551230000"),
+      }),
+    ).toBe(false);
+    expect(
+      nativeShouldHandle({
+        cfg: pluginOnly,
+        approvalKind: "exec",
+        request: buildExecRequest("+15551230000"),
+      }),
+    ).toBe(false);
+    expect(
+      nativeShouldHandle({
+        cfg: pluginOnly,
+        approvalKind: "plugin",
+        request: buildPluginRequest("+15551230000"),
+      }),
     ).toBe(true);
   });
 
@@ -157,7 +177,7 @@ describe("whatsapp approval capability", () => {
       sessionKey: "agent:main:slack:channel:c123",
     });
 
-    expect(nativeShouldHandle({ cfg, request })).toBe(false);
+    expect(nativeShouldHandle({ cfg, approvalKind: "exec", request })).toBe(false);
     expect(
       whatsappApprovalCapability.native?.describeDeliveryCapabilities({
         cfg,
@@ -181,7 +201,7 @@ describe("whatsapp approval capability", () => {
     const request = buildExecRequest("+15551230000");
 
     expect(
-      whatsappNativeApprovalAdapter.auth?.getActionAvailabilityState?.({
+      whatsappApprovalCapability?.getActionAvailabilityState?.({
         cfg,
         accountId: "default",
         action: "approve",
@@ -195,7 +215,7 @@ describe("whatsapp approval capability", () => {
         context: {},
       }),
     ).toBe(false);
-    expect(nativeShouldHandle({ cfg, request })).toBe(false);
+    expect(nativeShouldHandle({ cfg, approvalKind: "exec", request })).toBe(false);
     expect(
       whatsappApprovalCapability.native?.describeDeliveryCapabilities({
         cfg,
@@ -239,6 +259,31 @@ describe("whatsapp approval capability", () => {
     expect(text).not.toContain("2️⃣ Allow Always");
     expect(text).not.toContain("3️⃣ Deny");
     expect(text.indexOf("React with:")).toBeLessThan(text.indexOf("/approve exec-1 allow-once"));
+    expect(payload?.presentation).toMatchObject({
+      blocks: [
+        {
+          type: "buttons",
+          buttons: [
+            {
+              action: {
+                type: "approval",
+                approvalId: "exec-1",
+                approvalKind: "exec",
+                decision: "allow-once",
+              },
+            },
+            {
+              action: {
+                type: "approval",
+                approvalId: "exec-1",
+                approvalKind: "exec",
+                decision: "deny",
+              },
+            },
+          ],
+        },
+      ],
+    });
   });
 
   it("renders target-mode plugin prompts with concrete thumbs-only reaction choices", () => {
@@ -273,6 +318,39 @@ describe("whatsapp approval capability", () => {
     expect(payload?.text).not.toContain("2️⃣ Allow Always");
     expect(payload?.text).not.toContain("3️⃣ Deny");
     expect(payload?.text).not.toContain("<id>");
+    expect(payload?.presentation).toMatchObject({
+      blocks: [
+        {
+          type: "buttons",
+          buttons: [
+            {
+              action: {
+                type: "approval",
+                approvalId: "plugin:approval-1",
+                approvalKind: "plugin",
+                decision: "allow-once",
+              },
+            },
+            {
+              action: {
+                type: "approval",
+                approvalId: "plugin:approval-1",
+                approvalKind: "plugin",
+                decision: "allow-always",
+              },
+            },
+            {
+              action: {
+                type: "approval",
+                approvalId: "plugin:approval-1",
+                approvalKind: "plugin",
+                decision: "deny",
+              },
+            },
+          ],
+        },
+      ],
+    });
   });
 
   it("does not report target-mode availability when no WhatsApp target matches", () => {
@@ -287,7 +365,7 @@ describe("whatsapp approval capability", () => {
     });
 
     expect(
-      whatsappNativeApprovalAdapter.auth?.getActionAvailabilityState?.({
+      whatsappApprovalCapability?.getActionAvailabilityState?.({
         cfg,
         accountId: "default",
         action: "approve",
@@ -308,8 +386,10 @@ describe("whatsapp approval capability", () => {
       approvals: { exec: { enabled: true, sessionFilter: ["telegram"] } },
     });
 
-    expect(nativeShouldHandle({ cfg: blockedByAgent, request })).toBe(false);
-    expect(nativeShouldHandle({ cfg: blockedBySession, request })).toBe(false);
+    expect(nativeShouldHandle({ cfg: blockedByAgent, approvalKind: "exec", request })).toBe(false);
+    expect(nativeShouldHandle({ cfg: blockedBySession, approvalKind: "exec", request })).toBe(
+      false,
+    );
   });
 
   it("matches account-scoped top-level WhatsApp targets only for that account", () => {
@@ -329,7 +409,7 @@ describe("whatsapp approval capability", () => {
     });
 
     expect(
-      whatsappNativeApprovalAdapter.auth?.getActionAvailabilityState?.({
+      whatsappApprovalCapability?.getActionAvailabilityState?.({
         cfg,
         accountId: "default",
         action: "approve",
@@ -337,7 +417,7 @@ describe("whatsapp approval capability", () => {
       }),
     ).toEqual({ kind: "disabled" });
     expect(
-      whatsappNativeApprovalAdapter.auth?.getActionAvailabilityState?.({
+      whatsappApprovalCapability?.getActionAvailabilityState?.({
         cfg,
         accountId: "work",
         action: "approve",

@@ -1,7 +1,13 @@
+// Provides shared replay-policy helpers for provider plugins.
+import {
+  bindsClaudeThinkingPrefix,
+  resolveClaudeModelIdentity,
+  resolveClaudeOpus5ModelIdentity,
+} from "@openclaw/llm-core";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import type { AgentMessage } from "../agents/runtime/index.js";
-import { isGemma4ModelId } from "../shared/google-models.js";
 import { sanitizeGoogleAssistantFirstOrdering } from "../shared/google-turn-ordering.js";
+import type { ProviderRuntimeModel } from "./provider-runtime-model.types.js";
 import type {
   ProviderReasoningOutputMode,
   ProviderReplayPolicy,
@@ -15,6 +21,7 @@ export function buildOpenAICompatibleReplayPolicy(
   modelApi: string | null | undefined,
   options: {
     sanitizeToolCallIds?: boolean;
+    duplicateToolCallIdStyle?: "openai";
     modelId?: string | null;
     dropReasoningFromHistory?: boolean;
   } = {},
@@ -37,7 +44,13 @@ export function buildOpenAICompatibleReplayPolicy(
 
   return {
     ...(sanitizeToolCallIds
-      ? { sanitizeToolCallIds: true, toolCallIdMode: "strict" as const }
+      ? {
+          sanitizeToolCallIds: true,
+          toolCallIdMode: "strict" as const,
+          ...(options.duplicateToolCallIdStyle
+            ? { duplicateToolCallIdStyle: options.duplicateToolCallIdStyle }
+            : {}),
+        }
       : {}),
     ...(isResponsesFamily ? { allowSyntheticToolResults: true } : {}),
     ...(modelApi === "openai-completions"
@@ -51,8 +64,7 @@ export function buildOpenAICompatibleReplayPolicy(
           validateGeminiTurns: false,
           validateAnthropicTurns: false,
         }),
-    ...(modelApi === "openai-completions" &&
-    (dropReasoningFromHistory || isGemma4ModelId(options.modelId))
+    ...(modelApi === "openai-completions" && dropReasoningFromHistory
       ? { dropReasoningFromHistory: true }
       : {}),
   };
@@ -62,6 +74,7 @@ export function buildOpenAICompatibleReplayPolicy(
 export function buildStrictAnthropicReplayPolicy(
   options: {
     dropThinkingBlocks?: boolean;
+    appendOnlyRuntimeContext?: boolean;
     sanitizeToolCallIds?: boolean;
     preserveNativeAnthropicToolUseIds?: boolean;
   } = {},
@@ -79,6 +92,7 @@ export function buildStrictAnthropicReplayPolicy(
         }
       : {}),
     preserveSignatures: true,
+    appendOnlyRuntimeContext: options.appendOnlyRuntimeContext ?? false,
     repairToolUseResultPairing: true,
     validateAnthropicTurns: true,
     allowSyntheticToolResults: true,
@@ -86,56 +100,43 @@ export function buildStrictAnthropicReplayPolicy(
   };
 }
 
-/**
- * Returns true for Claude models that preserve thinking blocks in context
- * natively (Opus 4.5+, Sonnet 4.5+, Haiku 4.5+). For these models, dropping
- * thinking blocks from prior turns breaks prompt cache prefix matching.
- *
- * See: https://platform.claude.com/docs/en/build-with-claude/extended-thinking#differences-in-thinking-across-model-versions
- *
- * @deprecated Anthropic-family provider replay helper; prefer provider-local replay hooks.
- */
-export function shouldPreserveThinkingBlocks(modelId?: string): boolean {
-  const id = normalizeLowercaseStringOrEmpty(modelId);
-  if (!id.includes("claude")) {
-    return false;
-  }
-
-  // Models that preserve thinking blocks natively (Claude 4.5+):
-  // - claude-opus-4-x (opus-4-5, opus-4-6, ...)
-  // - claude-sonnet-4-x (sonnet-4-5, sonnet-4-6, ...)
-  //   Note: "sonnet-4" is safe — legacy "claude-3-5-sonnet" does not contain "sonnet-4"
-  // - claude-haiku-4-x (haiku-4-5, ...)
-  // Models that require dropping thinking blocks:
-  // - claude-3-7-sonnet, claude-3-5-sonnet, and earlier
-  if (id.includes("opus-4") || id.includes("sonnet-4") || id.includes("haiku-4")) {
-    return true;
-  }
-
-  // Future-proofing: claude-5-x, claude-6-x etc. should also preserve
-  if (/claude-[5-9]/.test(id) || /claude-\d{2,}/.test(id)) {
-    return true;
-  }
-
-  return false;
+/** @deprecated Anthropic-family provider replay helper; prefer provider-local replay hooks. */
+export function shouldDropClaudeThinkingBlocks(
+  modelId?: string,
+  model?: Pick<ProviderRuntimeModel, "params">,
+): boolean {
+  const ref = { id: modelId, params: model?.params };
+  const canonicalId = resolveClaudeModelIdentity(ref);
+  const isClaude =
+    canonicalId.startsWith("claude-") || resolveClaudeOpus5ModelIdentity(ref) !== undefined;
+  const preservesThinking =
+    resolveClaudeOpus5ModelIdentity(ref) !== undefined ||
+    /(?:^|-)claude-(?:fable-5|mythos-(?:5|preview)|opus-4-(?:5|6|7|8)|sonnet-(?:5|4-6))(?=$|[^a-z0-9])/.test(
+      canonicalId,
+    );
+  return isClaude && !preservesThinking;
 }
 
 /** @deprecated Anthropic-family provider replay helper; prefer provider-local replay hooks. */
-export function buildAnthropicReplayPolicyForModel(modelId?: string): ProviderReplayPolicy {
-  const isClaude = normalizeLowercaseStringOrEmpty(modelId).includes("claude");
+export function buildAnthropicReplayPolicyForModel(
+  modelId?: string,
+  model?: Pick<ProviderRuntimeModel, "params">,
+): ProviderReplayPolicy {
   return buildStrictAnthropicReplayPolicy({
-    dropThinkingBlocks: isClaude && !shouldPreserveThinkingBlocks(modelId),
+    dropThinkingBlocks: shouldDropClaudeThinkingBlocks(modelId, model),
+    appendOnlyRuntimeContext: bindsClaudeThinkingPrefix({ id: modelId, params: model?.params }),
   });
 }
 
 /** @deprecated Anthropic-family provider replay helper; prefer provider-local replay hooks. */
-export function buildNativeAnthropicReplayPolicyForModel(modelId?: string): ProviderReplayPolicy {
-  const isClaude = normalizeLowercaseStringOrEmpty(modelId).includes("claude");
-  return buildStrictAnthropicReplayPolicy({
-    dropThinkingBlocks: isClaude && !shouldPreserveThinkingBlocks(modelId),
-    sanitizeToolCallIds: true,
+export function buildNativeAnthropicReplayPolicyForModel(
+  modelId?: string,
+  model?: Pick<ProviderRuntimeModel, "params">,
+): ProviderReplayPolicy {
+  return {
+    ...buildAnthropicReplayPolicyForModel(modelId, model),
     preserveNativeAnthropicToolUseIds: true,
-  });
+  };
 }
 
 /** @deprecated Provider replay helper; prefer provider-local replay hooks. */
@@ -144,12 +145,14 @@ export function buildHybridAnthropicOrOpenAIReplayPolicy(
   options: { anthropicModelDropThinkingBlocks?: boolean } = {},
 ): ProviderReplayPolicy | undefined {
   if (ctx.modelApi === "anthropic-messages" || ctx.modelApi === "bedrock-converse-stream") {
-    const isClaude = normalizeLowercaseStringOrEmpty(ctx.modelId).includes("claude");
     return buildStrictAnthropicReplayPolicy({
+      appendOnlyRuntimeContext: bindsClaudeThinkingPrefix({
+        id: ctx.modelId,
+        params: ctx.model?.params,
+      }),
       dropThinkingBlocks:
         options.anthropicModelDropThinkingBlocks &&
-        isClaude &&
-        !shouldPreserveThinkingBlocks(ctx.modelId),
+        shouldDropClaudeThinkingBlocks(ctx.modelId, ctx.model),
     });
   }
 

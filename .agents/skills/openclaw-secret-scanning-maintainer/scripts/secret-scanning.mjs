@@ -1,13 +1,15 @@
 #!/usr/bin/env node
-// Secret scanning alert handler for OpenClaw maintainers.
-// Usage: node secret-scanning.mjs <command> [options]
+/**
+ * Secret scanning alert handler for OpenClaw maintainers.
+ * Usage: node secret-scanning.mjs <command> [options]
+ */
 
-import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { execPlainGh } from "../../../../scripts/lib/plain-gh.mjs";
 
 const REPO = "openclaw/openclaw";
 const REPO_URL = `https://github.com/${REPO}`;
@@ -27,25 +29,30 @@ function tmpFile(purpose) {
 }
 
 function gh(args, { json = true, allowFailure = false } = {}) {
-  const proc = spawnSync("gh", args, { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 });
-  if (proc.status !== 0 && !allowFailure) {
-    fail(`gh ${args.slice(0, 3).join(" ")} failed:\n${(proc.stderr || proc.stdout || "").trim()}`);
-  }
-  if (proc.status !== 0) {
-    return {
+  let stdout;
+  try {
+    stdout = execPlainGh(args, { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 });
+  } catch (error) {
+    const failure = {
       gh_failed: true,
-      status: proc.status,
-      stdout: proc.stdout,
-      stderr: proc.stderr,
+      status: error?.status ?? 1,
+      stdout: String(error?.stdout ?? ""),
+      stderr: String(error?.stderr ?? ""),
     };
+    if (!allowFailure) {
+      fail(
+        `gh ${args.slice(0, 3).join(" ")} failed:\n${(failure.stderr || failure.stdout).trim()}`,
+      );
+    }
+    return failure;
   }
   if (!json) {
-    return proc.stdout;
+    return stdout;
   }
   try {
-    return JSON.parse(proc.stdout);
+    return JSON.parse(stdout);
   } catch {
-    return proc.stdout;
+    return stdout;
   }
 }
 
@@ -57,7 +64,8 @@ function isBodyLocationType(locationType) {
   return locationType === "issue_body" || locationType === "pull_request_body";
 }
 
-export function decideBodyRedaction(currentBody, redactedBody) {
+/** Decides whether redacting an issue/PR body requires notifying the reporter. */
+function decideBodyRedaction(currentBody, redactedBody) {
   const bodyChanged = String(currentBody) !== String(redactedBody);
   return {
     body_changed: bodyChanged,
@@ -65,7 +73,8 @@ export function decideBodyRedaction(currentBody, redactedBody) {
   };
 }
 
-export function loadBodyRedactionResult(locationType, resultFile) {
+/** Loads redaction-result metadata for issue/PR body secret locations. */
+function loadBodyRedactionResult(locationType, resultFile) {
   if (!isBodyLocationType(locationType)) {
     return { notify_required: true };
   }
@@ -883,7 +892,7 @@ function cmdSummary(jsonFile) {
 
 const args = [];
 
-export const commands = {
+const commands = {
   "fetch-alert": () => cmdFetchAlert(args[0]),
   "fetch-content": () => cmdFetchContent(args[0]),
   "redact-body": () => cmdRedactBody(args[0], args[1], args[2]),

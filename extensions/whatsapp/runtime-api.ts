@@ -1,3 +1,4 @@
+// Whatsapp API module exposes the plugin public contract.
 export {
   getActiveWebListener,
   resolveWebAccountId,
@@ -45,12 +46,13 @@ export {
 export {
   extractContactContext,
   extractLocationData,
-  extractMediaPlaceholder,
   extractText,
   monitorWebInbox,
   resetWebInboundDedupe,
+  type WebInboundCallbackMessage,
   type WebInboundMessage,
   type WebListenerCloseReason,
+  type WhatsAppInboundAdmission,
 } from "./src/inbound.js";
 export { loginWeb } from "./src/login.js";
 export {

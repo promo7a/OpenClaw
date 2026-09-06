@@ -1,13 +1,14 @@
+// Skills upload methods implement staged archive upload begin/chunk/commit
+// flows with feature gating, validation, and upload-store error mapping.
 import {
   ErrorCodes,
   errorShape,
-  formatValidationErrors,
+  type ErrorShape,
   type ProtocolValidator,
   validateSkillsUploadBeginParams,
   validateSkillsUploadChunkParams,
   validateSkillsUploadCommitParams,
 } from "../../../packages/gateway-protocol/src/index.js";
-import type { ErrorShape } from "../../../packages/gateway-protocol/src/index.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import {
   areUploadedSkillArchivesEnabled,
@@ -18,13 +19,7 @@ import {
   SkillUploadRequestError,
 } from "../../skills/lifecycle/upload-store.js";
 import type { GatewayRequestHandlers } from "./types.js";
-
-function uploadErrorShape(
-  prefix: string,
-  errors: Parameters<typeof formatValidationErrors>[0],
-): ErrorShape {
-  return errorShape(ErrorCodes.INVALID_REQUEST, `${prefix}: ${formatValidationErrors(errors)}`);
-}
+import { assertValidParams } from "./validation.js";
 
 function mapUploadError(err: unknown): ErrorShape {
   if (err instanceof SkillUploadRequestError) {
@@ -67,8 +62,7 @@ function makeUploadHandler<P, R>(
       );
       return;
     }
-    if (!validator(params)) {
-      respond(false, undefined, uploadErrorShape(`invalid ${name} params`, validator.errors));
+    if (!assertValidParams(params, validator, name, respond)) {
       return;
     }
     try {

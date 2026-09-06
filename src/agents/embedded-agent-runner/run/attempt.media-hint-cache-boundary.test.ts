@@ -10,8 +10,6 @@ const imageGenerationTaskStatusMocks = vi.hoisted(() => ({
   buildImageGenerationTaskStatusDetails: vi.fn(() => ({})),
   buildImageGenerationTaskStatusText: vi.fn(() => "Image generation task status"),
   findActiveImageGenerationTaskForSession: vi.fn(),
-  getImageGenerationTaskProviderId: vi.fn(),
-  isActiveImageGenerationTask: vi.fn(() => false),
   IMAGE_GENERATION_TASK_KIND: "image_generation",
 }));
 const videoGenerationTaskStatusMocks = vi.hoisted(() => ({
@@ -19,8 +17,6 @@ const videoGenerationTaskStatusMocks = vi.hoisted(() => ({
   buildVideoGenerationTaskStatusDetails: vi.fn(() => ({})),
   buildVideoGenerationTaskStatusText: vi.fn(() => "Video generation task status"),
   findActiveVideoGenerationTaskForSession: vi.fn(),
-  getVideoGenerationTaskProviderId: vi.fn(),
-  isActiveVideoGenerationTask: vi.fn(() => false),
   VIDEO_GENERATION_TASK_KIND: "video_generation",
 }));
 const musicGenerationTaskStatusMocks = vi.hoisted(() => ({
@@ -31,15 +27,17 @@ const musicGenerationTaskStatusMocks = vi.hoisted(() => ({
   MUSIC_GENERATION_TASK_KIND: "music_generation",
 }));
 
-vi.mock("../../image-generation-task-status.js", () => imageGenerationTaskStatusMocks);
-vi.mock("../../music-generation-task-status.js", () => musicGenerationTaskStatusMocks);
-vi.mock("../../video-generation-task-status.js", () => videoGenerationTaskStatusMocks);
+vi.mock("../../media-generation-task-status.js", () => ({
+  ...imageGenerationTaskStatusMocks,
+  ...musicGenerationTaskStatusMocks,
+  ...videoGenerationTaskStatusMocks,
+}));
 
 import {
   ensureSystemPromptCacheBoundary,
   SYSTEM_PROMPT_CACHE_BOUNDARY,
   splitSystemPromptCacheBoundary,
-} from "../../system-prompt-cache-boundary.js";
+} from "@openclaw/ai/internal/shared";
 import {
   appendModelIdentitySystemPrompt,
   buildModelIdentityPromptLine,
@@ -47,8 +45,8 @@ import {
 import {
   prependSystemPromptAddition,
   resolveAttemptMediaTaskSystemPromptAddition,
-} from "./attempt.prompt-helpers.js";
-import { composeSystemPromptWithHookContext } from "./attempt.thread-helpers.js";
+} from "./attempt-prompt-helpers.js";
+import { composeSystemPromptWithHookContext } from "./attempt-thread-helpers.js";
 
 const MEDIA_HINT = "Active image generation task in progress";
 const HOOK = "Static plugin guidance"; // documented static-cacheable hook field, constant per turn

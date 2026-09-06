@@ -1,3 +1,4 @@
+// Runtime smoke script for bundled plugin install/uninstall E2E validation.
 import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -5,44 +6,46 @@ import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { appendBoundedTail } from "../../../lib/bounded-output-tail.mjs";
+import {
+  createBoundedResponseTooLargeError,
+  readBoundedResponseText,
+  toLintErrorObject,
+} from "../../../lib/bounded-response.mjs";
+import { isRecord } from "../../../lib/record-shared.mjs";
+import { resolveWindowsTaskkillPath } from "../../../lib/windows-taskkill.mjs";
 
 const TOKEN = "bundled-plugin-runtime-smoke-token";
-const OUTPUT_CAPTURE_CHARS = readPositiveInt(
-  process.env.OPENCLAW_BUNDLED_PLUGIN_RUNTIME_OUTPUT_CHARS,
+const RUNTIME_PORT_BASE_ENV = "OPENCLAW_BUNDLED_PLUGIN_RUNTIME_PORT_BASE";
+const TCP_PORT_MAX = 65535;
+const OUTPUT_CAPTURE_CHARS = readPositiveIntEnv(
+  "OPENCLAW_BUNDLED_PLUGIN_RUNTIME_OUTPUT_CHARS",
   1024 * 1024,
 );
-const LOG_SCAN_BYTES = readPositiveInt(
-  process.env.OPENCLAW_BUNDLED_PLUGIN_RUNTIME_LOG_SCAN_BYTES,
+const LOG_SCAN_BYTES = readPositiveIntEnv(
+  "OPENCLAW_BUNDLED_PLUGIN_RUNTIME_LOG_SCAN_BYTES",
   256 * 1024,
 );
-const GATEWAY_LOG_CAPTURE_BYTES = readPositiveInt(
-  process.env.OPENCLAW_BUNDLED_PLUGIN_RUNTIME_GATEWAY_LOG_BYTES,
+const GATEWAY_LOG_CAPTURE_BYTES = readPositiveIntEnv(
+  "OPENCLAW_BUNDLED_PLUGIN_RUNTIME_GATEWAY_LOG_BYTES",
   16 * 1024 * 1024,
 );
-const WATCHDOG_MS = readPositiveInt(process.env.OPENCLAW_BUNDLED_PLUGIN_RUNTIME_WATCHDOG_MS, 1000);
-const READY_TIMEOUT_MS = readPositiveInt(
-  process.env.OPENCLAW_BUNDLED_PLUGIN_RUNTIME_READY_MS,
-  900000,
-);
-const RPC_TIMEOUT_MS = readPositiveInt(process.env.OPENCLAW_BUNDLED_PLUGIN_RUNTIME_RPC_MS, 60000);
-const RPC_READY_TIMEOUT_MS = readPositiveInt(
-  process.env.OPENCLAW_BUNDLED_PLUGIN_RUNTIME_RPC_READY_MS,
+const WATCHDOG_MS = readPositiveIntEnv("OPENCLAW_BUNDLED_PLUGIN_RUNTIME_WATCHDOG_MS", 1000);
+const READY_TIMEOUT_MS = readPositiveIntEnv("OPENCLAW_BUNDLED_PLUGIN_RUNTIME_READY_MS", 900000);
+const RPC_TIMEOUT_MS = readPositiveIntEnv("OPENCLAW_BUNDLED_PLUGIN_RUNTIME_RPC_MS", 60000);
+const RPC_READY_TIMEOUT_MS = readPositiveIntEnv(
+  "OPENCLAW_BUNDLED_PLUGIN_RUNTIME_RPC_READY_MS",
   210000,
 );
-const COMMAND_TIMEOUT_MS = readPositiveInt(
-  process.env.OPENCLAW_BUNDLED_PLUGIN_RUNTIME_COMMAND_MS,
-  120000,
-);
-const HTTP_PROBE_TIMEOUT_MS = readPositiveInt(
-  process.env.OPENCLAW_BUNDLED_PLUGIN_RUNTIME_HTTP_MS,
-  5000,
-);
-const GATEWAY_TEARDOWN_GRACE_MS = readPositiveInt(
-  process.env.OPENCLAW_BUNDLED_PLUGIN_RUNTIME_TEARDOWN_GRACE_MS,
+const COMMAND_TIMEOUT_MS = readPositiveIntEnv("OPENCLAW_BUNDLED_PLUGIN_RUNTIME_COMMAND_MS", 120000);
+const HTTP_PROBE_TIMEOUT_MS = readPositiveIntEnv("OPENCLAW_BUNDLED_PLUGIN_RUNTIME_HTTP_MS", 5000);
+const HTTP_PROBE_BODY_MAX_BYTES = 1024 * 1024;
+const GATEWAY_TEARDOWN_GRACE_MS = readPositiveIntEnv(
+  "OPENCLAW_BUNDLED_PLUGIN_RUNTIME_TEARDOWN_GRACE_MS",
   10000,
 );
-const GATEWAY_TEARDOWN_KILL_GRACE_MS = readPositiveInt(
-  process.env.OPENCLAW_BUNDLED_PLUGIN_RUNTIME_TEARDOWN_KILL_GRACE_MS,
+const GATEWAY_TEARDOWN_KILL_GRACE_MS = readPositiveIntEnv(
+  "OPENCLAW_BUNDLED_PLUGIN_RUNTIME_TEARDOWN_KILL_GRACE_MS",
   1000,
 );
 const GATEWAY_READY_LOG_NEEDLE = Buffer.from("[gateway] ready");
@@ -56,17 +59,54 @@ const FORBIDDEN_POST_READY_DEPS_WORK = [/\b(?:npm|pnpm|yarn|corepack) install\b/
 const PACKAGE_MANAGER_PROCESS_BASENAME = /^(?:npm|pnpm|yarn|corepack)(?:$|[.-])/u;
 const PROCESS_SNAPSHOT_ARGS = ["-ww", "-eo", "pid=,ppid=,args="];
 const isolatedStateRoots = new WeakMap();
+const activeCommandChildren = new Set();
 const activeGatewayChildren = new Set();
 const parentSignalHandlers = new Map();
-let gatewayExitCleanupInstalled = false;
+let parentCleanupInstalled = false;
 
-function readPositiveInt(raw, fallback) {
+function readPositiveIntEnv(name, fallback) {
+  return readPositiveInt(process.env[name], fallback, name);
+}
+
+function readPositiveInt(raw, fallback, name) {
   const text = String(raw ?? "").trim();
-  if (!/^\d+$/u.test(text)) {
+  if (!text) {
     return fallback;
   }
+  if (!/^\d+$/u.test(text)) {
+    throw new Error(`invalid ${name}: ${text}`);
+  }
   const parsed = Number(text);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`invalid ${name}: ${text}`);
+  }
+  return parsed;
+}
+
+function readNonNegativeInt(raw, fallback, name) {
+  const text = String(raw ?? "").trim();
+  if (!text) {
+    return fallback;
+  }
+  if (!/^\d+$/u.test(text)) {
+    throw new Error(`invalid ${name}: ${text}`);
+  }
+  const parsed = Number(text);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`invalid ${name}: ${text}`);
+  }
+  return parsed;
+}
+
+export function resolveRuntimeSmokePort(pluginIndex, offset = 0, env = process.env) {
+  const base = readPositiveInt(env[RUNTIME_PORT_BASE_ENV], 19000, RUNTIME_PORT_BASE_ENV);
+  const port = base + pluginIndex * 3 + offset;
+  if (!Number.isSafeInteger(port) || port > TCP_PORT_MAX) {
+    throw new Error(
+      `${RUNTIME_PORT_BASE_ENV} with bundled plugin runtime index ${pluginIndex} and offset ${offset} must resolve to a TCP port from 1 to 65535. Got: ${port}`,
+    );
+  }
+  return port;
 }
 
 function readJson(file) {
@@ -339,15 +379,6 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
 
-export function appendBoundedOutput(buffer, chunk, maxChars = OUTPUT_CAPTURE_CHARS) {
-  const nextText = buffer.text + String(chunk);
-  if (nextText.length <= maxChars) {
-    return { text: nextText, truncatedChars: buffer.truncatedChars };
-  }
-  const truncatedChars = buffer.truncatedChars + nextText.length - maxChars;
-  return { text: nextText.slice(-maxChars), truncatedChars };
-}
-
 function formatCapturedOutput(label, buffer) {
   if (!buffer.text) {
     return "";
@@ -400,24 +431,29 @@ function createBoundedGatewayLog(logPath) {
 export function runCommand(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const { timeoutMs = COMMAND_TIMEOUT_MS, ...spawnOptions } = options;
+    const detached = spawnOptions.detached ?? process.platform !== "win32";
     const child = childProcess.spawn(command, args, {
       stdio: ["ignore", "pipe", "pipe"],
       ...spawnOptions,
+      detached,
     });
+    if (detached) {
+      trackCommandChild(child);
+    }
     let stdout = { text: "", truncatedChars: 0 };
     let stderr = { text: "", truncatedChars: 0 };
     let timedOut = false;
     let settled = false;
     child.stdout?.on("data", (chunk) => {
-      stdout = appendBoundedOutput(stdout, chunk);
+      stdout = appendBoundedTail(stdout, chunk, OUTPUT_CAPTURE_CHARS);
     });
     child.stderr?.on("data", (chunk) => {
-      stderr = appendBoundedOutput(stderr, chunk);
+      stderr = appendBoundedTail(stderr, chunk, OUTPUT_CAPTURE_CHARS);
     });
     const clearCommandTimer = timeoutMs
       ? setTimeout(() => {
           timedOut = true;
-          child.kill("SIGKILL");
+          signalChildProcessTree(child, "SIGKILL");
         }, timeoutMs)
       : undefined;
     child.on("error", (error) => {
@@ -508,14 +544,26 @@ function trackGatewayChild(child) {
   };
   child.once("error", untrack);
   child.once("close", untrack);
-  installGatewayParentCleanup();
+  installParentCleanup();
 }
 
-function installGatewayParentCleanup() {
-  if (!gatewayExitCleanupInstalled) {
-    gatewayExitCleanupInstalled = true;
+function trackCommandChild(child) {
+  activeCommandChildren.add(child);
+  const untrack = () => {
+    if (!processTreeIsAlive(child)) {
+      activeCommandChildren.delete(child);
+    }
+  };
+  child.once("error", untrack);
+  child.once("close", untrack);
+  installParentCleanup();
+}
+
+function installParentCleanup() {
+  if (!parentCleanupInstalled) {
+    parentCleanupInstalled = true;
     process.once("exit", () => {
-      cleanupActiveGatewayChildren("SIGTERM");
+      cleanupActiveChildren("SIGTERM");
     });
   }
   for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
@@ -523,7 +571,7 @@ function installGatewayParentCleanup() {
       continue;
     }
     const handler = () => {
-      cleanupActiveGatewayChildren(signal);
+      cleanupActiveChildren(signal);
       for (const [registeredSignal, registeredHandler] of parentSignalHandlers) {
         process.off(registeredSignal, registeredHandler);
       }
@@ -535,11 +583,17 @@ function installGatewayParentCleanup() {
   }
 }
 
-function cleanupActiveGatewayChildren(signal) {
-  for (const child of activeGatewayChildren) {
-    signalGateway(child, signal);
+function cleanupActiveChildren(signal) {
+  for (const child of activeCommandChildren) {
+    signalChildProcessTree(child, signal);
     if (process.platform !== "win32") {
-      signalGateway(child, "SIGKILL");
+      signalChildProcessTree(child, "SIGKILL");
+    }
+  }
+  for (const child of activeGatewayChildren) {
+    signalChildProcessTree(child, signal);
+    if (process.platform !== "win32") {
+      signalChildProcessTree(child, "SIGKILL");
     }
   }
 }
@@ -559,11 +613,11 @@ export async function stopGateway(child) {
     return !processTreeIsAlive(child);
   };
 
-  signalGateway(child, "SIGTERM");
+  signalChildProcessTree(child, "SIGTERM");
   if (await waitForExit(GATEWAY_TEARDOWN_GRACE_MS)) {
     return;
   }
-  signalGateway(child, "SIGKILL");
+  signalChildProcessTree(child, "SIGKILL");
   await waitForExit(GATEWAY_TEARDOWN_KILL_GRACE_MS);
 }
 
@@ -585,13 +639,37 @@ function processTreeIsAlive(child) {
   }
 }
 
-function signalGateway(child, signal) {
-  if (process.platform !== "win32" && typeof child.pid === "number") {
+function defaultRunTaskkill(command, args, options) {
+  return childProcess.spawnSync(command, args, options);
+}
+
+export function signalChildProcessTree(
+  child,
+  signal,
+  { platform = process.platform, runTaskkill = defaultRunTaskkill } = {},
+) {
+  if (platform !== "win32" && typeof child.pid === "number") {
     try {
       process.kill(-child.pid, signal);
       return;
-    } catch (error) {
-      if (error?.code === "ESRCH") {
+    } catch {
+      // Non-detached callers may not own a process group keyed by child.pid; keep
+      // the legacy direct-child kill path as the fallback.
+    }
+  }
+  if (platform === "win32" && typeof child.pid === "number") {
+    const args = ["/PID", String(child.pid), "/T"];
+    if (signal === "SIGKILL") {
+      args.push("/F");
+    }
+    const taskkillPath = resolveWindowsTaskkillPath();
+    const result = runTaskkill(taskkillPath, args, { stdio: "ignore" });
+    if (!result?.error && result?.status === 0) {
+      return;
+    }
+    if (signal !== "SIGKILL") {
+      const forceResult = runTaskkill(taskkillPath, [...args, "/F"], { stdio: "ignore" });
+      if (!forceResult?.error && forceResult?.status === 0) {
         return;
       }
     }
@@ -640,18 +718,49 @@ export async function waitForReady(params) {
 }
 
 async function fetchHttpProbeStatus(port, pathName, options = {}) {
-  const { timeoutMs = HTTP_PROBE_TIMEOUT_MS } = options;
+  const { parseJson = false, timeoutMs = HTTP_PROBE_TIMEOUT_MS } = options;
   const controller = new AbortController();
-  const clearProbeTimer = timeoutMs
-    ? setTimeout(() => {
-        controller.abort();
-      }, timeoutMs)
+  const timeoutError = Object.assign(
+    new Error(`${pathName} probe timed out after ${timeoutMs}ms`),
+    {
+      code: "ETIMEDOUT",
+    },
+  );
+  let clearProbeTimer;
+  const timeoutPromise = timeoutMs
+    ? new Promise((_, reject) => {
+        clearProbeTimer = setTimeout(() => {
+          controller.abort(timeoutError);
+          reject(timeoutError);
+        }, timeoutMs);
+        clearProbeTimer.unref?.();
+      })
     : undefined;
   try {
-    const res = await fetch(`http://127.0.0.1:${port}${pathName}`, {
-      signal: controller.signal,
-    });
-    const status = { ok: res.ok, status: res.status };
+    const res = await Promise.race([
+      fetch(`http://127.0.0.1:${port}${pathName}`, {
+        signal: controller.signal,
+      }),
+      ...(timeoutPromise ? [timeoutPromise] : []),
+    ]);
+    const status = { ok: res.ok, status: res.status, body: undefined, bodyText: undefined };
+    if (parseJson) {
+      const text = await readBoundedResponseText(
+        res,
+        `${pathName} probe`,
+        HTTP_PROBE_BODY_MAX_BYTES,
+        { createTooLargeError: createBoundedResponseTooLargeError, timeoutPromise },
+      );
+      status.bodyText = text;
+      if (text.trim()) {
+        try {
+          status.body = JSON.parse(text);
+        } catch {
+          status.body = undefined;
+        }
+      }
+      return status;
+    }
     await res.body?.cancel().catch(() => {});
     return status;
   } finally {
@@ -683,7 +792,7 @@ async function assertHttpOk(port, pathName) {
     } catch (error) {
       lastError = error;
     }
-    await delay(500);
+    await delay(Math.min(500, Math.max(1, RPC_READY_TIMEOUT_MS - (Date.now() - started))));
   }
   throw toLintErrorObject(
     lastError ?? new Error(`${pathName} did not return HTTP 200`),
@@ -691,26 +800,65 @@ async function assertHttpOk(port, pathName) {
   );
 }
 
-async function assertReadyzProbe(options) {
+function listReadyzFailingComponents(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return undefined;
+  }
+  if (body.ready !== false || !Array.isArray(body.failing)) {
+    return undefined;
+  }
+  const failing = body.failing.filter((entry) => typeof entry === "string" && entry.length > 0);
+  if (failing.length !== body.failing.length || failing.length === 0) {
+    return undefined;
+  }
+  return failing;
+}
+
+function isAllowedDegradedReadyz(res, allowedFailures) {
+  if (res.status !== 503 || allowedFailures.size === 0) {
+    return false;
+  }
+  const failing = listReadyzFailingComponents(res.body);
+  if (!failing) {
+    return false;
+  }
+  return failing.every((entry) => allowedFailures.has(entry));
+}
+
+function formatHttpProbeBody(res) {
+  if (res.body !== undefined) {
+    return JSON.stringify(res.body);
+  }
+  const text = typeof res.bodyText === "string" ? res.bodyText.trim() : "";
+  if (!text) {
+    return "null";
+  }
+  return JSON.stringify(text.length > 500 ? `${text.slice(0, 500)}...` : text);
+}
+
+export async function assertReadyzProbe(options) {
+  const allowedFailures = new Set(options.allowedDegradedReadyzFailures ?? []);
   const started = Date.now();
   let lastError;
   while (Date.now() - started < RPC_READY_TIMEOUT_MS) {
     try {
-      const res = await fetchHttpProbeStatus(options.port, "/readyz");
+      const res = await fetchHttpProbeStatus(options.port, "/readyz", { parseJson: true });
       if (res.ok) {
         return;
       }
-      if (options.allowDegradedReadyz) {
+      if (isAllowedDegradedReadyz(res, allowedFailures)) {
         console.log(
-          `Runtime readyz smoke degraded for ${options.pluginId}: /readyz returned HTTP ${res.status}`,
+          `Runtime readyz smoke degraded for ${options.pluginId}: /readyz failing ${JSON.stringify(
+            listReadyzFailingComponents(res.body),
+          )}`,
         );
         return;
       }
-      lastError = new Error(`/readyz returned HTTP ${res.status}`);
+      lastError = new Error(`/readyz returned HTTP ${res.status}: ${formatHttpProbeBody(res)}`);
     } catch (error) {
       lastError = error;
     }
-    await delay(500);
+    await delay(Math.min(500, Math.max(1, RPC_READY_TIMEOUT_MS - (Date.now() - started))));
   }
   throw toLintErrorObject(
     lastError ?? new Error("/readyz did not return HTTP 200"),
@@ -787,33 +935,105 @@ function parseJsonOutput(stdout) {
   if (!trimmed) {
     throw new Error("gateway call produced no JSON output");
   }
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    const jsonStart = trimmed.indexOf("{");
-    if (jsonStart >= 0) {
-      try {
-        return JSON.parse(trimmed.slice(jsonStart));
-      } catch {
-        // Fall through to the line-oriented fallback below.
+  const parsed = parseJsonValue(trimmed);
+  if (parsed.ok) {
+    return parsed.value;
+  }
+
+  let lastParsed;
+  const lines = trimmed.split(/\r?\n/u);
+  for (let start = lines.length - 1; start >= 0; start -= 1) {
+    if (!lines[start].trimStart().startsWith("{")) {
+      continue;
+    }
+    let candidate = "";
+    for (let end = start; end < lines.length; end += 1) {
+      candidate = candidate ? `${candidate}\n${lines[end]}` : lines[end];
+      const candidateParsed = parseJsonValue(candidate);
+      if (!candidateParsed.ok) {
+        continue;
       }
+      lastParsed ??= candidateParsed.value;
+      if (isGatewayJsonOutput(candidateParsed.value)) {
+        return candidateParsed.value;
+      }
+      break;
     }
-    const jsonLine = trimmed
-      .split(/\r?\n/u)
-      .toReversed()
-      .find((line) => line.trim().startsWith("{"));
-    if (!jsonLine) {
-      throw new Error(`gateway call JSON output was not parseable:\n${trimmed}`);
-    }
-    return JSON.parse(jsonLine);
+  }
+  if (lastParsed !== undefined) {
+    return lastParsed;
+  }
+  throw new Error(`gateway call JSON output was not parseable:\n${trimmed}`);
+}
+
+function parseJsonValue(text) {
+  try {
+    return { ok: true, value: JSON.parse(text) };
+  } catch {
+    return { ok: false };
   }
 }
 
-function unwrapRpcPayload(raw) {
+function isGatewayJsonOutput(raw) {
+  return (
+    raw?.ok === false ||
+    hasOwnPayloadField(raw, "result") ||
+    hasOwnPayloadField(raw, "payload") ||
+    hasOwnPayloadField(raw, "data")
+  );
+}
+
+function hasOwnPayloadField(raw, field) {
+  return (
+    ((typeof raw === "object" && raw !== null) || typeof raw === "function") &&
+    Object.hasOwn(raw, field)
+  );
+}
+
+export function unwrapRpcPayload(raw) {
   if (raw?.ok === false) {
     throw new Error(`gateway RPC failed: ${JSON.stringify(raw.error ?? raw)}`);
   }
-  return raw?.result ?? raw?.payload ?? raw?.data ?? raw;
+  if (hasOwnPayloadField(raw, "result")) {
+    return raw.result;
+  }
+  if (hasOwnPayloadField(raw, "payload")) {
+    return raw.payload;
+  }
+  if (hasOwnPayloadField(raw, "data")) {
+    return raw.data;
+  }
+  return raw;
+}
+
+export function assertGatewayHealthPayload(payload, label = "health") {
+  if (!isRecord(payload)) {
+    throw new Error(`${label} returned invalid payload: expected object.`);
+  }
+  if (payload.ok !== true) {
+    throw new Error(`${label} returned invalid payload: expected ok=true.`);
+  }
+  if (!Number.isFinite(payload.ts)) {
+    throw new Error(`${label} returned invalid payload: expected numeric ts.`);
+  }
+  if (!Number.isFinite(payload.durationMs)) {
+    throw new Error(`${label} returned invalid payload: expected numeric durationMs.`);
+  }
+  if (typeof payload.defaultAgentId !== "string" || payload.defaultAgentId.trim() === "") {
+    throw new Error(`${label} returned invalid payload: expected defaultAgentId.`);
+  }
+  if (!Array.isArray(payload.agents)) {
+    throw new Error(`${label} returned invalid payload: expected agents array.`);
+  }
+  if (!isRecord(payload.channels)) {
+    throw new Error(`${label} returned invalid payload: expected channels object.`);
+  }
+  if (!Array.isArray(payload.channelOrder)) {
+    throw new Error(`${label} returned invalid payload: expected channelOrder array.`);
+  }
+  if (!isRecord(payload.sessions)) {
+    throw new Error(`${label} returned invalid payload: expected sessions object.`);
+  }
 }
 
 async function smokePlugin(pluginId, pluginDir, requiresConfig, pluginIndex, pluginRoot) {
@@ -827,8 +1047,7 @@ async function smokePlugin(pluginId, pluginDir, requiresConfig, pluginIndex, plu
   }
   const manifest = loadManifest(pluginDir, pluginRoot);
   const plan = buildPluginPlan(manifest);
-  const port =
-    readPositiveInt(process.env.OPENCLAW_BUNDLED_PLUGIN_RUNTIME_PORT_BASE, 19000) + pluginIndex * 3;
+  const port = resolveRuntimeSmokePort(pluginIndex);
   const config = ensureGatewayConfig(
     activateSmokePlugin(readConfig(), pluginId, plan.channels),
     port,
@@ -836,16 +1055,13 @@ async function smokePlugin(pluginId, pluginDir, requiresConfig, pluginIndex, plu
   const env = withManifestChannelActivationEnv(process.env, plan.channels);
   if (plan.speechProviders[0]) {
     const provider = plan.speechProviders[0];
-    config.messages = {
-      ...config.messages,
-      tts: {
-        ...config.messages?.tts,
-        provider,
-        providers: {
-          ...config.messages?.tts?.providers,
-          [provider]: {
-            ...config.messages?.tts?.providers?.[provider],
-          },
+    config.tts = {
+      ...config.tts,
+      provider,
+      providers: {
+        ...config.tts?.providers,
+        [provider]: {
+          ...config.tts?.providers?.[provider],
         },
       },
     };
@@ -862,12 +1078,13 @@ async function smokePlugin(pluginId, pluginDir, requiresConfig, pluginIndex, plu
   });
   try {
     await waitForReady({ child, port, logPath });
+    assertPluginLoaded(logPath, pluginId);
     await assertBaseGatewayProbes({
       entrypoint,
       port,
       env,
       pluginId,
-      allowDegradedReadyz: plan.channels.length > 0,
+      allowedDegradedReadyzFailures: plan.channels,
     });
     await runManifestProbes(plan, { entrypoint, port, env, pluginId });
     await runWatchdog({ child, logPath, port, entrypoint, env, pluginId });
@@ -883,7 +1100,7 @@ async function smokePlugin(pluginId, pluginDir, requiresConfig, pluginIndex, plu
 async function assertBaseGatewayProbes(options) {
   await assertHttpOk(options.port, "/healthz");
   await assertReadyzProbe(options);
-  await retryRpcCall("health", {}, options);
+  assertGatewayHealthPayload(await retryRpcCall("health", {}, options));
 }
 
 async function runManifestProbes(plan, options) {
@@ -1016,7 +1233,10 @@ async function runWatchdog(options) {
       `gateway exited after ready for ${options.pluginId}\n${tailFile(options.logPath)}`,
     );
   }
-  await retryRpcCall("health", {}, options);
+  assertGatewayHealthPayload(
+    await retryRpcCall("health", {}, options),
+    `${options.pluginId} watchdog health`,
+  );
   assertGatewayLogNotTruncated(options.logPath);
   assertNoPostReadyRuntimeDepsWork(options.logPath, readyOffset);
   await assertNoPackageManagerChildren(options.child.pid);
@@ -1033,6 +1253,19 @@ export function assertGatewayLogNotTruncated(logPath) {
         GATEWAY_LOG_CAPTURE_BYTES,
       )} bytes; runtime smoke cannot validate complete post-ready output`,
     );
+  }
+}
+
+export function assertPluginLoaded(logPath, pluginId) {
+  let text;
+  try {
+    text = fs.readFileSync(logPath, "utf8");
+  } catch {
+    return;
+  }
+  const failurePrefix = `[plugins] ${pluginId} failed to load`;
+  if (text.includes(failurePrefix)) {
+    throw new Error(`${failurePrefix}: ${tailText(text)}`);
   }
 }
 
@@ -1157,10 +1390,7 @@ async function smokeTtsGlobalDisable(pluginId, pluginDir, provider, pluginIndex,
     console.log(`Global-disable TTS smoke skipped for ${pluginId}: no speech provider contract`);
     return;
   }
-  const port =
-    readPositiveInt(process.env.OPENCLAW_BUNDLED_PLUGIN_RUNTIME_PORT_BASE, 19000) +
-    pluginIndex * 3 +
-    1;
+  const port = resolveRuntimeSmokePort(pluginIndex, 1);
   const env = createIsolatedStateEnv(`tts-disabled-${pluginId}`);
   writeConfig(
     ensureGatewayConfig(
@@ -1168,10 +1398,8 @@ async function smokeTtsGlobalDisable(pluginId, pluginDir, provider, pluginIndex,
         plugins: {
           enabled: false,
         },
-        messages: {
-          tts: {
-            provider: selectedProvider,
-          },
+        tts: {
+          provider: selectedProvider,
         },
       },
       port,
@@ -1212,10 +1440,7 @@ async function smokeOpenAiTts(pluginIndex) {
     console.log("OpenAI key-backed TTS smoke skipped: OPENAI_API_KEY is not set");
     return;
   }
-  const port =
-    readPositiveInt(process.env.OPENCLAW_BUNDLED_PLUGIN_RUNTIME_PORT_BASE, 19000) +
-    pluginIndex * 3 +
-    2;
+  const port = resolveRuntimeSmokePort(pluginIndex, 2);
   const env = createIsolatedStateEnv("tts-openai-live");
   writeConfig(
     ensureGatewayConfig(
@@ -1227,13 +1452,11 @@ async function smokeOpenAiTts(pluginIndex) {
             openai: { enabled: true },
           },
         },
-        messages: {
-          tts: {
-            provider: "openai",
-            providers: {
-              openai: {
-                apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" },
-              },
+        tts: {
+          provider: "openai",
+          providers: {
+            openai: {
+              apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" },
             },
           },
         },
@@ -1301,10 +1524,10 @@ function tailText(text) {
   return text.split(/\r?\n/u).slice(-120).join("\n");
 }
 
-export async function main(argv = process.argv.slice(2)) {
+async function main(argv = process.argv.slice(2)) {
   const [command, pluginId, pluginDir, requiresConfigRaw, pluginIndexRaw, pluginRoot, provider] =
     argv;
-  const pluginIndex = Number.parseInt(pluginIndexRaw || "0", 10);
+  const pluginIndex = readNonNegativeInt(pluginIndexRaw, 0, "bundled plugin runtime index");
 
   if (command === "plugin") {
     await smokePlugin(pluginId, pluginDir, requiresConfigRaw === "1", pluginIndex, pluginRoot);
@@ -1319,18 +1542,4 @@ export async function main(argv = process.argv.slice(2)) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   await main();
-}
-
-function toLintErrorObject(value, fallbackMessage) {
-  if (value instanceof Error) {
-    return value;
-  }
-  if (typeof value === "string") {
-    return new Error(value);
-  }
-  const error = new Error(fallbackMessage, { cause: value });
-  if ((typeof value === "object" && value !== null) || typeof value === "function") {
-    Object.assign(error, value);
-  }
-  return error;
 }

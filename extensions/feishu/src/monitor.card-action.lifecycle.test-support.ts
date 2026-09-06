@@ -1,12 +1,14 @@
+// Feishu plugin module implements monitor.card action.lifecycle support behavior.
 import { createRuntimeEnv } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import "./lifecycle.test-support.js";
-import { resetProcessedFeishuCardActionTokensForTests } from "./card-action.js";
-import { createFeishuCardInteractionEnvelope } from "./card-interaction.js";
+// Preserve module setup before modules that consume it.
+// oxfmt-ignore
 import {
   getFeishuLifecycleTestMocks,
   resetFeishuLifecycleTestMocks,
 } from "./lifecycle.test-support.js";
+import { processedCardActions, resolvedCardActionChatTypes } from "./card-action-state.js";
+import { createFeishuCardInteractionEnvelope } from "./card-interaction.js";
 import {
   createFeishuLifecycleConfig,
   createFeishuLifecycleReplyDispatcher,
@@ -25,7 +27,6 @@ const {
   createEventDispatcherMock,
   createFeishuReplyDispatcherMock,
   dispatchReplyFromConfigMock,
-  finalizeInboundContextMock,
   resolveAgentRouteMock,
   resolveBoundConversationMock,
   sendCardFeishuMock,
@@ -42,6 +43,10 @@ const lifecycleConfig = createFeishuLifecycleConfig({
   channelConfig: {
     dmPolicy: "open",
     allowFrom: ["ou_user1"],
+    groupPolicy: "open",
+    groups: {
+      oc_group_require_mention: { requireMention: true },
+    },
   },
   accountConfig: {
     dmPolicy: "open",
@@ -65,6 +70,8 @@ function createCardActionEvent(params: {
   command: string;
   chatId?: string;
   chatType?: "group" | "p2p";
+  contextOpenMessageId?: string;
+  openMessageId?: string;
 }) {
   const openId = "ou_user1";
   const chatId = params.chatId ?? "p2p:ou_user1";
@@ -76,6 +83,7 @@ function createCardActionEvent(params: {
       union_id: "union_1",
     },
     token: params.token,
+    ...(params.openMessageId ? { open_message_id: params.openMessageId } : {}),
     action: {
       tag: "button",
       value: createFeishuCardInteractionEnvelope({
@@ -94,6 +102,7 @@ function createCardActionEvent(params: {
       open_id: openId,
       user_id: "user_1",
       chat_id: chatId,
+      ...(params.contextOpenMessageId ? { open_message_id: params.contextOpenMessageId } : {}),
     },
   };
 }
@@ -124,11 +133,11 @@ function latestReplyDispatcherParams() {
 }
 
 function latestFinalizedContext() {
-  const call = finalizeInboundContextMock.mock.calls.at(-1);
+  const call = dispatchReplyFromConfigMock.mock.calls.at(-1);
   if (!call) {
     throw new Error("expected finalized inbound context call");
   }
-  return call[0] as {
+  return call[0].ctx as {
     AccountId?: string;
     SessionKey?: string;
     MessageSid?: string;
@@ -140,7 +149,8 @@ describe("Feishu card-action lifecycle", () => {
     vi.useRealTimers();
     resetFeishuLifecycleTestMocks();
     lastRuntime = createRuntimeEnv();
-    resetProcessedFeishuCardActionTokensForTests();
+    processedCardActions.clear();
+    resolvedCardActionChatTypes.clear();
     setFeishuLifecycleStateDir("openclaw-feishu-card-action");
 
     createFeishuReplyDispatcherMock.mockReturnValue(createFeishuLifecycleReplyDispatcher());
@@ -164,11 +174,8 @@ describe("Feishu card-action lifecycle", () => {
       replyText: "card action reply once",
     });
 
-    withReplyDispatcherMock.mockImplementation(async ({ run }) => await run());
-
     installFeishuLifecycleReplyRuntime({
       resolveAgentRouteMock,
-      finalizeInboundContextMock,
       dispatchReplyFromConfigMock,
       withReplyDispatcherMock,
       storePath: "/tmp/feishu-card-action-sessions.json",
@@ -177,7 +184,8 @@ describe("Feishu card-action lifecycle", () => {
 
   afterEach(() => {
     vi.useRealTimers();
-    resetProcessedFeishuCardActionTokensForTests();
+    processedCardActions.clear();
+    resolvedCardActionChatTypes.clear();
     restoreFeishuLifecycleStateDir(originalStateDir);
   });
 
@@ -252,6 +260,42 @@ describe("Feishu card-action lifecycle", () => {
     expect(latestFinalizedContext().MessageSid).toBe("card-action-tok-card-v2-context");
   });
 
+  it("routes authenticated group callbacks when the group requires a mention", async () => {
+    const onCardAction = await setupLifecycleMonitor();
+
+    await onCardAction(
+      createCardActionEvent({
+        token: "tok-card-require-mention",
+        action: "feishu.quick_actions.help",
+        command: "/help",
+        chatId: "oc_group_require_mention",
+        chatType: "group",
+      }),
+    );
+
+    expect(lastRuntime?.error).not.toHaveBeenCalled();
+    expect(dispatchReplyFromConfigMock).toHaveBeenCalledTimes(1);
+    expect(latestReplyDispatcherParams().chatId).toBe("oc_group_require_mention");
+    expect(latestFinalizedContext().MessageSid).toBe("card-action-tok-card-require-mention");
+  });
+
+  it("prefers the original context message id over a temporary callback id", async () => {
+    const onCardAction = await setupLifecycleMonitor();
+    const event = createCardActionEvent({
+      token: "tok-card-original-target",
+      action: "feishu.quick_actions.help",
+      command: "/help",
+      openMessageId: "card-action-c-temporary",
+      contextOpenMessageId: "om_card_original",
+    });
+
+    await onCardAction(event);
+
+    expect(lastRuntime?.error).not.toHaveBeenCalled();
+    expect(dispatchReplyFromConfigMock).toHaveBeenCalledTimes(1);
+    expect(latestReplyDispatcherParams().replyToMessageId).toBe("om_card_original");
+  });
+
   it("routes v2 callbacks with nested operator identity", async () => {
     const onCardAction = await setupLifecycleMonitor();
     const chatId = "p2p:ou_user1";
@@ -294,13 +338,14 @@ describe("Feishu card-action lifecycle", () => {
         replyToMessageId: "om_card_v2_nested",
       }),
     );
-    expect(finalizeInboundContextMock).toHaveBeenCalledWith(
+    expect(dispatchReplyFromConfigMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        AccountId: "acct-card",
-        SessionKey: "agent:bound-agent:feishu:direct:ou_user1",
-        MessageSid: "card-action-tok-card-v2-nested-operator",
+        ctx: expect.objectContaining({
+          AccountId: "acct-card",
+          SessionKey: "agent:bound-agent:feishu:direct:ou_user1",
+          MessageSid: "card-action-tok-card-v2-nested-operator",
+        }),
       }),
-      undefined,
     );
   });
 
@@ -315,9 +360,16 @@ describe("Feishu card-action lifecycle", () => {
       token: "tok-card-sdk-flat",
       action: {
         tag: "button",
-        value: {
-          command: "/help",
-        },
+        value: createFeishuCardInteractionEnvelope({
+          k: "quick",
+          a: "feishu.quick_actions.help",
+          q: "/help",
+          c: {
+            u: "ou_user1",
+            t: "p2p",
+            e: Date.now() + 60_000,
+          },
+        }),
       },
     });
 
@@ -338,9 +390,16 @@ describe("Feishu card-action lifecycle", () => {
       token: "tok-card-no-reply-target",
       action: {
         tag: "button",
-        value: {
-          command: "/help",
-        },
+        value: createFeishuCardInteractionEnvelope({
+          k: "quick",
+          a: "feishu.quick_actions.help",
+          q: "/help",
+          c: {
+            u: "ou_user1",
+            t: "p2p",
+            e: Date.now() + 60_000,
+          },
+        }),
       },
     });
 
@@ -351,6 +410,22 @@ describe("Feishu card-action lifecycle", () => {
     expect(dispatcherParams.chatId).toBe("ou_user1");
     expect(dispatcherParams.replyToMessageId).toBeUndefined();
     expect(latestFinalizedContext().MessageSid).toBe("card-action-tok-card-no-reply-target");
+  });
+
+  it("plain-sends card action replies when only a temporary callback id is available", async () => {
+    const onCardAction = await setupLifecycleMonitor();
+    const event = createCardActionEvent({
+      token: "tok-card-temporary-target",
+      action: "feishu.quick_actions.help",
+      command: "/help",
+      openMessageId: "card-action-c-temporary",
+    });
+
+    await onCardAction(event);
+
+    expect(lastRuntime?.error).not.toHaveBeenCalled();
+    expect(dispatchReplyFromConfigMock).toHaveBeenCalledTimes(1);
+    expect(latestReplyDispatcherParams().replyToMessageId).toBeUndefined();
   });
 
   it("does not duplicate delivery when retrying after a post-send failure", async () => {

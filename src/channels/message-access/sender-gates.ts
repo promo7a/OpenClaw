@@ -1,14 +1,19 @@
+/**
+ * Channel ingress sender gate helpers.
+ *
+ * Evaluates DM and group sender policies against normalized allowlists.
+ */
 import {
   allowlistFailureReason,
-  applyMutableIdentifierPolicy,
+  applyIdentifierAuthenticationPolicy,
   effectiveGroupSenderAllowlist,
   redactedAllowlistDiagnostics,
 } from "./allowlist.js";
 import type {
   AccessGraphGate,
   ChannelIngressPolicyInput,
-  ChannelIngressState,
-  ResolvedIngressAllowlist,
+  NormalizedIngressState,
+  NormalizedIngressAllowlist,
 } from "./types.js";
 
 function senderGate(params: {
@@ -19,8 +24,10 @@ function senderGate(params: {
   reasonCode: AccessGraphGate["reasonCode"];
   match: AccessGraphGate["match"];
   policy: ChannelIngressPolicyInput["dmPolicy"] | ChannelIngressPolicyInput["groupPolicy"];
-  allowlistSource: ResolvedIngressAllowlist;
+  allowlistSource: NormalizedIngressAllowlist;
 }): AccessGraphGate {
+  // Sender gates always include redacted allowlist facts so diagnostics can explain an
+  // allow/block result without exposing raw sender ids.
   return {
     id: params.id,
     phase: "sender",
@@ -31,15 +38,26 @@ function senderGate(params: {
     match: params.match,
     sender: { policy: params.policy },
     allowlist: redactedAllowlistDiagnostics(params.allowlistSource, params.reasonCode),
+    ...(params.allowlistSource.authentication
+      ? {
+          identifierAuthentication: {
+            evaluated: params.allowlistSource.authentication.evaluated,
+            affectedMatch: params.allowlistSource.authentication.affectedMatch,
+          },
+        }
+      : {}),
   };
 }
 
+/**
+ * Evaluates direct-message sender policy against DM and pairing-store allowlists.
+ */
 export function senderGateForDirect(params: {
-  state: ChannelIngressState;
+  state: NormalizedIngressState;
   policy: ChannelIngressPolicyInput;
 }): AccessGraphGate {
-  const dm = applyMutableIdentifierPolicy(params.state.allowlists.dm, params.policy);
-  const pairingStore = applyMutableIdentifierPolicy(
+  const dm = applyIdentifierAuthenticationPolicy(params.state.allowlists.dm, params.policy);
+  const pairingStore = applyIdentifierAuthenticationPolicy(
     params.state.allowlists.pairingStore,
     params.policy,
   );
@@ -70,6 +88,8 @@ export function senderGateForDirect(params: {
     return block("dm_policy_disabled");
   }
   if (params.policy.dmPolicy === "open") {
+    // Open DM policy still requires either wildcard or an explicit normalized entry so
+    // configured allowlists keep their narrowing effect.
     if (dm.hasWildcard) {
       return allow("dm_policy_open");
     }
@@ -82,6 +102,7 @@ export function senderGateForDirect(params: {
     return allow("dm_policy_allowlisted");
   }
   if (params.policy.dmPolicy === "pairing" && pairingStore.match.matched) {
+    // Pairing-store matches are only valid for pairing policy, never for open/allowlist modes.
     return senderGate({
       id: "sender:dm",
       kind: "dmSender",
@@ -103,8 +124,11 @@ export function senderGateForDirect(params: {
   return block(reasonCode);
 }
 
+/**
+ * Evaluates group/channel sender policy after route sender allowlist overrides are applied.
+ */
 export function senderGateForGroup(params: {
-  state: ChannelIngressState;
+  state: NormalizedIngressState;
   policy: ChannelIngressPolicyInput;
 }): AccessGraphGate {
   const group = effectiveGroupSenderAllowlist(params);
@@ -146,13 +170,18 @@ export function senderGateForGroup(params: {
   return block(allowlistFailureReason(group) ?? "group_policy_not_allowlisted");
 }
 
+/**
+ * Applies event auth mode to sender gates for non-message callbacks.
+ */
 export function applyEventAuthModeToSenderGate(params: {
-  state: ChannelIngressState;
+  state: NormalizedIngressState;
   senderGate: AccessGraphGate;
 }): AccessGraphGate {
   if (params.state.event.authMode === "inbound" || params.senderGate.allowed) {
     return params.senderGate;
   }
+  // Non-inbound events can be authorized by command/origin/route gates, so a failed sender
+  // gate becomes an ignored diagnostic instead of a dispatch block.
   const reasonCode = "sender_not_required";
   return {
     ...params.senderGate,

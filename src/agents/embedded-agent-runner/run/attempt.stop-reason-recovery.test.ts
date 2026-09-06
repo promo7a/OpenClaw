@@ -1,3 +1,4 @@
+// Coverage for converting sensitive/unhandled stop reasons into assistant errors.
 import type { StreamFn } from "openclaw/plugin-sdk/agent-core";
 import {
   createAssistantMessageEventStream,
@@ -5,7 +6,8 @@ import {
   type Model,
 } from "openclaw/plugin-sdk/llm";
 import { describe, expect, it } from "vitest";
-import { wrapStreamFnHandleSensitiveStopReason } from "./attempt.stop-reason-recovery.js";
+import { createZeroUsageFixture } from "../../test-helpers/usage-fixtures.js";
+import { wrapStreamFnHandleSensitiveStopReason } from "./attempt-stop-reason-recovery.js";
 
 const anthropicModel = {
   api: "anthropic-messages",
@@ -15,6 +17,8 @@ const anthropicModel = {
 
 describe("wrapStreamFnHandleSensitiveStopReason", () => {
   it("rewrites unhandled stop-reason errors into structured assistant errors", async () => {
+    // Some providers surface unhandled stop reasons as stream errors; convert
+    // them into a normal assistant error so fallback/retry paths can inspect it.
     const baseStreamFn: StreamFn = () => {
       const stream = createAssistantMessageEventStream();
       queueMicrotask(() => {
@@ -27,14 +31,7 @@ describe("wrapStreamFnHandleSensitiveStopReason", () => {
             api: anthropicModel.api,
             provider: anthropicModel.provider,
             model: anthropicModel.id,
-            usage: {
-              input: 0,
-              output: 0,
-              cacheRead: 0,
-              cacheWrite: 0,
-              totalTokens: 0,
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-            },
+            usage: createZeroUsageFixture(),
             stopReason: "error",
             errorMessage: "Unhandled stop reason: sensitive",
             timestamp: Date.now(),

@@ -1,7 +1,20 @@
+/**
+ * Channel ingress decision graph builder.
+ *
+ * Evaluates route, sender, command, and mention gates into one admission decision.
+ */
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import { resolveCommandAuthorizedFromAuthorizers } from "../command-gating.js";
-import { resolveInboundMentionDecision } from "../mention-gating.js";
-import { applyMutableIdentifierPolicy, redactedAllowlistDiagnostics } from "./allowlist.js";
+import {
+  allowedImplicitMentionKindsFromConfig,
+  resolveInboundMentionDecision,
+} from "../mention-gating.js";
+import { applyIdentifierAuthenticationPolicy, redactedAllowlistDiagnostics } from "./allowlist.js";
+import {
+  DEFAULT_IDENTIFIER_AUTHENTICATION,
+  meetsIdentifierAuthentication,
+  minimumIdentifierAuthenticationFrom,
+} from "./identifier-authentication.js";
 import {
   applyEventAuthModeToSenderGate,
   senderGateForDirect,
@@ -11,7 +24,7 @@ import type {
   AccessGraphGate,
   ChannelIngressDecision,
   ChannelIngressPolicyInput,
-  ChannelIngressState,
+  NormalizedIngressState,
   RedactedIngressMatch,
 } from "./types.js";
 
@@ -30,7 +43,9 @@ function decisiveDecision(params: {
   };
 }
 
-function routeGates(state: ChannelIngressState): AccessGraphGate[] {
+function routeGates(state: NormalizedIngressState): AccessGraphGate[] {
+  // Route gates run first because a matched route can block dispatch before sender,
+  // command, or mention policy needs to evaluate.
   return state.routeFacts.map((route) => ({
     id: route.id,
     phase: "route",
@@ -42,7 +57,9 @@ function routeGates(state: ChannelIngressState): AccessGraphGate[] {
   }));
 }
 
-function routeSenderEmptyGate(state: ChannelIngressState): AccessGraphGate | null {
+function routeSenderEmptyGate(state: NormalizedIngressState): AccessGraphGate | null {
+  // deny-when-empty route sender policy means the route matched but has no sender list to
+  // authorize against, so it becomes an explicit route block.
   const route = state.routeFacts.find(
     (fact) =>
       fact.senderPolicy === "deny-when-empty" &&
@@ -68,7 +85,7 @@ function routeSenderEmptyGate(state: ChannelIngressState): AccessGraphGate | nul
 }
 
 function commandGate(params: {
-  state: ChannelIngressState;
+  state: NormalizedIngressState;
   policy: ChannelIngressPolicyInput;
 }): AccessGraphGate {
   const command = params.policy.command;
@@ -83,8 +100,16 @@ function commandGate(params: {
     };
   }
   const useAccessGroups = command.useAccessGroups ?? true;
-  const owner = applyMutableIdentifierPolicy(params.state.allowlists.commandOwner, params.policy);
-  const group = applyMutableIdentifierPolicy(params.state.allowlists.commandGroup, params.policy);
+  // Command authorization combines owner and group allowlists after authentication policy so
+  // command control cannot be granted by identifiers the current policy rejects.
+  const owner = applyIdentifierAuthenticationPolicy(
+    params.state.allowlists.commandOwner,
+    params.policy,
+  );
+  const group = applyIdentifierAuthenticationPolicy(
+    params.state.allowlists.commandGroup,
+    params.policy,
+  );
   const authorized = resolveCommandAuthorizedFromAuthorizers({
     useAccessGroups,
     modeWhenAccessGroupsOff: command.modeWhenAccessGroupsOff,
@@ -102,6 +127,12 @@ function commandGate(params: {
     allowed: authorized,
     reasonCode: shouldBlock ? "control_command_unauthorized" : "command_authorized",
     match: mergeCommandMatch(owner.match, group.match),
+    identifierAuthentication: {
+      evaluated: Boolean(owner.authentication?.evaluated || group.authentication?.evaluated),
+      affectedMatch: Boolean(
+        owner.authentication?.affectedMatch || group.authentication?.affectedMatch,
+      ),
+    },
     command: {
       useAccessGroups,
       allowTextCommands: command.allowTextCommands,
@@ -123,7 +154,8 @@ function mergeCommandMatch(
 }
 
 function eventGate(params: {
-  state: ChannelIngressState;
+  state: NormalizedIngressState;
+  policy: ChannelIngressPolicyInput;
   senderGate: AccessGraphGate;
   commandGate: AccessGraphGate;
 }): AccessGraphGate {
@@ -145,17 +177,34 @@ function eventGate(params: {
     return eventResult(true, "event_authorized");
   }
   if (authMode === "command") {
+    // Command-auth events, such as button or slash command callbacks, inherit the command gate
+    // result instead of re-checking the sender allowlist.
     return eventResult(
       params.commandGate.allowed,
       params.commandGate.allowed ? "event_authorized" : "event_unauthorized",
     );
   }
   if (authMode === "origin-subject") {
+    // Origin-subject mode is used for callbacks tied to a prior message/user identity.
     if (!params.state.event.hasOriginSubject) {
       return eventResult(false, "origin_subject_missing");
     }
-    const matched = params.state.event.originSubjectMatched;
-    return eventResult(matched, matched ? "event_authorized" : "origin_subject_not_matched");
+    const matched =
+      params.state.event.originSubjectMatched &&
+      meetsIdentifierAuthentication(
+        params.state.event.originSubjectAuthentication ?? DEFAULT_IDENTIFIER_AUTHENTICATION,
+        minimumIdentifierAuthenticationFrom(params.policy),
+      );
+    return {
+      ...eventResult(matched, matched ? "event_authorized" : "origin_subject_not_matched"),
+      identifierAuthentication: {
+        evaluated:
+          params.policy.minIdentifierAuthentication !== undefined ||
+          params.policy.mutableIdentifierMatching !== undefined ||
+          params.state.event.originSubjectAuthentication !== undefined,
+        affectedMatch: params.state.event.originSubjectMatched && !matched,
+      },
+    };
   }
   return eventResult(
     params.senderGate.allowed,
@@ -165,19 +214,18 @@ function eventGate(params: {
 
 function activationMetadata(params: {
   activation?: ChannelIngressPolicyInput["activation"];
-  mentionFacts: ChannelIngressState["mentionFacts"];
+  mentionFacts: NormalizedIngressState["mentionFacts"];
   shouldSkip: boolean;
   effectiveWasMentioned?: boolean;
   shouldBypassMention?: boolean;
 }) {
   const mentionFacts = params.mentionFacts;
+  const allowedImplicitMentionKinds = resolveAllowedImplicitMentionKinds(params.activation);
   return {
     hasMentionFacts: mentionFacts != null,
     requireMention: params.activation?.requireMention ?? false,
     allowTextCommands: params.activation?.allowTextCommands ?? false,
-    ...(params.activation?.allowedImplicitMentionKinds !== undefined
-      ? { allowedImplicitMentionKinds: params.activation.allowedImplicitMentionKinds }
-      : {}),
+    ...(allowedImplicitMentionKinds !== undefined ? { allowedImplicitMentionKinds } : {}),
     ...(params.activation?.order ? { order: params.activation.order } : {}),
     shouldSkip: params.shouldSkip,
     ...(mentionFacts?.canDetectMention !== undefined
@@ -201,13 +249,23 @@ function activationMetadata(params: {
   };
 }
 
+function resolveAllowedImplicitMentionKinds(activation: ChannelIngressPolicyInput["activation"]) {
+  return (
+    activation?.allowedImplicitMentionKinds ??
+    (activation?.implicitMentions
+      ? allowedImplicitMentionKindsFromConfig(activation.implicitMentions)
+      : undefined)
+  );
+}
+
 function activationGate(params: {
-  state: ChannelIngressState;
+  state: NormalizedIngressState;
   policy: ChannelIngressPolicyInput;
   commandGate: AccessGraphGate;
 }): AccessGraphGate {
   const activation = params.policy.activation;
   const mentionFacts = params.state.mentionFacts;
+  const allowedImplicitMentionKinds = resolveAllowedImplicitMentionKinds(activation);
   const activationResult = (input: {
     shouldSkip: boolean;
     effectiveWasMentioned?: boolean;
@@ -228,6 +286,7 @@ function activationGate(params: {
     }),
   });
   if (!activation || !mentionFacts) {
+    // Without activation policy or mention facts, sender/event authorization is enough.
     return activationResult({
       shouldSkip: false,
       effectiveWasMentioned:
@@ -240,7 +299,7 @@ function activationGate(params: {
     policy: {
       isGroup: params.state.conversationKind !== "direct",
       requireMention: activation.requireMention,
-      allowedImplicitMentionKinds: activation.allowedImplicitMentionKinds,
+      allowedImplicitMentionKinds,
       allowTextCommands: activation.allowTextCommands,
       hasControlCommand: params.policy.command?.hasControlCommand ?? false,
       commandAuthorized: params.commandGate.allowed,
@@ -254,7 +313,7 @@ function activationGate(params: {
 }
 
 export function decideChannelIngress(
-  state: ChannelIngressState,
+  state: NormalizedIngressState,
   policy: ChannelIngressPolicyInput,
 ): ChannelIngressDecision {
   const gates: AccessGraphGate[] = routeGates(state);
@@ -267,6 +326,8 @@ export function decideChannelIngress(
     return decisiveDecision({ admission: "drop", decision: "block", gate: routeBlock, gates });
   }
 
+  // Some channels want mention gating before sender checks so unmentioned room chatter can
+  // short-circuit without exposing sender allowlist diagnostics.
   const activationBeforeSender =
     policy.activation?.order === "before-sender" && !policy.activation.allowTextCommands
       ? activationGate({
@@ -291,6 +352,7 @@ export function decideChannelIngress(
     state.conversationKind === "direct"
       ? senderGateForDirect({ state, policy })
       : senderGateForGroup({ state, policy });
+  // Event auth mode can relax or tighten how sender gates affect non-message events.
   const eventModeSender = applyEventAuthModeToSenderGate({ state, senderGate: sender });
   gates.push(eventModeSender);
   if (!eventModeSender.allowed) {
@@ -307,7 +369,7 @@ export function decideChannelIngress(
     return decisiveDecision({ admission: "drop", decision: "block", gate: command, gates });
   }
 
-  const event = eventGate({ state, senderGate: eventModeSender, commandGate: command });
+  const event = eventGate({ state, policy, senderGate: eventModeSender, commandGate: command });
   gates.push(event);
   if (!event.allowed) {
     return decisiveDecision({ admission: "drop", decision: "block", gate: event, gates });

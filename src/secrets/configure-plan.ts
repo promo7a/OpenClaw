@@ -1,3 +1,4 @@
+/** Builds the interactive `openclaw secrets configure` target list and apply plan. */
 import { isDeepStrictEqual } from "node:util";
 import type { AuthProfileStore } from "../agents/auth-profiles/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -14,12 +15,13 @@ import {
   discoverConfigSecretTargets,
 } from "./target-registry.js";
 
+/** Credential target shown by `openclaw secrets configure` before a SecretRef is selected. */
 export type ConfigureCandidate = {
   type: string;
   path: string;
   pathSegments: string[];
   label: string;
-  configFile: "openclaw.json" | "auth-profiles.json";
+  configFile: "openclaw.json" | "auth-profile-store";
   expectedResolvedValue: "string" | "string-or-object";
   existingRef?: SecretRef;
   isDerived?: boolean;
@@ -29,11 +31,13 @@ export type ConfigureCandidate = {
   authProfileProvider?: string;
 };
 
-export type ConfigureSelectedTarget = ConfigureCandidate & {
+/** Configure candidate after the operator chooses the SecretRef to write. */
+type ConfigureSelectedTarget = ConfigureCandidate & {
   ref: SecretRef;
 };
 
-export type ConfigureProviderChanges = {
+/** Provider config mutations collected while building a secrets configure plan. */
+type ConfigureProviderChanges = {
   upserts: Record<string, SecretProviderConfig>;
   deletes: string[];
 };
@@ -45,12 +49,8 @@ function getSecretProviders(config: OpenClawConfig): Record<string, SecretProvid
   return config.secrets.providers;
 }
 
-export function buildConfigureCandidates(config: OpenClawConfig): ConfigureCandidate[] {
-  return buildConfigureCandidatesForScope({ config });
-}
-
 function configureCandidateSortKey(candidate: ConfigureCandidate): string {
-  if (candidate.configFile === "auth-profiles.json") {
+  if (candidate.configFile === "auth-profile-store") {
     const agentId = candidate.agentId ?? "";
     return `auth-profiles:${agentId}:${candidate.path}`;
   }
@@ -73,6 +73,7 @@ function resolveAuthProfileProvider(
   return provider.length > 0 ? provider : undefined;
 }
 
+/** Builds configure candidates for OpenClaw config plus an optional auth-profile scope. */
 export function buildConfigureCandidatesForScope(params: {
   config: OpenClawConfig;
   authoredOpenClawConfig?: OpenClawConfig;
@@ -98,6 +99,8 @@ export function buildConfigureCandidatesForScope(params: {
       const refPathExists = entry.refPathSegments
         ? hasPathInAuthoredConfig(entry.refPathSegments)
         : false;
+      // Generated/defaulted target paths are still configurable, but mark them derived so
+      // prompts can distinguish authored config from normalized aliases.
       return Object.assign(
         {
           type: entry.entry.targetType,
@@ -128,6 +131,7 @@ export function buildConfigureCandidatesForScope(params: {
               authProfiles.store,
               entry.pathSegments,
             );
+            // Auth-profile apply can create missing profiles only when the provider is known.
             const resolved = resolveSecretInputRef({
               value: entry.value,
               refValue: entry.refValue,
@@ -139,7 +143,7 @@ export function buildConfigureCandidatesForScope(params: {
                 path: entry.path,
                 pathSegments: [...entry.pathSegments],
                 label: `${entry.path} (auth profile, agent ${authProfiles.agentId})`,
-                configFile: `auth-profiles.json` as const,
+                configFile: `auth-profile-store` as const,
                 expectedResolvedValue: entry.entry.expectedResolvedValue,
               },
               resolved.ref ? { existingRef: resolved.ref } : {},
@@ -185,6 +189,7 @@ function hasPath(root: unknown, segments: string[]): boolean {
   return false;
 }
 
+/** Computes provider upserts/deletes between original and edited config. */
 export function collectConfigureProviderChanges(params: {
   original: OpenClawConfig;
   next: OpenClawConfig;
@@ -215,6 +220,7 @@ export function collectConfigureProviderChanges(params: {
   };
 }
 
+/** Returns true when selected targets or provider mutations would produce a plan. */
 export function hasConfigurePlanChanges(params: {
   selectedTargets: ReadonlyMap<string, ConfigureSelectedTarget>;
   providerChanges: ConfigureProviderChanges;
@@ -226,6 +232,7 @@ export function hasConfigurePlanChanges(params: {
   );
 }
 
+/** Builds the serializable secrets apply plan from configure selections. */
 export function buildSecretsConfigurePlan(params: {
   selectedTargets: ReadonlyMap<string, ConfigureSelectedTarget>;
   providerChanges: ConfigureProviderChanges;
@@ -259,7 +266,7 @@ export function buildSecretsConfigurePlan(params: {
     options: {
       scrubEnv: true,
       scrubAuthProfilesForProviderTargets: true,
-      scrubLegacyAuthJson: true,
+      scrubLegacyAuthJson: false,
     },
   };
 }

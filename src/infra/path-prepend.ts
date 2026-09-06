@@ -1,7 +1,9 @@
+// Prepends directories to PATH while preserving existing order.
 import path from "node:path";
 import {
   normalizeStringEntries,
   normalizeUniqueStringEntries,
+  normalizeUniqueTrimmedStringList,
 } from "@openclaw/normalization-core/string-normalization";
 
 /**
@@ -21,26 +23,12 @@ export function findPathKey(env: Record<string, string>): string {
   return "PATH";
 }
 
+/** Normalizes configured PATH prepends by trimming blanks and preserving first-seen order. */
 export function normalizePathPrepend(entries?: string[]) {
-  if (!Array.isArray(entries)) {
-    return [];
-  }
-  const seen = new Set<string>();
-  const normalized: string[] = [];
-  for (const entry of entries) {
-    if (typeof entry !== "string") {
-      continue;
-    }
-    const trimmed = entry.trim();
-    if (!trimmed || seen.has(trimmed)) {
-      continue;
-    }
-    seen.add(trimmed);
-    normalized.push(trimmed);
-  }
-  return normalized;
+  return normalizeUniqueTrimmedStringList(entries);
 }
 
+/** Merges prepended PATH entries ahead of the existing PATH while deduping normalized parts. */
 export function mergePathPrepend(existing: string | undefined, prepend: string[]) {
   if (prepend.length === 0) {
     return existing;
@@ -50,6 +38,7 @@ export function mergePathPrepend(existing: string | undefined, prepend: string[]
   );
 }
 
+/** Removes managed prepend entries from an existing PATH, including later duplicate copies. */
 export function removePathPrepend(
   existing: string | undefined,
   prepend: string[],
@@ -67,6 +56,7 @@ export function removePathPrepend(
   return remaining.join(path.delimiter);
 }
 
+/** Applies configured PATH prepends in-place, preserving Windows PATH key casing. */
 export function applyPathPrepend(
   env: Record<string, string>,
   prepend: string[] | undefined,

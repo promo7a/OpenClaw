@@ -1,3 +1,5 @@
+// Bound delivery router maps task-completion delivery back to active
+// conversation bindings, failing closed when requester context is ambiguous.
 import { normalizeConversationRef } from "./session-binding-normalization.js";
 import {
   getSessionBindingService,
@@ -7,7 +9,7 @@ import {
 } from "./session-binding-service.js";
 
 /** Session-bound delivery lookup input for routing task completion messages. */
-export type BoundDeliveryRouterInput = {
+type BoundDeliveryRouterInput = {
   eventKind: "task_completion";
   targetSessionKey: string;
   requester?: ConversationRef;
@@ -15,14 +17,14 @@ export type BoundDeliveryRouterInput = {
 };
 
 /** Resolved session binding or the fallback reason used by delivery callers. */
-export type BoundDeliveryRouterResult = {
+type BoundDeliveryRouterResult = {
   binding: SessionBindingRecord | null;
   mode: "bound" | "fallback";
   reason: string;
 };
 
 /** Router facade that maps a target session/requester pair to a bound conversation. */
-export type BoundDeliveryRouter = {
+type BoundDeliveryRouter = {
   resolveDestination: (input: BoundDeliveryRouterInput) => BoundDeliveryRouterResult;
 };
 

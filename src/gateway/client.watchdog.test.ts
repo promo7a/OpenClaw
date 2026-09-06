@@ -1,3 +1,5 @@
+// Gateway client watchdog tests ensure managed proxy mode does not block direct
+// loopback WebSocket connections needed by the OpenClaw wrapper.
 import { describe, expect, test, vi } from "vitest";
 import { WebSocketServer } from "ws";
 import { GatewayClient } from "./client.js";
@@ -35,7 +37,6 @@ describe("GatewayClient OpenClaw wrapper watchdog integration", () => {
 
     const { startProxy, stopProxy } = await import("../infra/net/proxy/proxy-lifecycle.js");
     const handle = await startProxy({
-      enabled: true,
       proxyUrl: "http://127.0.0.1:9",
       loopbackMode: "gateway-only",
     });

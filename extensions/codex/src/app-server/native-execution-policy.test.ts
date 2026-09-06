@@ -1,7 +1,25 @@
-import { describe, expect, it } from "vitest";
+// Codex tests cover native execution policy plugin behavior.
+import type { getSessionEntry as getSessionEntryType } from "openclaw/plugin-sdk/session-store-runtime";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveCodexNativeExecutionPolicy } from "./native-execution-policy.js";
 
+const sessionStoreMocks = vi.hoisted(() => ({
+  getSessionEntry: vi.fn<typeof getSessionEntryType>(),
+}));
+
+vi.mock("openclaw/plugin-sdk/session-store-runtime", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("openclaw/plugin-sdk/session-store-runtime")>();
+  return {
+    ...actual,
+    getSessionEntry: sessionStoreMocks.getSessionEntry,
+  };
+});
+
 describe("resolveCodexNativeExecutionPolicy", () => {
+  beforeEach(() => {
+    sessionStoreMocks.getSessionEntry.mockReset();
+  });
+
   it("allows Codex native execution for gateway exec hosts", () => {
     expect(
       resolveCodexNativeExecutionPolicy({
@@ -54,6 +72,8 @@ describe("resolveCodexNativeExecutionPolicy", () => {
       requestedExecHost: "node",
       effectiveExecHost: "node",
       node: "worker-1",
+      blockReason:
+        "OpenClaw exec host=node is active for this session. Codex app-server native execution cannot route shell, filesystem, MCP, or app-backed work through the selected OpenClaw node.",
     });
   });
 
@@ -87,12 +107,124 @@ describe("resolveCodexNativeExecutionPolicy", () => {
     });
   });
 
+  it("honors persisted default-session exec hosts with explicit main agent policy", () => {
+    sessionStoreMocks.getSessionEntry.mockReturnValue({
+      sessionId: "session-1",
+      updatedAt: 1,
+      execHost: "node",
+      execNode: "worker-5",
+    });
+
+    expect(
+      resolveCodexNativeExecutionPolicy({
+        config: { tools: { exec: { host: "gateway" } } },
+        sessionKey: "main",
+        agentId: "main",
+        readRuntimeSessionEntry: true,
+      }),
+    ).toMatchObject({
+      nativeToolSurfaceAllowed: false,
+      requestedExecHost: "node",
+      effectiveExecHost: "node",
+      node: "worker-5",
+    });
+    expect(sessionStoreMocks.getSessionEntry).toHaveBeenCalledWith({
+      sessionKey: "main",
+      agentId: "main",
+      hydrateSkillPromptRefs: false,
+    });
+  });
+
+  it("honors persisted unscoped exec hosts for the configured default agent", () => {
+    sessionStoreMocks.getSessionEntry.mockReturnValue({
+      sessionId: "session-1",
+      updatedAt: 1,
+      execHost: "node",
+      execNode: "worker-6",
+    });
+
+    expect(
+      resolveCodexNativeExecutionPolicy({
+        config: {
+          tools: { exec: { host: "gateway" } },
+          agents: { list: [{ id: "bot-a", default: true }] },
+        },
+        sessionKey: "node-session",
+        agentId: "bot-a",
+        readRuntimeSessionEntry: true,
+      }),
+    ).toMatchObject({
+      nativeToolSurfaceAllowed: false,
+      requestedExecHost: "node",
+      effectiveExecHost: "node",
+      node: "worker-6",
+    });
+    expect(sessionStoreMocks.getSessionEntry).toHaveBeenCalledWith({
+      sessionKey: "node-session",
+      agentId: "bot-a",
+      hydrateSkillPromptRefs: false,
+    });
+  });
+
+  it("does not read an unscoped session entry for an explicit multi-agent roster", () => {
+    sessionStoreMocks.getSessionEntry.mockReturnValue({
+      sessionId: "session-1",
+      updatedAt: 1,
+      execHost: "node",
+      execNode: "worker-6",
+    });
+
+    expect(
+      resolveCodexNativeExecutionPolicy({
+        config: {
+          tools: { exec: { host: "gateway" } },
+          agents: { entries: { alpha: {}, beta: {} } },
+        },
+        sessionKey: "node-session",
+        agentId: "alpha",
+        readRuntimeSessionEntry: true,
+      }),
+    ).toMatchObject({
+      nativeToolSurfaceAllowed: true,
+      requestedExecHost: "gateway",
+      effectiveExecHost: "gateway",
+    });
+    expect(sessionStoreMocks.getSessionEntry).not.toHaveBeenCalled();
+  });
+
+  it("uses global policy when an explicit multi-agent roster has no selected agent", () => {
+    sessionStoreMocks.getSessionEntry.mockReturnValue({
+      sessionId: "session-1",
+      updatedAt: 1,
+      execHost: "node",
+      execNode: "worker-6",
+    });
+
+    expect(
+      resolveCodexNativeExecutionPolicy({
+        config: {
+          tools: { exec: { host: "gateway" } },
+          agents: { entries: { alpha: {}, beta: {} } },
+        },
+        sessionKey: "node-session",
+        readRuntimeSessionEntry: true,
+      }),
+    ).toMatchObject({
+      nativeToolSurfaceAllowed: true,
+      requestedExecHost: "gateway",
+      effectiveExecHost: "gateway",
+    });
+    expect(sessionStoreMocks.getSessionEntry).not.toHaveBeenCalled();
+  });
+
   it("honors agent exec config before global exec config", () => {
     expect(
       resolveCodexNativeExecutionPolicy({
         config: {
           tools: { exec: { host: "gateway" } },
-          agents: { list: [{ id: "main", tools: { exec: { host: "node", node: "worker-4" } } }] },
+          agents: {
+            entries: { main: { tools: { exec: { host: "node", node: "worker-4" } } } },
+          },
         },
         sessionKey: "agent:main:session-1",
       }),

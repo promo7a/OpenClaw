@@ -1,9 +1,8 @@
+// Covers provider usage report formatting.
+
+import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it } from "vitest";
-import {
-  formatUsageReportLines,
-  formatUsageSummaryLine,
-  formatUsageWindowSummary,
-} from "./provider-usage.format.js";
+import { formatUsageReportLines, formatUsageWindowSummary } from "./provider-usage.format.js";
 import type { ProviderUsageSnapshot, UsageSummary } from "./provider-usage.types.js";
 
 const now = Date.UTC(2026, 0, 7, 12, 0, 0);
@@ -68,31 +67,6 @@ describe("provider-usage.format", () => {
     expect(summary).toBe("Over 0% left ⏱1m · Under 100% left");
   });
 
-  it("formats summary line from highest-usage window and provider cap", () => {
-    const summary: UsageSummary = {
-      updatedAt: now,
-      providers: [
-        {
-          provider: "anthropic",
-          displayName: "Claude",
-          windows: [
-            { label: "5h", usedPercent: 20 },
-            { label: "Week", usedPercent: 70 },
-          ],
-        },
-        {
-          provider: "zai",
-          displayName: "z.ai",
-          windows: [{ label: "Day", usedPercent: 10 }],
-        },
-      ],
-    };
-
-    expect(formatUsageSummaryLine(summary, { now, maxProviders: 1 })).toBe(
-      "📊 Usage: Claude 30% left (Week)",
-    );
-  });
-
   it("formats provider summary text for balance-only providers", () => {
     const summary: UsageSummary = {
       updatedAt: now,
@@ -106,33 +80,64 @@ describe("provider-usage.format", () => {
       ],
     };
 
-    expect(formatUsageWindowSummary(summary.providers[0], { now })).toBe("Balance ¥42.50");
-    expect(formatUsageSummaryLine(summary, { now })).toBe("📊 Usage: DeepSeek Balance ¥42.50");
+    expect(
+      formatUsageWindowSummary(
+        expectDefined(summary.providers[0], "summary.providers[0] test invariant"),
+        { now },
+      ),
+    ).toBe("Balance ¥42.50");
     expect(formatUsageReportLines(summary, { now })).toEqual([
       "Usage:",
       "  DeepSeek: Balance ¥42.50",
     ]);
   });
 
-  it("returns null summary line when providers are errored or have no windows", () => {
+  it("formats typed balances and budgets across compact and detailed surfaces", () => {
+    const summary: UsageSummary = {
+      updatedAt: now,
+      providers: [
+        {
+          provider: "openrouter",
+          displayName: "OpenRouter",
+          windows: [],
+          plan: "Production",
+          billing: [
+            { type: "balance", label: "Account balance", amount: 64.5, unit: "USD" },
+            {
+              type: "budget",
+              label: "API key budget",
+              used: 5,
+              limit: 20,
+              unit: "USD",
+            },
+          ],
+        },
+      ],
+    };
+
     expect(
-      formatUsageSummaryLine({
-        updatedAt: now,
-        providers: [
-          {
-            provider: "anthropic",
-            displayName: "Claude",
-            windows: [],
-            error: "HTTP 401",
-          },
-          {
-            provider: "zai",
-            displayName: "z.ai",
-            windows: [],
-          },
-        ],
+      formatUsageWindowSummary(
+        expectDefined(summary.providers[0], "summary.providers[0] test invariant"),
+        { now },
+      ),
+    ).toBe("Account balance: $64.50");
+    expect(formatUsageReportLines(summary, { now })).toEqual([
+      "Usage:",
+      "  OpenRouter (Production)",
+      "    Account balance: $64.50",
+      "    API key budget: $5.00 / $20.00",
+    ]);
+  });
+
+  it("places a negative currency sign before the symbol", () => {
+    expect(
+      formatUsageWindowSummary({
+        provider: "openrouter",
+        displayName: "OpenRouter",
+        windows: [],
+        billing: [{ type: "balance", amount: -2.5, unit: "USD" }],
       }),
-    ).toBeNull();
+    ).toBe("Balance: -$2.50");
   });
 
   it.each([

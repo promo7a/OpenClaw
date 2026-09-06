@@ -1,14 +1,17 @@
+// Coverage for sampling, token, and response-format extra parameter precedence.
 import type { StreamFn } from "openclaw/plugin-sdk/agent-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createLlmStreamSimpleMock } from "../../../test/helpers/agents/llm-stream-simple-mock.js";
 import {
-  testing as extraParamsTesting,
   applyExtraParamsToAgent,
   resolveExtraParams,
   resolvePreparedExtraParams,
 } from "./extra-params.js";
+import { testing as extraParamsTesting } from "./extra-params.test-support.js";
 
 vi.mock("./logger.js", () => ({
+  // Sampling tests assert call options only; silence warning/debug output from
+  // invalid or provider-specific extra params.
   log: {
     debug: vi.fn(),
     warn: vi.fn(),
@@ -123,6 +126,8 @@ describe("createStreamFnWithExtraParams sampling overrides", () => {
   });
 
   it("canonicalizes token aliases with config precedence before preparing stream params", () => {
+    // Canonicalization happens before provider preparation so plugins receive a
+    // single maxTokens field with agent-level precedence already applied.
     const resolved = resolveExtraParams({
       cfg: {
         agents: {
@@ -159,6 +164,8 @@ describe("createStreamFnWithExtraParams sampling overrides", () => {
   });
 
   it("lets runtime options override the wrapper sampling defaults", () => {
+    // Runtime call options are closest to the request and must beat configured
+    // defaults injected by the extra-params wrapper.
     const underlying = vi.fn(() => ({
       push: vi.fn(),
       result: vi.fn(async () => undefined),
@@ -231,7 +238,7 @@ describe("createStreamFnWithExtraParams sampling overrides", () => {
     expect(callOptions?.temperature).toBe(0.4);
   });
 
-  it("lets request responseFormat override configured response_format", () => {
+  it("threads a run-scoped responseFormat schema ahead of configured response_format", () => {
     const underlying = vi.fn(() => ({
       push: vi.fn(),
       result: vi.fn(async () => undefined),
@@ -241,6 +248,12 @@ describe("createStreamFnWithExtraParams sampling overrides", () => {
     })) as unknown as StreamFn;
     const agent: { streamFn?: StreamFn } = { streamFn: underlying };
 
+    const responseFormat = {
+      type: "object",
+      properties: { reply: { type: "string" } },
+      required: ["reply"],
+      additionalProperties: false,
+    };
     applyExtraParamsToAgent(
       agent,
       {
@@ -259,7 +272,7 @@ describe("createStreamFnWithExtraParams sampling overrides", () => {
       "openai",
       "gpt-5.4",
       {
-        responseFormat: { type: "json_object" },
+        responseFormat,
       },
     );
 
@@ -275,10 +288,10 @@ describe("createStreamFnWithExtraParams sampling overrides", () => {
 
     const callOptions = (underlying as unknown as { mock: { calls: unknown[][] } }).mock
       .calls[0]?.[2] as { responseFormat?: Record<string, unknown> } | undefined;
-    expect(callOptions?.responseFormat).toEqual({ type: "json_object" });
+    expect(callOptions?.responseFormat).toEqual(responseFormat);
   });
 
-  it("keeps request-scoped response_format out of prepared extra params cache", () => {
+  it("keeps request-scoped response_format out of prepared extra params", () => {
     const prepareProviderExtraParams = vi.fn((params) => ({
       ...params.context.extraParams,
       prepared: true,
@@ -315,14 +328,14 @@ describe("createStreamFnWithExtraParams sampling overrides", () => {
       },
     });
 
-    expect(prepareProviderExtraParams).toHaveBeenCalledTimes(1);
-    expect(first).toBe(second);
+    expect(prepareProviderExtraParams).toHaveBeenCalledTimes(2);
+    expect(first).toEqual(second);
     expect(first).not.toHaveProperty("response_format");
     expect(first).not.toHaveProperty("responseFormat");
     expect(first.temperature).toBe(0.4);
   });
 
-  it("keeps request-scoped stop out of prepared extra params cache", () => {
+  it("keeps request-scoped stop out of prepared extra params", () => {
     const prepareProviderExtraParams = vi.fn((params) => ({
       ...params.context.extraParams,
       prepared: true,
@@ -347,8 +360,8 @@ describe("createStreamFnWithExtraParams sampling overrides", () => {
       extraParamsOverride: { temperature: 0.4, stop: ["Assistant:", "\n\n"] },
     });
 
-    expect(prepareProviderExtraParams).toHaveBeenCalledTimes(1);
-    expect(first).toBe(second);
+    expect(prepareProviderExtraParams).toHaveBeenCalledTimes(2);
+    expect(first).toEqual(second);
     expect(first).not.toHaveProperty("stop");
     expect(first.temperature).toBe(0.4);
   });
@@ -471,4 +484,85 @@ describe("createStreamFnWithExtraParams sampling overrides", () => {
     expect(callOptions?.frequencyPenalty).toBe(0.9);
     expect(callOptions?.presencePenalty).toBe(0.7);
   });
+
+  it("preserves each request's dynamic fast mode override", () => {
+    const prepareProviderExtraParams = vi.fn((params) => ({
+      ...params.context.extraParams,
+      prepared: true,
+    }));
+    extraParamsTesting.setProviderRuntimeDepsForTest({
+      prepareProviderExtraParams,
+      resolveProviderExtraParamsForTransport: () => undefined,
+      wrapProviderStreamFn: () => undefined,
+    });
+
+    const cfg = { agents: { defaults: {} } } as never;
+    const firstFastMode = () => true;
+    const secondFastMode = () => false;
+    const first = resolvePreparedExtraParams({
+      cfg,
+      provider: "openai",
+      modelId: "gpt-5.4",
+      extraParamsOverride: { fastMode: firstFastMode },
+    });
+    const second = resolvePreparedExtraParams({
+      cfg,
+      provider: "openai",
+      modelId: "gpt-5.4",
+      extraParamsOverride: { fastMode: secondFastMode },
+    });
+
+    expect(prepareProviderExtraParams).toHaveBeenCalledTimes(2);
+    expect(first).not.toBe(second);
+    expect(first.fastMode).toBe(firstFastMode);
+    expect(second.fastMode).toBe(secondFastMode);
+  });
+
+  it.each([
+    { requestRetention: undefined, expected: "long", name: "own undefined" },
+    { requestRetention: "none" as const, expected: "none", name: "explicit none" },
+    { requestRetention: "short" as const, expected: "short", name: "explicit short" },
+    { requestRetention: "long" as const, expected: "long", name: "explicit long" },
+  ])(
+    "merges configured cache retention with $name request options",
+    ({ requestRetention, expected }) => {
+      const underlying = vi.fn(() => ({
+        push: vi.fn(),
+        result: vi.fn(async () => undefined),
+        [Symbol.asyncIterator]: vi.fn(async function* () {
+          // empty stream
+        }),
+      })) as unknown as StreamFn;
+      const agent: { streamFn?: StreamFn } = { streamFn: underlying };
+
+      applyExtraParamsToAgent(
+        agent,
+        undefined,
+        "anthropic",
+        "claude-sonnet-5",
+        { cacheRetention: "long" },
+        undefined,
+        undefined,
+        undefined,
+        { supportsPromptCacheKey: true } as never,
+      );
+
+      if (!agent.streamFn) {
+        throw new Error("expected extra params to wrap streamFn");
+      }
+
+      const requestOptions = { cacheRetention: requestRetention };
+      expect(requestOptions).toHaveProperty("cacheRetention");
+      void agent.streamFn(
+        { id: "claude-sonnet-5", api: "anthropic-messages", provider: "anthropic" } as never,
+        { messages: [], tools: [] } as never,
+        requestOptions,
+      );
+
+      expect(underlying).toHaveBeenCalledTimes(1);
+      const callOptions = (underlying as unknown as { mock: { calls: unknown[][] } }).mock
+        .calls[0]?.[2] as { cacheRetention?: string } | undefined;
+      expect(callOptions?.cacheRetention).toBe(expected);
+    },
+  );
 });

@@ -1,3 +1,4 @@
+// Discord plugin module implements agent components.modal behavior.
 import { logError } from "openclaw/plugin-sdk/logging-core";
 import { parseDiscordModalCustomIdForInteraction } from "../component-custom-id.js";
 import { resolveDiscordModalEntryWithPersistence } from "../components-registry.js";
@@ -7,6 +8,7 @@ import {
   ensureComponentUserAllowed,
   formatModalSubmissionText,
   parseDiscordModalId,
+  replyUnavailableComponentInteraction,
   resolveAuthorizedComponentInteraction,
   resolveInteractionCustomId,
   resolveModalFieldValues,
@@ -30,14 +32,7 @@ export class DiscordComponentModal extends Modal {
     const modalId = parseDiscordModalId(data, resolveInteractionCustomId(interaction));
     if (!modalId) {
       logError("discord component modal: missing modal id");
-      try {
-        await interaction.reply({
-          content: "This form is no longer valid.",
-          ephemeral: true,
-        });
-      } catch {
-        // Interaction may have expired
-      }
+      await replyUnavailableComponentInteraction(interaction, "This form is no longer valid.");
       return;
     }
 
@@ -46,14 +41,7 @@ export class DiscordComponentModal extends Modal {
       consume: false,
     });
     if (!modalEntry) {
-      try {
-        await interaction.reply({
-          content: "This form has expired.",
-          ephemeral: true,
-        });
-      } catch {
-        // Interaction may have expired
-      }
+      await replyUnavailableComponentInteraction(interaction, "This form has expired.");
       return;
     }
 
@@ -102,14 +90,7 @@ export class DiscordComponentModal extends Modal {
       consume: !modalEntry.reusable,
     });
     if (!consumed) {
-      try {
-        await interaction.reply({
-          content: "This form has expired.",
-          ephemeral: true,
-        });
-      } catch {
-        // Interaction may have expired
-      }
+      await replyUnavailableComponentInteraction(interaction, "This form has expired.");
       return;
     }
 

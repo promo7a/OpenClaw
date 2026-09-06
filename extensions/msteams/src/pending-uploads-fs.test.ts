@@ -1,7 +1,13 @@
+// Msteams tests cover pending uploads fs plugin behavior.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
+import type { OpenKeyedStoreOptions } from "openclaw/plugin-sdk/plugin-state-runtime";
+import {
+  createPluginStateKeyedStoreForTests,
+  openOpenClawStateDatabase,
+  resetPluginStateStoreForTests,
+} from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { prepareFileConsentActivityFs } from "./file-consent-helpers.js";
 import {
@@ -10,7 +16,6 @@ import {
   setPendingUploadActivityIdFs,
   storePendingUploadFs,
 } from "./pending-uploads-fs.js";
-import { clearPendingUploads } from "./pending-uploads.js";
 import { setMSTeamsRuntime } from "./runtime.js";
 import { msteamsRuntimeStub } from "./test-support/runtime.js";
 
@@ -53,7 +58,6 @@ describe("msteams pending uploads (fs-backed)", () => {
   beforeEach(() => {
     resetPluginStateStoreForTests();
     setMSTeamsRuntime(msteamsRuntimeStub);
-    clearPendingUploads();
   });
 
   afterEach(async () => {
@@ -110,9 +114,7 @@ describe("msteams pending uploads (fs-backed)", () => {
     // Confirm SQLite-backed plugin state was created instead of a new JSON store.
     const storePath = path.join(stateDir, "msteams-pending-uploads.json");
     await expect(fs.promises.access(storePath)).rejects.toThrow();
-    await expect(
-      fs.promises.access(path.join(stateDir, "state", "openclaw.sqlite")),
-    ).resolves.toBeUndefined();
+    await fs.promises.access(path.join(stateDir, "state", "openclaw.sqlite"));
 
     // Second "process": reader using the same state dir
     const reader = await getPendingUploadFs("upload-x", { env });
@@ -120,7 +122,22 @@ describe("msteams pending uploads (fs-backed)", () => {
     expect(reader?.filename).toBe("secret.bin");
   });
 
-  it("stores multi-megabyte uploads by chunking payload bytes", async () => {
+  it.each(["bulk", "legacy"])("stores multi-megabyte uploads with %s host reads", async (mode) => {
+    if (mode === "legacy") {
+      setMSTeamsRuntime({
+        ...msteamsRuntimeStub,
+        state: {
+          ...msteamsRuntimeStub.state,
+          openKeyedStore: <T>(options: OpenKeyedStoreOptions) => {
+            const { lookupMany: _lookupMany, ...store } = createPluginStateKeyedStoreForTests<T>(
+              "msteams",
+              options,
+            );
+            return store;
+          },
+        },
+      });
+    }
     const stateDir = await makeTempStateDir();
     const env = makeEnv(stateDir);
     const payload = Buffer.alloc(6 * 1024 * 1024, 7);
@@ -138,6 +155,30 @@ describe("msteams pending uploads (fs-backed)", () => {
     const reader = await getPendingUploadFs("upload-large", { env });
     expect(reader?.buffer.equals(payload)).toBe(true);
     expect(reader?.filename).toBe("large.bin");
+    const chunks = createPluginStateKeyedStoreForTests<{
+      id: string;
+      index: number;
+      dataBase64: string;
+    }>("msteams", { namespace: "pending-upload-chunks", maxEntries: 45_000, env });
+    const rows = await chunks.entries();
+    const first = rows.find((row) => row.value.index === 0);
+    const later = rows.find((row) => row.value.index === 1);
+    if (!first || !later) {
+      throw new Error("expected upload chunks");
+    }
+    const { db } = openOpenClawStateDatabase({ env });
+    db.prepare("UPDATE plugin_state_entries SET value_json = ? WHERE entry_key = ?").run(
+      "invalid JSON",
+      later.key,
+    );
+    await chunks.register(first.key, { ...first.value, id: "wrong-upload" });
+    await expect(getPendingUploadFs("upload-large", { env })).resolves.toBeUndefined();
+    await chunks.delete(first.key);
+    await expect(getPendingUploadFs("upload-large", { env })).resolves.toBeUndefined();
+    await chunks.register(first.key, first.value);
+    await expect(getPendingUploadFs("upload-large", { env })).rejects.toMatchObject({
+      code: "PLUGIN_STATE_CORRUPT",
+    });
   });
 
   it("removes persisted entries", async () => {
@@ -212,58 +253,7 @@ describe("msteams pending uploads (fs-backed)", () => {
     expect(loaded?.consentCardActivityId).toBe("activity-xyz");
   });
 
-  it("ignores malformed or empty store files and returns undefined", async () => {
-    const stateDir = await makeTempStateDir();
-    const env = makeEnv(stateDir);
-    const storePath = path.join(stateDir, "msteams-pending-uploads.json");
-    await fs.promises.writeFile(storePath, "not valid json", "utf-8");
-
-    // Should not throw and should treat as empty
-    expect(await getPendingUploadFs("anything", { env })).toBeUndefined();
-    await expect(fs.promises.access(storePath)).rejects.toThrow();
-
-    const secondStateDir = await makeTempStateDir();
-    const secondEnv = makeEnv(secondStateDir);
-    const secondStorePath = path.join(secondStateDir, "msteams-pending-uploads.json");
-    await fs.promises.writeFile(
-      secondStorePath,
-      JSON.stringify({ version: 2, uploads: {} }),
-      "utf-8",
-    );
-    expect(await getPendingUploadFs("anything", { env: secondEnv })).toBeUndefined();
-    await expect(fs.promises.access(secondStorePath)).rejects.toThrow();
-  });
-
-  it("imports a legacy JSON file that appears after an empty migration marker", async () => {
-    const stateDir = await makeTempStateDir();
-    const env = makeEnv(stateDir);
-    const storePath = path.join(stateDir, "msteams-pending-uploads.json");
-
-    expect(await getPendingUploadFs("upload-late", { env })).toBeUndefined();
-    await fs.promises.writeFile(
-      storePath,
-      `${JSON.stringify({
-        version: 1,
-        uploads: {
-          "upload-late": {
-            id: "upload-late",
-            bufferBase64: Buffer.from("late payload").toString("base64"),
-            filename: "late.txt",
-            conversationId: "19:conv@thread.v2",
-            createdAt: Date.now(),
-          },
-        },
-      })}\n`,
-      "utf-8",
-    );
-
-    const loaded = await getPendingUploadFs("upload-late", { env });
-    expect(loaded?.filename).toBe("late.txt");
-    expect(loaded?.buffer.toString("utf8")).toBe("late payload");
-    await expect(fs.promises.access(storePath)).rejects.toThrow();
-  });
-
-  it("skips malformed legacy upload rows while importing valid rows", async () => {
+  it("ignores legacy pending-upload JSON cache files at runtime", async () => {
     const stateDir = await makeTempStateDir();
     const env = makeEnv(stateDir);
     const storePath = path.join(stateDir, "msteams-pending-uploads.json");
@@ -272,16 +262,10 @@ describe("msteams pending uploads (fs-backed)", () => {
       `${JSON.stringify({
         version: 1,
         uploads: {
-          broken: {
-            id: "broken",
-            filename: "broken.txt",
-            conversationId: "19:conv@thread.v2",
-            createdAt: Date.now(),
-          },
-          valid: {
-            id: "valid",
-            bufferBase64: Buffer.from("valid payload").toString("base64"),
-            filename: "valid.txt",
+          cached: {
+            id: "cached",
+            bufferBase64: Buffer.from("cached payload").toString("base64"),
+            filename: "cached.txt",
             conversationId: "19:conv@thread.v2",
             createdAt: Date.now(),
           },
@@ -290,9 +274,8 @@ describe("msteams pending uploads (fs-backed)", () => {
       "utf-8",
     );
 
-    expect(await getPendingUploadFs("broken", { env })).toBeUndefined();
-    const loaded = await getPendingUploadFs("valid", { env });
-    expect(loaded?.buffer.toString("utf8")).toBe("valid payload");
+    expect(await getPendingUploadFs("cached", { env })).toBeUndefined();
+    await fs.promises.access(storePath);
   });
 });
 
@@ -300,7 +283,6 @@ describe("prepareFileConsentActivityFs end-to-end", () => {
   beforeEach(() => {
     resetPluginStateStoreForTests();
     setMSTeamsRuntime(msteamsRuntimeStub);
-    clearPendingUploads();
   });
 
   afterEach(async () => {

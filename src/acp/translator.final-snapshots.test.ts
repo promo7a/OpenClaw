@@ -1,3 +1,4 @@
+/** Tests final Gateway snapshots are emitted before ACP prompt resolution. */
 import { createInMemorySessionStore } from "@openclaw/acp-core/session";
 import { describe, expect, it, vi } from "vitest";
 import type { EventFrame } from "../../packages/gateway-protocol/src/index.js";
@@ -60,12 +61,10 @@ describe("acp final chat snapshots", () => {
       },
     });
     expect(sessionStore.getSession("snapshot-session")?.activeRunId).toBeNull();
-    sessionStore.clearAllSessionsForTest();
   });
 
   it("does not duplicate text when final repeats the last delta snapshot", async () => {
-    const { agent, sessionUpdate, promptPromise, runId, sessionStore } =
-      await createSnapshotHarness();
+    const { agent, sessionUpdate, promptPromise, runId } = await createSnapshotHarness();
 
     await agent.handleGatewayEvent({
       event: "chat",
@@ -100,12 +99,10 @@ describe("acp final chat snapshots", () => {
           "agent_message_chunk",
     );
     expect(chunks).toHaveLength(1);
-    sessionStore.clearAllSessionsForTest();
   });
 
   it("emits only the missing tail when the final snapshot extends prior deltas", async () => {
-    const { agent, sessionUpdate, promptPromise, runId, sessionStore } =
-      await createSnapshotHarness();
+    const { agent, sessionUpdate, promptPromise, runId } = await createSnapshotHarness();
 
     await agent.handleGatewayEvent({
       event: "chat",
@@ -147,6 +144,5 @@ describe("acp final chat snapshots", () => {
         content: { type: "text", text: " world" },
       },
     });
-    sessionStore.clearAllSessionsForTest();
   });
 });

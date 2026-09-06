@@ -1,51 +1,8 @@
-import type {
-  DetachedTaskLifecycleRuntime,
-  DetachedTaskLifecycleRuntimeRegistration,
-} from "./detached-task-runtime-contract.js";
-
-export type { DetachedTaskLifecycleRuntime, DetachedTaskLifecycleRuntimeRegistration };
-
-let detachedTaskLifecycleRuntimeRegistration: DetachedTaskLifecycleRuntimeRegistration | undefined;
-
-export function registerDetachedTaskLifecycleRuntime(
-  pluginId: string,
-  runtime: DetachedTaskLifecycleRuntime,
-): void {
-  detachedTaskLifecycleRuntimeRegistration = {
-    pluginId,
-    runtime,
-  };
-}
-
-export function getDetachedTaskLifecycleRuntimeRegistration():
-  | DetachedTaskLifecycleRuntimeRegistration
-  | undefined {
-  if (!detachedTaskLifecycleRuntimeRegistration) {
-    return undefined;
-  }
-  return {
-    pluginId: detachedTaskLifecycleRuntimeRegistration.pluginId,
-    runtime: detachedTaskLifecycleRuntimeRegistration.runtime,
-  };
-}
+import { requireActivePluginRegistry } from "../plugins/runtime.js";
+import type { DetachedTaskLifecycleRuntime } from "./detached-task-runtime-contract.js";
 
 export function getRegisteredDetachedTaskLifecycleRuntime():
   | DetachedTaskLifecycleRuntime
   | undefined {
-  return detachedTaskLifecycleRuntimeRegistration?.runtime;
-}
-
-export function restoreDetachedTaskLifecycleRuntimeRegistration(
-  registration: DetachedTaskLifecycleRuntimeRegistration | undefined,
-): void {
-  detachedTaskLifecycleRuntimeRegistration = registration
-    ? {
-        pluginId: registration.pluginId,
-        runtime: registration.runtime,
-      }
-    : undefined;
-}
-
-export function clearDetachedTaskLifecycleRuntimeRegistration(): void {
-  detachedTaskLifecycleRuntimeRegistration = undefined;
+  return requireActivePluginRegistry().detachedTaskRuntimes[0]?.runtime;
 }

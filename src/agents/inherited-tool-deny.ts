@@ -1,6 +1,9 @@
+/**
+ * Normalizes inherited tool allow/deny lists and ACP compatibility errors.
+ */
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
-import { isToolAllowedByPolicyName } from "./tool-policy-match.js";
-import { normalizeToolName } from "./tool-policy-shared.js";
+import { createToolPolicyMatcher } from "./tool-policy-match.js";
+import { normalizeToolPolicyName } from "./tool-policy-shared.js";
 
 const ACP_UNSUPPORTED_INHERITED_TOOL_DENY = [
   "apply_patch",
@@ -34,7 +37,7 @@ export function normalizeInheritedToolDenylist(value: unknown): string[] {
   }
   return uniqueStrings(
     value.flatMap((entry) => {
-      const normalized = typeof entry === "string" ? normalizeToolName(entry) : "";
+      const normalized = typeof entry === "string" ? normalizeToolPolicyName(entry) : "";
       return normalized ? [normalized] : [];
     }),
   );
@@ -59,9 +62,8 @@ export function findAcpUnsupportedInheritedToolDeny(value: unknown): string | un
   if (inheritedToolDeny.length === 0) {
     return undefined;
   }
-  return ACP_UNSUPPORTED_INHERITED_TOOL_DENY.find(
-    (toolName) => !isToolAllowedByPolicyName(toolName, { deny: inheritedToolDeny }),
-  );
+  const matches = createToolPolicyMatcher({ deny: inheritedToolDeny });
+  return ACP_UNSUPPORTED_INHERITED_TOOL_DENY.find((toolName) => !matches(toolName));
 }
 
 export function findAcpUnsupportedInheritedToolAllow(value: unknown): string | undefined {
@@ -69,9 +71,8 @@ export function findAcpUnsupportedInheritedToolAllow(value: unknown): string | u
   if (inheritedToolAllow.length === 0) {
     return undefined;
   }
-  return ACP_REQUIRED_INHERITED_TOOL_ALLOW.find(
-    (toolName) => !isToolAllowedByPolicyName(toolName, { allow: inheritedToolAllow }),
-  );
+  const matches = createToolPolicyMatcher({ allow: inheritedToolAllow });
+  return ACP_REQUIRED_INHERITED_TOOL_ALLOW.find((toolName) => !matches(toolName));
 }
 
 export function formatAcpInheritedToolDenyError(toolName: string): string {

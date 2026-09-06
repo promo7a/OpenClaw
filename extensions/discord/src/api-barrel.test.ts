@@ -1,3 +1,4 @@
+// Discord tests cover api barrel plugin behavior.
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -65,7 +66,6 @@ describe("discord API barrel", () => {
       "buildDiscordComponentMessageFlags",
       "createDiscordFormModal",
       "handleDiscordMessageAction",
-      "handleDiscordSubagentSpawning",
       "listEnabledDiscordAccounts",
       "parseDiscordComponentCustomIdForCarbon",
       "parseDiscordModalCustomIdForCarbon",

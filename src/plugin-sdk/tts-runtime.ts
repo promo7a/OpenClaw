@@ -1,3 +1,7 @@
+// TTS runtime exports expose host-owned text-to-speech helpers through the plugin SDK.
+export { maybeApplyTtsToPayload, textToSpeech } from "../tts/tts.js";
+export type { TtsResult } from "../tts/tts-runtime-types.js";
+
 export {
   TtsAutoSchema,
   TtsConfigSchema,
@@ -5,6 +9,7 @@ export {
   TtsProviderSchema,
 } from "../config/zod-schema.core.js";
 
+/** Compatibility no-op retained for callers that prewarm facade runtimes generically. */
 export function prewarmTtsRuntimeFacade(): void {}
 
 export {
@@ -19,7 +24,6 @@ export {
   isTtsProviderConfigured,
   listSpeechVoices,
   listTtsPersonas,
-  maybeApplyTtsToPayload,
   resolveExplicitTtsOverrides,
   resolveTtsAutoMode,
   resolveTtsConfig,
@@ -34,7 +38,6 @@ export {
   setTtsProvider,
   synthesizeSpeech,
   streamSpeech,
-  textToSpeech,
   textToSpeechStream,
   textToSpeechTelephony,
   testApi,
@@ -43,9 +46,8 @@ export {
   type ResolvedTtsModelOverrides,
   type TtsDirectiveOverrides,
   type TtsDirectiveParseResult,
-  type TtsResult,
   type TtsSynthesisResult,
   type TtsSynthesisStreamResult,
   type TtsStreamResult,
   type TtsTelephonyResult,
-} from "../../packages/speech-core/runtime-api.js";
+} from "../tts/runtime-api.js";

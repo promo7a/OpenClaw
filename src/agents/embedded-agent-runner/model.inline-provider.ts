@@ -1,17 +1,26 @@
+/**
+ * Converts inline provider model config into runtime model definitions.
+ */
 import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import type { ModelDefinitionConfig, ModelProviderConfig } from "../../config/types.js";
 import { normalizeGoogleApiBaseUrl } from "../../infra/google-api-base-url.js";
 import type { Api } from "../../llm/types.js";
+import type { PluginMetadataSnapshotOwnerMaps } from "../../plugins/plugin-metadata-snapshot.types.js";
 import { isSecretRefHeaderValueMarker } from "../model-auth-markers.js";
 import { attachModelProviderLocalService } from "../provider-local-service.js";
 import {
+  attachModelProviderRequestRouteFacts,
   attachModelProviderRequestTransport,
   resolveProviderRequestConfig,
   sanitizeConfiguredModelProviderRequest,
 } from "../provider-request-config.js";
 
-export type InlineModelEntry = Omit<ModelDefinitionConfig, "api"> & {
+/**
+ * Normalizes inline `models.providers` config into runtime model entries.
+ */
+export type InlineModelEntry = Omit<ModelDefinitionConfig, "api" | "contextWindow"> & {
   api?: Api;
+  contextWindow?: number;
   provider: string;
   baseUrl?: string;
   headers?: Record<string, string>;
@@ -21,8 +30,6 @@ export type InlineProviderConfig = {
   baseUrl?: string;
   api?: ModelDefinitionConfig["api"];
   models?: ModelDefinitionConfig[];
-  contextWindow?: ModelProviderConfig["contextWindow"];
-  contextTokens?: ModelProviderConfig["contextTokens"];
   maxTokens?: ModelProviderConfig["maxTokens"];
   params?: ModelProviderConfig["params"];
   headers?: unknown;
@@ -32,6 +39,7 @@ export type InlineProviderConfig = {
   localService?: ModelProviderConfig["localService"];
 };
 
+/** Returns a supported transport API id from raw config values. */
 export function normalizeResolvedTransportApi(
   api: unknown,
 ): ModelDefinitionConfig["api"] | undefined {
@@ -52,6 +60,7 @@ export function normalizeResolvedTransportApi(
   }
 }
 
+/** Sanitizes configured provider/model headers before they enter runtime model metadata. */
 export function sanitizeModelHeaders(
   headers: unknown,
   opts?: { stripSecretRefMarkers?: boolean },
@@ -65,6 +74,8 @@ export function sanitizeModelHeaders(
       continue;
     }
     if (opts?.stripSecretRefMarkers && isSecretRefHeaderValueMarker(headerValue)) {
+      // Catalog/runtime model records are inspectable. Secret-ref markers are resolved later during
+      // auth setup, so inline provider discovery must not expose them as literal headers.
       continue;
     }
     next[headerName] = headerValue;
@@ -94,6 +105,7 @@ function isLegacyFoundryVisionModelCandidate(params: {
   );
 }
 
+/** Resolves model input modalities with Foundry legacy vision-model compatibility. */
 export function resolveProviderModelInput(params: {
   provider?: string;
   modelId?: string;
@@ -127,8 +139,10 @@ function resolveInlineProviderTransport(params: { api?: Api | null; baseUrl?: st
   };
 }
 
+/** Builds runtime model records from inline provider config. */
 export function buildInlineProviderModels(
   providers: Record<string, InlineProviderConfig>,
+  options: { providerMetadataOwners?: PluginMetadataSnapshotOwnerMaps } = {},
 ): InlineModelEntry[] {
   return Object.entries(providers).flatMap(([providerId, entry]) => {
     const trimmed = providerId.trim();
@@ -151,6 +165,9 @@ export function buildInlineProviderModels(
         provider: trimmed,
         api: transport.api ?? model.api,
         baseUrl: transport.baseUrl,
+        ...(options.providerMetadataOwners
+          ? { providerMetadataOwners: options.providerMetadataOwners }
+          : {}),
         providerHeaders,
         modelHeaders,
         authHeader: entry?.authHeader,
@@ -158,27 +175,29 @@ export function buildInlineProviderModels(
         capability: "llm",
         transport: "stream",
       });
-      return attachModelProviderLocalService(
-        attachModelProviderRequestTransport(
-          {
-            ...model,
-            contextWindow: model.contextWindow ?? entry?.contextWindow,
-            contextTokens: model.contextTokens ?? entry?.contextTokens,
-            maxTokens: model.maxTokens ?? entry?.maxTokens,
-            input: resolveProviderModelInput({
+      const maxTokens = model.maxTokens ?? entry?.maxTokens;
+      return attachModelProviderRequestRouteFacts(
+        attachModelProviderLocalService(
+          attachModelProviderRequestTransport(
+            {
+              ...model,
+              ...(maxTokens !== undefined ? { maxTokens } : {}),
+              input: resolveProviderModelInput({
+                provider: trimmed,
+                modelId: model.id,
+                modelName: model.name,
+                input: model.input,
+              }),
               provider: trimmed,
-              modelId: model.id,
-              modelName: model.name,
-              input: model.input,
-            }),
-            provider: trimmed,
-            baseUrl: requestConfig.baseUrl ?? transport.baseUrl,
-            api: requestConfig.api ?? model.api,
-            headers: requestConfig.headers,
-          },
-          providerRequest,
+              baseUrl: requestConfig.baseUrl ?? transport.baseUrl,
+              api: requestConfig.api ?? model.api,
+              headers: requestConfig.headers,
+            },
+            providerRequest,
+          ),
+          entry?.localService,
         ),
-        entry?.localService,
+        options.providerMetadataOwners,
       );
     });
   });

@@ -1,7 +1,6 @@
+// Xai helper module supports tool config shared behavior.
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { normalizeXaiModelId } from "../model-id.js";
-
-export { isRecord };
 
 export function coerceXaiToolConfig(
   config: Record<string, unknown> | undefined,

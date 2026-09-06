@@ -1,3 +1,4 @@
+// Help cold import tests cover root help output without loading heavy command modules.
 import { Command } from "commander";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -19,10 +20,10 @@ vi.mock("./gateway-cli/run.js", () => {
   };
 });
 
-vi.mock("./gateway-cli/call.js", () => {
+vi.mock("./gateway-rpc.runtime.js", () => {
   loaded.mark("gateway-call-runtime");
   return {
-    callGatewayCli: vi.fn(async () => ({})),
+    callGatewayFromCliRuntime: vi.fn(async () => ({})),
   };
 });
 
@@ -101,14 +102,6 @@ vi.mock("../commands/export-trajectory.js", () => {
   return { exportTrajectoryCommand: vi.fn(async () => {}) };
 });
 
-vi.mock("../commands/commitments.js", () => {
-  loaded.mark("commitments-command");
-  return {
-    commitmentsDismissCommand: vi.fn(async () => {}),
-    commitmentsListCommand: vi.fn(async () => {}),
-  };
-});
-
 vi.mock("../commands/tasks.js", () => {
   loaded.mark("tasks-command");
   return {
@@ -153,6 +146,11 @@ vi.mock("../commands/setup.js", () => {
 vi.mock("../commands/agent-via-gateway.js", () => {
   loaded.mark("agent-via-gateway-command");
   return { agentCliCommand: vi.fn(async () => {}) };
+});
+
+vi.mock("../commands/agent-exec.js", () => {
+  loaded.mark("agent-exec-command");
+  return { agentExecCommand: vi.fn(async () => {}) };
 });
 
 vi.mock("../commands/agents.commands.add.js", () => {
@@ -279,7 +277,6 @@ describe("subcommand help cold imports", () => {
     expect(loaded.modules).not.toContain("sessions-command");
     expect(loaded.modules).not.toContain("sessions-cleanup-command");
     expect(loaded.modules).not.toContain("export-trajectory-command");
-    expect(loaded.modules).not.toContain("commitments-command");
     expect(loaded.modules).not.toContain("tasks-command");
     expect(loaded.modules).not.toContain("flows-command");
   });
@@ -319,21 +316,27 @@ describe("subcommand help cold imports", () => {
     expect(loaded.modules).not.toContain("default-runtime");
   });
 
-  it("keeps agents help out of agent action modules", async () => {
-    const { registerAgentCommands } = await import("./program/register.agent.js");
-    const program = makeProgram();
+  it.each(["agent", "agent exec", "agents"])(
+    "keeps %s help out of agent action modules",
+    async (command) => {
+      const { registerAgentsCommands } = await import("./program/register.agent.js");
+      const { registerAgentTurnCommand } = await import("./program/register.agent-turn.js");
+      const program = makeProgram();
 
-    registerAgentCommands(program, { agentChannelOptions: "last|telegram|discord" });
-    await expectHelpExit(program, ["agents", "--help"]);
+      registerAgentTurnCommand(program, { agentChannelOptions: "last|telegram|discord" });
+      registerAgentsCommands(program);
+      await expectHelpExit(program, [...command.split(" "), "--help"]);
 
-    expect(loaded.modules).not.toContain("agent-via-gateway-command");
-    expect(loaded.modules).not.toContain("agents-add-command");
-    expect(loaded.modules).not.toContain("agents-bind-command");
-    expect(loaded.modules).not.toContain("agents-delete-command");
-    expect(loaded.modules).not.toContain("agents-identity-command");
-    expect(loaded.modules).not.toContain("agents-list-command");
-    expect(loaded.modules).not.toContain("default-runtime");
-  });
+      expect(loaded.modules).not.toContain("agent-via-gateway-command");
+      expect(loaded.modules).not.toContain("agent-exec-command");
+      expect(loaded.modules).not.toContain("agents-add-command");
+      expect(loaded.modules).not.toContain("agents-bind-command");
+      expect(loaded.modules).not.toContain("agents-delete-command");
+      expect(loaded.modules).not.toContain("agents-identity-command");
+      expect(loaded.modules).not.toContain("agents-list-command");
+      expect(loaded.modules).not.toContain("default-runtime");
+    },
+  );
 
   it("keeps secrets help out of secrets action modules", async () => {
     const { registerSecretsCli } = await import("./secrets-cli.js");

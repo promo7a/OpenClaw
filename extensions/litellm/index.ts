@@ -1,3 +1,4 @@
+// Litellm plugin entrypoint registers its OpenClaw integration.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   definePluginEntry,
@@ -8,7 +9,7 @@ import {
   createProviderApiKeyAuthMethod,
   normalizeOptionalSecretInput,
 } from "openclaw/plugin-sdk/provider-auth";
-import { buildSingleProviderApiKeyCatalog } from "openclaw/plugin-sdk/provider-catalog-shared";
+import { buildOpenAICompatibleProviderCatalog } from "openclaw/plugin-sdk/provider-catalog-live-runtime";
 import { buildLitellmImageGenerationProvider } from "./image-generation-provider.js";
 import { applyLitellmConfig, LITELLM_DEFAULT_MODEL_REF } from "./onboard.js";
 import { buildLitellmProvider } from "./provider-catalog.js";
@@ -95,12 +96,18 @@ export default definePluginEntry({
       catalog: {
         order: "simple",
         run: (ctx) =>
-          buildSingleProviderApiKeyCatalog({
+          buildOpenAICompatibleProviderCatalog({
+            discoveryMode: "strict",
             ctx,
             providerId: PROVIDER_ID,
             buildProvider: buildLitellmProvider,
             allowExplicitBaseUrl: true,
+            modelDiscovery: { endpointPath: "v1/models" },
           }),
+      },
+      staticCatalog: {
+        order: "simple",
+        run: async () => ({ provider: buildLitellmProvider() }),
       },
     });
     api.registerImageGenerationProvider(buildLitellmImageGenerationProvider());

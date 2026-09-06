@@ -1,4 +1,6 @@
+// Status scan fast-json tests cover scan defaults, memory config, and JSON-safe status payloads.
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { GENERATED_BUNDLED_CHANNEL_CONFIG_METADATA } from "../config/bundled-channel-config-metadata.generated.js";
 import {
   applyStatusScanDefaults,
   createStatusMemorySearchConfig,
@@ -20,6 +22,26 @@ let originalForceStderr: boolean;
 let loggingStateRef: typeof import("../logging/state.js").loggingState;
 let scanStatusJsonFast: typeof import("./status.scan.fast-json.js").scanStatusJsonFast;
 
+const STATUS_JSON_TEST_CHANNEL_ENV_PREFIXES = GENERATED_BUNDLED_CHANNEL_CONFIG_METADATA.filter(
+  (entry) => entry.configurable !== false,
+).map((entry) => `${entry.channelId.replace(/[^a-z0-9]+/gi, "_").toUpperCase()}_`);
+const STATUS_JSON_TEST_CHANNEL_ENV_VARS = GENERATED_BUNDLED_CHANNEL_CONFIG_METADATA.filter(
+  (entry) => entry.configurable !== false,
+).flatMap((entry) => entry.channelEnvVars ?? []);
+
+function clearStatusJsonChannelEnv(): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = {};
+  for (const key of STATUS_JSON_TEST_CHANNEL_ENV_VARS) {
+    env[key] = undefined;
+  }
+  for (const key of Object.keys(process.env)) {
+    if (STATUS_JSON_TEST_CHANNEL_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) {
+      env[key] = undefined;
+    }
+  }
+  return env;
+}
+
 function configureFastJsonStatus() {
   applyStatusScanDefaults(mocks, {
     sourceConfig: createStatusMemorySearchConfig(),
@@ -29,7 +51,7 @@ function configureFastJsonStatus() {
   });
   mocks.getStatusCommandSecretTargetIds.mockReturnValue([]);
   mocks.resolveMemorySearchConfig.mockReturnValue({
-    store: { path: "/tmp/main.sqlite" },
+    store: { databasePath: "/tmp/main.sqlite" },
   });
 }
 
@@ -60,7 +82,7 @@ afterEach(() => {
 
 describe("scanStatusJsonFast", () => {
   it("does not preload configured channel plugins for the lean JSON path", async () => {
-    mocks.hasPotentialConfiguredChannels.mockReturnValue(true);
+    mocks.hasConfiguredChannels.mockReturnValue(true);
 
     await scanStatusJsonFast({}, {} as never);
 
@@ -74,8 +96,30 @@ describe("scanStatusJsonFast", () => {
     expect(loggingStateRef.forceConsoleToStderr).toBe(false);
   });
 
+  it("carries invalid config diagnostics through the lean JSON scan", async () => {
+    const config = createStatusMemorySearchConfig();
+    const configDiagnostics = {
+      path: "/tmp/openclaw.json",
+      issues: [
+        {
+          path: "gateway.port",
+          message: "Invalid input: expected number, received string",
+        },
+      ],
+    };
+    mocks.readBestEffortConfigSnapshot.mockResolvedValue({
+      config,
+      sourceConfig: config,
+      configDiagnostics,
+    });
+
+    const result = await scanStatusJsonFast({}, {} as never);
+
+    expect(result.configDiagnostics).toEqual(configDiagnostics);
+  });
+
   it("keeps resolved and source channel configs available without loading runtime plugins", async () => {
-    mocks.hasPotentialConfiguredChannels.mockReturnValue(true);
+    mocks.hasConfiguredChannels.mockReturnValue(true);
     applyStatusScanDefaults(mocks, {
       hasConfiguredChannels: true,
       sourceConfig: {
@@ -106,15 +150,32 @@ describe("scanStatusJsonFast", () => {
   });
 
   it("skips plugin compatibility loading even when configured channels are present", async () => {
-    mocks.hasPotentialConfiguredChannels.mockReturnValue(true);
+    mocks.hasConfiguredChannels.mockReturnValue(true);
 
     await scanStatusJsonFast({}, {} as never);
 
     expect(mocks.buildPluginCompatibilityNotices).not.toHaveBeenCalled();
   });
 
+  it("collects actual plugin compatibility warnings when full JSON status is requested", async () => {
+    const notice = {
+      pluginId: "legacy-plugin",
+      code: "hook-only",
+      severity: "warn",
+      message: "plugin registers only legacy hooks",
+    };
+    mocks.buildPluginCompatibilityNotices.mockReturnValue([notice]);
+
+    const result = await scanStatusJsonFast({ all: true }, {} as never);
+
+    expect(mocks.buildPluginCompatibilityNotices).toHaveBeenCalledWith({
+      config: createStatusMemorySearchConfig(),
+    });
+    expect(result.pluginCompatibility).toEqual([notice]);
+  });
+
   it("keeps default fast JSON update scans local-only", async () => {
-    mocks.hasPotentialConfiguredChannels.mockReturnValue(true);
+    mocks.hasConfiguredChannels.mockReturnValue(true);
 
     await scanStatusJsonFast({ timeoutMs: 1234 }, {} as never);
 
@@ -128,7 +189,7 @@ describe("scanStatusJsonFast", () => {
   });
 
   it("restores registry-backed update checks and remote git fetches when --all is requested", async () => {
-    mocks.hasPotentialConfiguredChannels.mockReturnValue(true);
+    mocks.hasConfiguredChannels.mockReturnValue(true);
 
     await scanStatusJsonFast({ all: true }, {} as never);
 
@@ -142,7 +203,7 @@ describe("scanStatusJsonFast", () => {
   });
 
   it("keeps the local status RPC fallback off the default fast JSON path", async () => {
-    mocks.hasPotentialConfiguredChannels.mockReturnValue(true);
+    mocks.hasConfiguredChannels.mockReturnValue(true);
     mocks.callGateway.mockResolvedValue({ sessions: 1 });
 
     await scanStatusJsonFast({}, {} as never);
@@ -152,34 +213,15 @@ describe("scanStatusJsonFast", () => {
   });
 
   it("honors explicit gateway probe timeouts on the lean JSON path", async () => {
-    mocks.hasPotentialConfiguredChannels.mockReturnValue(true);
+    mocks.hasConfiguredChannels.mockReturnValue(true);
 
     await scanStatusJsonFast({ timeoutMs: 5000 }, {} as never);
 
     expect(mocks.probeGateway).toHaveBeenCalledWith(expect.objectContaining({ timeoutMs: 5000 }));
   });
 
-  it("keeps configured gateway handshake timeouts on the lean JSON path", async () => {
-    mocks.hasPotentialConfiguredChannels.mockReturnValue(true);
-    applyStatusScanDefaults(mocks, {
-      resolvedConfig: {
-        ...createStatusMemorySearchConfig(),
-        gateway: { handshakeTimeoutMs: 30_000 },
-      } as never,
-    });
-
-    await scanStatusJsonFast({}, {} as never);
-
-    expect(mocks.probeGateway).toHaveBeenCalledWith(
-      expect.objectContaining({
-        preauthHandshakeTimeoutMs: 30_000,
-        timeoutMs: 30_000,
-      }),
-    );
-  });
-
   it("restores the local status RPC fallback when --all is requested", async () => {
-    mocks.hasPotentialConfiguredChannels.mockReturnValue(true);
+    mocks.hasConfiguredChannels.mockReturnValue(true);
     mocks.callGateway.mockResolvedValue({ sessions: 1 });
 
     await scanStatusJsonFast({ all: true }, {} as never);
@@ -193,7 +235,7 @@ describe("scanStatusJsonFast", () => {
   });
 
   it("keeps the fast JSON summary off the channel plugin summary path", async () => {
-    mocks.hasPotentialConfiguredChannels.mockReturnValue(true);
+    mocks.hasConfiguredChannels.mockReturnValue(true);
 
     await scanStatusJsonFast({}, {} as never);
 
@@ -208,7 +250,7 @@ describe("scanStatusJsonFast", () => {
     const result = await scanStatusJsonFast({}, {} as never);
 
     expect(result.memory).toBeNull();
-    expect(mocks.hasPotentialConfiguredChannels).not.toHaveBeenCalled();
+    expect(mocks.hasConfiguredChannels).not.toHaveBeenCalled();
     expect(mocks.resolveMemorySearchConfig).not.toHaveBeenCalled();
     expect(mocks.getMemorySearchManager).not.toHaveBeenCalled();
   });
@@ -230,12 +272,14 @@ describe("scanStatusJsonFast", () => {
       cfg: createStatusMemorySearchConfig(),
       agentId: "main",
       purpose: "status",
+      inspectSources: true,
     });
   });
 
   it("skips gateway and update probes on cold-start status --json", async () => {
     await withTemporaryEnv(
       {
+        ...clearStatusJsonChannelEnv(),
         OPENCLAW_TWITCH_ACCESS_TOKEN: undefined,
         TELEGRAM_BOT_TOKEN: undefined,
         VITEST: undefined,
@@ -254,6 +298,7 @@ describe("scanStatusJsonFast", () => {
   it("keeps cold-start gateway probes with local-only updates when a channel is configured from manifest env vars", async () => {
     await withTemporaryEnv(
       {
+        ...clearStatusJsonChannelEnv(),
         OPENCLAW_TWITCH_ACCESS_TOKEN: "token",
         VITEST: undefined,
         VITEST_POOL_ID: undefined,
